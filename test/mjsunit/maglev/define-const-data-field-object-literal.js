@@ -24,6 +24,7 @@
   const marker = {};
   const o = make(marker);
   assertSame(marker, o.a);
+  assertMaglevved(make);
   assertTrue(%HasOwnConstDataProperty(o, "a"));
 })();
 
@@ -45,6 +46,7 @@
   %OptimizeMaglevOnNextCall(make);
   const o = make(3);
   assertEquals(3, o.b);
+  assertMaglevved(make);
   assertTrue(%HasOwnConstDataProperty(o, "b"));
 })();
 
@@ -61,5 +63,6 @@
   %OptimizeMaglevOnNextCall(make);
   const o = make(3.5);
   assertEquals(3.5, o.c);
+  assertMaglevved(make);
   assertTrue(%HasOwnConstDataProperty(o, "c"));
 })();

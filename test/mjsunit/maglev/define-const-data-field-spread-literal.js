@@ -33,6 +33,7 @@
   %OptimizeMaglevOnNextCall(make);
   const o = make(src);
   assertSame(second, o.a);
+  assertMaglevved(make);
   assertFalse(%HasOwnConstDataProperty(o, "a"));
   assertSame(first, src.a);
 })();
@@ -54,6 +55,7 @@
   %OptimizeMaglevOnNextCall(make);
   const o = make(src);
   assertEquals(2, o.b);
+  assertMaglevved(make);
   assertFalse(%HasOwnConstDataProperty(o, "b"));
   assertEquals(1, src.b);
 })();
@@ -73,6 +75,7 @@
   %OptimizeMaglevOnNextCall(make);
   const o = make(src);
   assertEquals(2.5, o.c);
+  assertMaglevved(make);
   assertFalse(%HasOwnConstDataProperty(o, "c"));
   assertEquals(1.5, src.c);
 })();
