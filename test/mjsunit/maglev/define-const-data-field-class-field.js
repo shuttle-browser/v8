@@ -45,6 +45,7 @@
   for (let i = 0; i < 30; i++) define({myProp: second}, true);
   %OptimizeMaglevOnNextCall(define);
   define({myProp: second}, true);
+  assertMaglevved(define);
 
   // Assert the good state before we begin the shenanigans.
   assertTrue(%HasOwnConstDataProperty(holder, "myProp"));
@@ -89,6 +90,7 @@
   for (let i = 0; i < 30; i++) define({myProp: second}, true);
   %OptimizeMaglevOnNextCall(define);
   define({myProp: second}, true);
+  assertMaglevved(define);
 
   // Assert the good state before we begin the shenanigans.
   assertTrue(%HasOwnConstDataProperty(holder, "myProp"));
@@ -131,6 +133,7 @@
   for (let i = 0; i < 30; i++) define({myProp: second}, true);
   %OptimizeMaglevOnNextCall(define);
   define({myProp: second}, true);
+  assertMaglevved(define);
 
   // Assert the good state before we begin the shenanigans.
   assertTrue(%HasOwnConstDataProperty(holder, "myProp"));
