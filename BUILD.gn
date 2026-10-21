@@ -8699,16 +8699,17 @@ if (is_component_build) {
   v8_component("v8") {
     sources = [ "src/utils/v8dll-main.cc" ]
 
-    deps = [
-      ":v8_base",
-      ":v8_snapshot",
-    ]
+    deps = [ ":v8_base" ]
 
+    # Shuttle: public so embedders may list the generated snapshot_blob.bin as a
+    # bundle source (gn's input check needs a public path; builds without the
+    # V8 context snapshot list it).
     public_deps = [
       ":cppgc_headers",
       ":v8_abseil",
       ":v8_headers",
       ":v8_libplatform",
+      ":v8_snapshot",
       "src/inspector:inspector_headers",
     ]
 
@@ -8781,15 +8782,15 @@ if (is_component_build) {
   }
 } else {
   group("v8") {
-    deps = [
-      ":v8_base",
-      ":v8_snapshot",
-    ]
+    deps = [ ":v8_base" ]
+
+    # Shuttle: public, see v8_component("v8") above.
     public_deps = [
       ":cppgc_headers",
       ":v8_abseil",
       ":v8_headers",
       ":v8_libplatform",
+      ":v8_snapshot",
       "src/inspector:inspector_headers",
     ]
 
