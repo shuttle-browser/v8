@@ -132,7 +132,7 @@ ValueNode* Value(ValueNode* node) { return node; }
     } else if (IsDoneWithAbort(res)) {      \
       return ProcessResult::kTruncateBlock; \
     }                                       \
-    DCHECK(IsFail(result));                 \
+    DCHECK(IsFail(res));                    \
   } while (false)
 
 #define REMOVE_AND_RETURN_IF_DONE(result)   \
@@ -2090,7 +2090,7 @@ ProcessResult MaglevGraphOptimizer::VisitLoadTaggedField(
   }
   if (!node->property_key().is_none()) {
     REPLACE_AND_RETURN_IF_DONE(known_node_aspects().TryFindLoadedProperty(
-        node->ValueInput().node(), node->property_key(), node->is_const()));
+        node->ValueInput().node(), node->property_key(), node->constness()));
   }
   return ProcessResult::kContinue;
 }
@@ -3757,6 +3757,15 @@ ProcessResult MaglevGraphOptimizer::VisitBranchIfInt32ToBooleanTrue(
   if (auto cst = reducer_.TryGetInt32Constant(node->ConditionInput().node())) {
     bool condition_value = cst.value() != 0;
     FoldBranch(state.block(), node, condition_value);
+    return ProcessResult::kRevisit;
+  }
+  return ProcessResult::kContinue;
+}
+
+ProcessResult MaglevGraphOptimizer::VisitBranchIfInt32BitwiseAndNonZero(
+    BranchIfInt32BitwiseAndNonZero* node, const ProcessingState& state) {
+  if (auto cst = reducer_.TryGetInt32Constant(node->ValueInput().node())) {
+    FoldBranch(state.block(), node, (cst.value() & node->mask()) != 0);
     return ProcessResult::kRevisit;
   }
   return ProcessResult::kContinue;

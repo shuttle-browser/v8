@@ -28,7 +28,6 @@
 #include "src/api/api-inl.h"
 #include "src/ast/ast-value-factory.h"
 #include "src/ast/scopes.h"
-#include "src/base/fpu.h"
 #include "src/base/iterator.h"
 #include "src/base/logging.h"
 #include "src/base/platform/mutex.h"
@@ -875,8 +874,6 @@ StackTraceFailureMessage::StackTraceFailureMessage(
   }
 }
 
-bool NoExtension(const v8::FunctionCallbackInfo<v8::Value>&) { return false; }
-
 namespace {
 
 bool IsBuiltinFunction(Isolate* isolate, Tagged<HeapObject> object,
@@ -1636,7 +1633,10 @@ void VisitStack_ForCallSiteBuilder(Isolate* isolate, CallSiteBuilder* visitor) {
                 CallSiteInfo::kIsDeferredBaselineFrame)) {
           return;
         }
-        skipped_last_frame = true;
+        // Visibility (incl. security origin) is tracked by skipped_prev_frame_
+        // in AppendDeferredFrame; count this frame as appended so the caller's
+        // inlined construct stub can still flag it.
+        skipped_last_frame = false;
         break;
       case StackFrame::API_CALLBACK_EXIT:
       case StackFrame::API_CONSTRUCT_EXIT:
@@ -2529,7 +2529,7 @@ Tagged<Object> Isolate::StackOverflow() {
 #endif
 
   if (v8_flags.correctness_fuzzer_suppressions) {
-    FATAL("Aborting on stack overflow");
+    base::FatalNoSecurityImpact("Aborting on stack overflow");
   }
 
 #if USE_SIMULATOR
@@ -5964,7 +5964,7 @@ bool Isolate::InitWithSnapshot(SnapshotData* startup_snapshot_data,
 namespace {
 static std::string ToHexString(uintptr_t address) {
   std::stringstream stream_address;
-  stream_address << "0x" << std::hex << address;
+  stream_address << "0x" << std::hex << address << std::dec;
   return stream_address.str();
 }
 }  // namespace
@@ -6210,8 +6210,6 @@ bool Isolate::Init(SnapshotData* startup_snapshot_data,
   CHECK_IMPLIES(is_shared_space_isolate(), V8_CAN_CREATE_SHARED_HEAP_BOOL);
 
   force_slow_path_ = v8_flags.force_slow_path;
-
-  flush_denormals_ = base::FPU::GetFlushDenormals();
 
   has_fatal_error_ = false;
 
