@@ -34,7 +34,7 @@ namespace v8 {
 namespace internal {
 namespace maglev {
 
-enum class EnsureTypeResult;
+enum class V8_NODISCARD EnsureTypeResult;
 struct MaglevCallSiteInfo;
 class MaglevGraphBuilder;
 template <typename BaseT>
@@ -1055,7 +1055,8 @@ class MaglevReducer {
 
   ReduceResult BuildLoadTaggedField(
       ValueNode* object, uint32_t offset, NodeType type = NodeType::kUnknown,
-      bool is_const = false, PropertyKey key = PropertyKey::None(),
+      PropertyConstness constness = PropertyConstness::kMutable,
+      PropertyKey key = PropertyKey::None(),
       IsArrayLength is_array_length = IsArrayLength::kNo,
       compiler::OptionalMapRef stable_field_map = {});
 
@@ -1075,7 +1076,7 @@ class MaglevReducer {
 
   ReduceResult BuildStoreTrustedPointerField(ValueNode* object,
                                              ValueNode* value, int offset,
-                                             IndirectPointerTag tag,
+                                             TrustedPointerTag tag,
                                              StoreTaggedMode store_mode);
 
   ReduceResult BuildStoreMap(ValueNode* object, compiler::MapRef map,
@@ -1389,7 +1390,7 @@ class MaglevReducer {
   MaybeReduceResult TryReuseKnownPropertyLoad(ValueNode* lookup_start_object,
                                               compiler::NameRef name);
   void RecordKnownProperty(ValueNode* lookup_start_object, PropertyKey key,
-                           ValueNode* value, bool is_const,
+                           ValueNode* value, PropertyConstness constness,
                            compiler::AccessMode access_mode);
   ValueNode* GetValueOrUndefined(ValueNode* maybe_value) {
     if (maybe_value == nullptr) {
@@ -1575,7 +1576,7 @@ class MaglevReducer {
     return graph()->GetConstant(ref);
   }
   ValueNode* GetTrustedConstant(compiler::HeapObjectRef ref,
-                                IndirectPointerTag tag) {
+                                TrustedPointerTag tag) {
     return graph()->GetTrustedConstant(ref, tag);
   }
 
@@ -1654,10 +1655,12 @@ class MaglevReducer {
   MaybeReduceResult TryFoldTestTypeOf(
       ValueNode* input, interpreter::TestTypeOfFlags::LiteralFlag literal);
 
-  bool CheckType(ValueNode* node, NodeType type, NodeType* old = nullptr) {
+  V8_NODISCARD bool CheckType(ValueNode* node, NodeType type,
+                              NodeType* old = nullptr) {
     return known_node_aspects().CheckType(broker(), node, type, old);
   }
-  NodeType CheckTypes(ValueNode* node, std::initializer_list<NodeType> types) {
+  V8_NODISCARD NodeType CheckTypes(ValueNode* node,
+                                   std::initializer_list<NodeType> types) {
     return known_node_aspects().CheckTypes(broker(), node, types);
   }
 

@@ -32,7 +32,7 @@ Tagged<Union<Smi, TrustedObject>> SharedFunctionInfo::GetTrustedData(
     IsolateForSandbox isolate) const {
   if (HasUnpublishedTrustedData(isolate)) return Smi::zero();
   return TrustedPointerField::ReadMaybeEmptyTrustedPointerField<
-      kTrustedDataIndirectPointerRange>(
+      kTrustedDataTrustedPointerRange>(
       Tagged<HeapObject>(this),
       offsetof(SharedFunctionInfo, trusted_function_data_), isolate,
       kAcquireLoad);
@@ -331,7 +331,7 @@ Handle<String> SharedFunctionInfo::DebugName(
 #if V8_ENABLE_WEBASSEMBLY
   if (shared->HasWasmExportedFunctionData(isolate) && allow_allocation) {
     return isolate->factory()
-        ->NewStringFromUtf8(base::CStrVector(shared->DebugNameCStr().get()))
+        ->NewStringFromUtf8(shared->DebugNameCStr().get())
         .ToHandleChecked();
   }
 #endif  // V8_ENABLE_WEBASSEMBLY
@@ -352,9 +352,7 @@ bool SharedFunctionInfo::PassesFilter(const char* raw_filter) {
   if (V8_LIKELY(raw_filter[0] == '*' && raw_filter[1] == '\0')) {
     return true;
   }
-  base::Vector<const char> filter = base::CStrVector(raw_filter);
-  return v8::internal::PassesFilter(base::CStrVector(DebugNameCStr().get()),
-                                    filter);
+  return v8::internal::PassesFilter(DebugNameCStr().get(), raw_filter);
 }
 
 bool SharedFunctionInfo::HasSourceCode() const {
@@ -525,7 +523,7 @@ void SharedFunctionInfo::DisableOptimization(Isolate* isolate,
                                              BailoutReason reason) {
   DCHECK_NE(reason, BailoutReason::kNoReason);
 
-  set_flags(DisabledOptimizationReasonBits::update(flags(kRelaxedLoad), reason),
+  set_flags(flags(kRelaxedLoad).with_disabled_optimization_reason(reason),
             kRelaxedStore);
   // Code should be the lazy compilation stub or else interpreted.
   if constexpr (DEBUG_BOOL) {
@@ -796,12 +794,12 @@ int SharedFunctionInfo::EndPosition() const {
 }
 
 CachedTieringDecision SharedFunctionInfo::cached_tiering_decision() {
-  return CachedTieringDecisionBits::decode(flags2());
+  return flags2().cached_tiering_decision();
 }
 
 void SharedFunctionInfo::set_cached_tiering_decision(
     CachedTieringDecision decision) {
-  set_flags2(CachedTieringDecisionBits::update(flags2(), decision));
+  set_flags2(flags2().with_cached_tiering_decision(decision));
 }
 
 // static
