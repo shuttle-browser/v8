@@ -284,14 +284,31 @@ MaglevGraphBuilder::LazyDeoptResultLocationScope::
   builder_->lazy_deopt_result_location_scope_ = previous_;
 }
 
-class MaglevGraphBuilder::MaglevSubGraphBuilder::LoopLabel {
+class V8_NODISCARD MaglevGraphBuilder::MaglevSubGraphBuilder::LoopLabel {
  public:
+  LoopLabel(const LoopLabel&) = delete;
+  LoopLabel(LoopLabel&&) = delete;
+  LoopLabel& operator=(const LoopLabel&) = delete;
+  LoopLabel& operator=(LoopLabel&&) = delete;
+
+  ~LoopLabel() {
+    if (merge_state_ != nullptr) {
+      // An early abort exited the subgraph before EndLoop was reached.
+      DCHECK_NULL(sub_builder_->builder_->current_block());
+      merge_state_->MergeDeadLoop(*sub_builder_->dummy_unit_);
+    }
+  }
+
  private:
-  explicit LoopLabel(LoopMergePointInterpreterFrameState* merge_state,
-                     BasicBlock* loop_header)
-      : merge_state_(merge_state), loop_header_(loop_header) {}
+  LoopLabel(MaglevSubGraphBuilder* sub_builder,
+            LoopMergePointInterpreterFrameState* merge_state,
+            BasicBlock* loop_header)
+      : sub_builder_(sub_builder),
+        merge_state_(merge_state),
+        loop_header_(loop_header) {}
 
   friend class MaglevSubGraphBuilder;
+  MaglevSubGraphBuilder* sub_builder_;
   LoopMergePointInterpreterFrameState* merge_state_ = nullptr;
   BasicBlock* loop_header_;
 };
@@ -426,7 +443,7 @@ MaglevGraphBuilder::MaglevSubGraphBuilder::BeginLoop(
   builder_->ProcessMergePointPredecessors(*loop_state, loop_header_ref);
   builder_->StartNewBlock(nullptr, loop_state, loop_header_ref);
 
-  return LoopLabel{loop_state, loop_header_ref.block_ptr()};
+  return LoopLabel{this, loop_state, loop_header_ref.block_ptr()};
 }
 
 template <typename ControlNodeT, typename... Args>
@@ -483,8 +500,12 @@ void MaglevGraphBuilder::MaglevSubGraphBuilder::MergeDeadInterpreterFrameState(
 }
 
 void MaglevGraphBuilder::MaglevSubGraphBuilder::EndLoop(LoopLabel* loop_label) {
+  // Ensure EndLoop is called only once and disarm ~LoopLabel().
+  LoopMergePointInterpreterFrameState* merge_state = loop_label->merge_state_;
+  DCHECK_NOT_NULL(merge_state);
+  loop_label->merge_state_ = nullptr;
   if (builder_->current_block() == nullptr) {
-    loop_label->merge_state_->MergeDeadLoop(*dummy_unit_);
+    merge_state->MergeDeadLoop(*dummy_unit_);
     return;
   }
 
@@ -492,11 +513,11 @@ void MaglevGraphBuilder::MaglevSubGraphBuilder::EndLoop(LoopLabel* loop_label) {
       builder_->FinishBlockNoAbort<JumpLoop>({}, loop_label->loop_header_);
   {
     BorrowParentKnownNodeAspectsAndVOs borrow(this);
-    loop_label->merge_state_->MergeLoop(
-        builder_->graph(), builder_->is_tracing(), *dummy_unit_,
-        variable_frame_, block, builder_->GetLatestCheckpointedFrame());
+    merge_state->MergeLoop(builder_->graph(), builder_->is_tracing(),
+                           *dummy_unit_, variable_frame_, block,
+                           builder_->GetLatestCheckpointedFrame());
   }
-  block->set_predecessor_id(loop_label->merge_state_->predecessor_count() - 1);
+  block->set_predecessor_id(merge_state->predecessor_count() - 1);
 }
 
 void MaglevGraphBuilder::MaglevSubGraphBuilder::Bind(Label* label) {
@@ -7035,11 +7056,12 @@ ReduceResult MaglevGraphBuilder::VisitDefineNamedOwnPropertyHelper(
       broker()->GetFeedbackForPropertyAccess(
           feedback_source, compiler::AccessMode::kStore, name);
 
-  auto build_generic_access = [this, object, &name, &feedback_source]() {
+  auto build_generic_access = [this, object, &name, in_literal,
+                               &feedback_source]() {
     ValueNode* context = GetContext();
     ValueNode* value = GetAccumulator();
     return AddNewNode<DefineNamedOwnGeneric>({context, object, value}, name,
-                                             feedback_source);
+                                             in_literal, feedback_source);
   };
   switch (processed_feedback.kind()) {
     case compiler::ProcessedFeedback::kInsufficient:
@@ -8445,6 +8467,10 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceGeneratorPrototypeNext(
   ValueNode* executing_constant =
       GetSmiConstant(JSGeneratorObject::kGeneratorExecuting);
   ValueNode* next_constant = GetSmiConstant(JSGeneratorObject::kNext);
+  ValueNode* try_skip_alloc_constant =
+      GetSmiConstant(JSGeneratorObject::kNextTrySkipAlloc);
+  ValueNode* alloc_skipped_constant =
+      GetSmiConstant(JSGeneratorObject::kNextAllocSkipped);
 
   // If any of the constants have an empty type, we're in dead code, and the
   // write barrier elision logic inside StoreTaggedFieldNoWriteBarrier will be
@@ -8455,13 +8481,14 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceGeneratorPrototypeNext(
   ABORT_IF_EMPTY_TYPE(closed_constant);
   ABORT_IF_EMPTY_TYPE(executing_constant);
   ABORT_IF_EMPTY_TYPE(next_constant);
+  ABORT_IF_EMPTY_TYPE(try_skip_alloc_constant);
+  ABORT_IF_EMPTY_TYPE(alloc_skipped_constant);
 
-  // The fast path below asks the generator to store the yielded value into
-  // yielded_value_ rather than allocate a result object, and rebuilds the
-  // object here as a VirtualObject that escape analysis can then elide. A
-  // current try-catch block, either in this function or in a caller we were
-  // inlined into, defeats that as would pay for the protocol and allocate
-  // anyway.
+  // The fast path below asks the generator to hand back the bare yielded value
+  // rather than allocate a result object, and rebuilds the object here as a
+  // VirtualObject that escape analysis can then elide. A current try-catch
+  // block, either in this function or in a caller we were inlined into,
+  // defeats that as would pay for the protocol and allocate anyway.
   const bool can_skip_allocation = GetCurrentTryCatchBlock().ref == nullptr;
 
   MaglevSubGraphBuilder::Label generator_already_closed(&subgraph, 1);
@@ -8483,18 +8510,11 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceGeneratorPrototypeNext(
       AssertCondition::kNotEqual, DeoptimizeReason::kWrongValue));
 
   CHECK(BuildStoreTaggedFieldNoWriteBarrier(
-            receiver, next_constant, offsetof(JSGeneratorObject, resume_mode_),
+            receiver,
+            can_skip_allocation ? try_skip_alloc_constant : next_constant,
+            offsetof(JSGeneratorObject, resume_mode_),
             StoreTaggedMode::kDefault)
             .IsDoneWithoutAbort());
-
-  // Tell the generator to skip allocating the result object if possible.
-  if (can_skip_allocation) {
-    CHECK(BuildStoreTaggedFieldNoWriteBarrier(
-              receiver, GetRootConstant(RootIndex::kTheHoleValue),
-              offsetof(JSGeneratorObject, yielded_value_),
-              StoreTaggedMode::kDefault)
-              .IsDoneWithoutAbort());
-  }
 
   ValueNode* result;
   {
@@ -8526,33 +8546,23 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceGeneratorPrototypeNext(
 
   if (can_skip_allocation) {
     MaglevSubGraphBuilder::Label allocation_not_skipped(&subgraph, 1);
-    ValueNode* yielded_value;
-    GET_VALUE(yielded_value,
-              BuildLoadTaggedField(
-                  receiver, offsetof(JSGeneratorObject, yielded_value_)));
-    // We unconditionally clear yielded_value_ here. If the generator did
-    // not hit the GeneratorYieldResult intrinsic (if it suspended via
-    // yield*), yielded_value_ would still hold TheHole. If it leaked to JS
-    // space (e.g., on a subsequent unoptimized next() call), it could cause
-    // a crash when JS attempts to access its properties.
-    CHECK(BuildStoreTaggedFieldNoWriteBarrier(
-              receiver, GetRootConstant(RootIndex::kUndefinedValue),
-              offsetof(JSGeneratorObject, yielded_value_),
-              StoreTaggedMode::kDefault)
-              .IsDoneWithoutAbort());
 
     // Check whether skipping allocating the result object was successful.
+    ValueNode* generator_mode;
+    GET_VALUE(generator_mode,
+              BuildLoadTaggedField(receiver,
+                                   offsetof(JSGeneratorObject, resume_mode_)));
     CHECK(subgraph
-              .GotoIfFalse<BranchIfRootConstant>(
-                  &allocation_not_skipped, {result}, RootIndex::kTheHoleValue)
+              .GotoIfFalse<BranchIfReferenceEqual>(
+                  &allocation_not_skipped,
+                  {generator_mode, alloc_skipped_constant})
               .IsDoneWithoutAbort());
 
-    // Was able to avoid allocating the result object. Use
-    // yielded_value from the generator object.
+    // Was able to avoid allocating the result object.
     compiler::MapRef map =
         broker()->target_native_context().iterator_result_map(broker());
-    VirtualObject* iter_result = reducer_.CreateJSIteratorResult(
-        map, yielded_value, GetBooleanConstant(false));
+    VirtualObject* iter_result =
+        reducer_.CreateJSIteratorResult(map, result, GetBooleanConstant(false));
     ValueNode* alloc_result;
     GET_VALUE(alloc_result, reducer_.BuildInlinedAllocation(
                                 iter_result, AllocationType::kYoung));
@@ -9056,19 +9066,12 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceFunctionPrototypeCall(
 
 MaybeReduceResult MaglevGraphBuilder::TryReduceFunctionPrototypeApply(
     compiler::JSFunctionRef target, CallArguments& args) {
-  compiler::OptionalHeapObjectRef maybe_receiver;
-  if (current_speculation_feedback().IsValid()) {
-    const compiler::ProcessedFeedback& processed_feedback =
-        broker()->GetFeedbackForCall(current_speculation_feedback());
-    DCHECK_EQ(processed_feedback.kind(), compiler::ProcessedFeedback::kCall);
-    const compiler::CallFeedback& call_feedback = processed_feedback.AsCall();
-    if (call_feedback.call_feedback_content() ==
-        CallFeedbackContent::kReceiver) {
-      maybe_receiver = call_feedback.target();
-    }
-  }
+  // We should have taken the `BuildCallWithFeedback` path for the typical
+  // Function.prototype.apply speculation-based optimization. If we are on this
+  // code path, we must be inside an apply inside another inlining and shouldn't
+  // use the feedback receiver.
   return TryReduceFunctionPrototypeApplyCallWithReceiver(
-      maybe_receiver, args, current_speculation_feedback());
+      {}, args, current_speculation_feedback());
 }
 
 namespace {
@@ -11578,7 +11581,7 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceCallForNewClosure(
 
 MaybeReduceResult
 MaglevGraphBuilder::TryReduceFunctionPrototypeApplyCallWithReceiver(
-    compiler::OptionalHeapObjectRef maybe_receiver, CallArguments& args,
+    compiler::OptionalJSFunctionRef maybe_receiver, CallArguments& args,
     const compiler::FeedbackSource& feedback_source) {
   if (args.mode() != CallArguments::kDefault) return {};
 
@@ -12407,12 +12410,12 @@ ReduceResult MaglevGraphBuilder::VisitIntrinsicGeneratorYieldResult(
   compiler::MapRef map =
       broker()->target_native_context().iterator_result_map(broker());
 
-  // Check if yielded_value_ is TheHole (signaling to skip allocating the result
-  // object).
-  ValueNode* current_yielded_value;
-  GET_VALUE_OR_ABORT(current_yielded_value,
-                     BuildLoadTaggedField(generator, offsetof(JSGeneratorObject,
-                                                              yielded_value_)));
+  // Check whether the caller asked to skip result allocation
+  // (resume_mode_ == kNextTrySkipAlloc).
+  ValueNode* mode;
+  GET_VALUE_OR_ABORT(
+      mode, BuildLoadTaggedField(generator,
+                                 offsetof(JSGeneratorObject, resume_mode_)));
 
   Subgraph<MaglevGraphBuilder> subgraph(&reducer_, 1);
   Subgraph<MaglevGraphBuilder>::Variable ret_val(0);
@@ -12420,14 +12423,17 @@ ReduceResult MaglevGraphBuilder::VisitIntrinsicGeneratorYieldResult(
   RETURN_IF_ABORT(subgraph.Branch(
       {&ret_val},
       [&](BranchBuilder& builder) {
-        return BuildBranchIfRootConstant(builder, current_yielded_value,
-                                         RootIndex::kTheHoleValue);
+        return BuildBranchIfReferenceEqual(
+            builder, mode,
+            GetSmiConstant(JSGeneratorObject::kNextTrySkipAlloc));
       },
       [&] {
+        // Skip allocation: ack handshake and return bare value.
         RETURN_IF_ABORT(BuildStoreTaggedField(
-            generator, value, offsetof(JSGeneratorObject, yielded_value_),
+            generator, GetSmiConstant(JSGeneratorObject::kNextAllocSkipped),
+            offsetof(JSGeneratorObject, resume_mode_),
             StoreTaggedMode::kDefault));
-        subgraph.set(ret_val, GetRootConstant(RootIndex::kTheHoleValue));
+        subgraph.set(ret_val, value);
         return ReduceResult::Done();
       },
       [&] {

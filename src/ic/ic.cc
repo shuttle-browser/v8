@@ -1102,6 +1102,18 @@ void LoadIC::UpdateCaches(LookupIterator* lookup) {
         TraceIC("LoadGlobalIC", lookup->name());
         return;
       }
+      // Own DATA properties above are accessed directly via PropertyCell on the
+      // JSGlobalObject and don't involve the JSGlobalProxy. For anything else
+      // (e.g. prototype accessors), the handler would substitute global_proxy
+      // as the receiver without performing an access check on it, and
+      // LookupIterator didn't fail an access check because JSGlobalObject
+      // belongs to the current (detached) native context while its global_proxy
+      // may have been rebound to a new cross-origin context.
+      if (Cast<JSGlobalObject>(*lookup->GetReceiver())->IsDetached()) {
+        SetCache(lookup->GetName(), LoadHandler::LoadSlow(isolate()));
+        TraceIC("LoadGlobalIC", lookup->GetName());
+        return;
+      }
     }
     handler = ComputeHandler(lookup);
     CHECK(lookup->state() == LookupIterator::STRING_LOOKUP_START_OBJECT ||
@@ -2420,6 +2432,16 @@ void StoreIC::UpdateCaches(LookupIterator* lookup, DirectHandle<Object> value,
         TraceIC("StoreGlobalIC", lookup->GetName());
         return;
       }
+      // See comment in LoadIC::UpdateCaches: own DATA properties above use
+      // PropertyCell on the JSGlobalObject directly, whereas other handlers
+      // (e.g. prototype accessors) substitute global_proxy as the receiver,
+      // which may have been rebound to a cross-origin context upon detachment.
+      if (Cast<JSGlobalObject>(*lookup->GetReceiver())->IsDetached()) {
+        set_slow_stub_reason("detached global object");
+        SetCache(lookup->GetName(), StoreHandler::StoreSlow(isolate()));
+        TraceIC("StoreGlobalIC", lookup->GetName());
+        return;
+      }
     }
     handler = ComputeHandler(lookup);
   } else {
@@ -2440,16 +2462,6 @@ MaybeObjectHandle StoreIC::ComputeHandler(LookupIterator* lookup) {
       if (IsJSGlobalObject(*store_target)) {
         TRACE_HANDLER_STATS(isolate(), StoreIC_StoreGlobalTransitionDH);
 
-        if (IsJSGlobalObject(*lookup_start_object_map())) {
-          DCHECK(IsStoreGlobalIC());
-#ifdef DEBUG
-          DirectHandle<JSObject> holder = lookup->GetHolder<JSObject>();
-          DCHECK_EQ(*lookup->GetReceiver(), *holder);
-          DCHECK_EQ(*store_target, *holder);
-#endif
-          return StoreHandler::StoreGlobal(
-              indirect_handle(lookup->transition_cell(), isolate()));
-        }
         if (IsDefineKeyedOwnIC()) {
           // Private field can't be deleted from this global object and can't
           // be overwritten, so install slow handler in order to make store IC
@@ -2666,9 +2678,19 @@ MaybeObjectHandle StoreIC::ComputeHandler(LookupIterator* lookup) {
       }
       if (lookup->is_dictionary_holder()) {
         if (IsJSGlobalObject(*holder)) {
+          DCHECK(!IsStoreGlobalIC());
+          DCHECK(IsJSGlobalProxy(*receiver));
+          if (IsAnyDefineOwn()) {
+            TRACE_HANDLER_STATS(isolate(), StoreIC_SlowStub);
+            return MaybeObjectHandle(StoreHandler::StoreSlow(isolate()));
+          }
           TRACE_HANDLER_STATS(isolate(), StoreIC_StoreGlobalDH);
-          return MaybeObjectHandle(StoreHandler::StoreGlobal(
-              indirect_handle(lookup->GetPropertyCell(), isolate())));
+          DirectHandle<Smi> smi_handler =
+              StoreHandler::StoreGlobalProxy(isolate());
+          Handle<Object> handler = StoreHandler::StoreThroughPrototype(
+              isolate(), lookup_start_object_map(), holder, *smi_handler,
+              MaybeObjectDirectHandle::Weak(lookup->GetPropertyCell()));
+          return MaybeObjectHandle(handler);
         }
         TRACE_HANDLER_STATS(isolate(), StoreIC_StoreNormalDH);
         DCHECK(holder.is_identical_to(receiver));
@@ -2688,16 +2710,9 @@ MaybeObjectHandle StoreIC::ComputeHandler(LookupIterator* lookup) {
           return MaybeObjectHandle(StoreHandler::StoreSharedStructField(
               isolate(), descriptor, index, lookup->representation()));
         }
-        PropertyConstness constness = lookup->constness();
-        if (constness == PropertyConstness::kConst &&
-            IsDefineNamedOwnICKind(nexus()->kind())) {
-          // DefineNamedOwnICs are used for initializing object literals
-          // therefore we must store the value unconditionally even to
-          // VariableMode::kConst fields.
-          constness = PropertyConstness::kMutable;
-        }
         return MaybeObjectHandle(StoreHandler::StoreField(
-            isolate(), descriptor, index, constness, lookup->representation()));
+            isolate(), descriptor, index, lookup->constness(),
+            lookup->representation()));
       }
 
       // -------------- Constant properties --------------
@@ -3501,10 +3516,9 @@ RUNTIME_FUNCTION(Runtime_StoreIC_Miss) {
 
   FeedbackSlot vector_slot = FeedbackVector::ToSlot(slot);
 
-  // When there is no feedback vector it is OK to use the SetNamedStrict as
-  // the feedback slot kind. We only reuse this for DefineNamedOwnIC when
-  // installing the handler for storing const properties. This will happen only
-  // when feedback vector is available.
+  // When there is no feedback vector it is OK to use SetNamedStrict as the
+  // feedback slot kind because StoreIC::Store deduces strictness from the
+  // caller frame rather than the feedback slot kind.
   FeedbackSlotKind kind = FeedbackSlotKind::kSetNamedStrict;
   Handle<FeedbackVector> vector = Handle<FeedbackVector>();
   if (!IsUndefined(*maybe_vector)) {
@@ -3520,6 +3534,9 @@ RUNTIME_FUNCTION(Runtime_StoreIC_Miss) {
   RETURN_RESULT_OR_FAILURE(isolate, ic.Store(receiver, key, value));
 }
 
+// Shared between DefineNamedOwn and DefineNamedOwnInLiteral. This
+// is fine, since the IC handlers we create are identical - only when using the
+// handler we check whether we're in the "in literal" case or not.
 RUNTIME_FUNCTION(Runtime_DefineNamedOwnIC_Miss) {
   HandleScope scope(isolate);
   DCHECK_EQ(5, args.length());
@@ -3552,6 +3569,7 @@ RUNTIME_FUNCTION(Runtime_DefineNamedOwnIC_Miss) {
   RETURN_RESULT_OR_FAILURE(isolate, ic.Store(receiver, key, value));
 }
 
+// Also usable for both DefineNamedOwn and DefineNamedOwnInLiteral.
 RUNTIME_FUNCTION(Runtime_DefineNamedOwnIC_Slow) {
   HandleScope scope(isolate);
   DCHECK_EQ(3, args.length());
