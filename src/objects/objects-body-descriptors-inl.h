@@ -678,6 +678,9 @@ class DescriptorArray::BodyDescriptor final : public BodyDescriptorBase {
   static inline void IterateBody(Tagged<Map> map, Tagged<HeapObject> obj,
                                  int object_size, ObjectVisitor* v) {
     IteratePointer(obj, offsetof(DescriptorArray, enum_cache_), v);
+#ifdef V8_ENABLE_DESCRIPTOR_ARRAY_LOOKUP_TABLE
+    IteratePointer(obj, offsetof(DescriptorArray, lookup_table_), v);
+#endif  // V8_ENABLE_DESCRIPTOR_ARRAY_LOOKUP_TABLE
     const int nof_all_descriptors =
         UncheckedCast<DescriptorArray>(obj)->number_of_all_descriptors();
     for (int i = 0; i < nof_all_descriptors; ++i) {
@@ -769,34 +772,19 @@ class JSFinalizationRegistry::BodyDescriptor final : public BodyDescriptorBase {
 
 class AllocationSite::BodyDescriptor final : public BodyDescriptorBase {
  public:
-  static constexpr int kCommonPointerFieldsStart = sizeof(HeapObject);
-  static constexpr int kCommonPointerFieldsEnd =
+  static constexpr int kStartOffset = sizeof(HeapObject);
+  static constexpr int kEndOffset =
       offsetof(AllocationSite, dependent_code_) + kTaggedSize;
-
-  static_assert(kCommonPointerFieldsEnd ==
-                offsetof(AllocationSite, pretenure_data_));
-  static_assert(offsetof(AllocationSite, pretenure_data_) + kInt32Size ==
-                offsetof(AllocationSite, pretenure_create_count_));
-  static_assert(offsetof(AllocationSite, pretenure_create_count_) +
-                    kInt32Size ==
-                offsetof(AllocationSiteWithWeakNext, weak_next_));
+  static_assert(kEndOffset == sizeof(AllocationSite));
 
   template <typename ObjectVisitor>
   static inline void IterateBody(Tagged<Map> map, Tagged<HeapObject> obj,
                                  int object_size, ObjectVisitor* v) {
-    // Iterate over all the common pointer fields
-    IteratePointers(obj, kCommonPointerFieldsStart, kCommonPointerFieldsEnd, v);
-    // Skip PretenureDataOffset and PretenureCreateCount which are Int32 fields.
-    // Visit weak_next only if it has weak_next field.
-    if (object_size == sizeof(AllocationSiteWithWeakNext)) {
-      IterateCustomWeakPointers(
-          obj, offsetof(AllocationSiteWithWeakNext, weak_next_),
-          sizeof(AllocationSiteWithWeakNext), v);
-    }
+    IteratePointers(obj, kStartOffset, kEndOffset, v);
   }
 
   static inline int SizeOf(Tagged<Map> map, Tagged<HeapObject> object) {
-    return map->instance_size();
+    return sizeof(AllocationSite);
   }
 };
 
@@ -1685,7 +1673,7 @@ class ExternalString::BodyDescriptor final : public BodyDescriptorBase {
   static inline void IterateBody(Tagged<Map> map, Tagged<HeapObject> obj,
                                  int object_size, ObjectVisitor* v) {
     Tagged<ExternalString> string = UncheckedCast<ExternalString>(obj);
-    v->VisitExternalPointer(obj, ExternalPointerSlot(&string->resource_));
+    v->VisitCppHeapPointer(obj, CppHeapPointerSlot(&string->resource_));
     if (string->is_uncached()) return;
     v->VisitExternalPointer(obj, ExternalPointerSlot(&string->resource_data_));
   }

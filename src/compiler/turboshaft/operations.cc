@@ -769,7 +769,8 @@ void StoreOp::PrintOptions(std::ostream& os) const {
 
 void TaggedBitcastOp::Validate(const Graph& graph) const {
   if (kind == Kind::kSmi) {
-    DCHECK((from.IsWord() && to.IsTaggedOrCompressed()) ||
+    DCHECK((from == RegisterRepresentation::WordPtr() &&
+            to == RegisterRepresentation::Tagged()) ||
            (from.IsTaggedOrCompressed() && to.IsWord()));
     DCHECK_IMPLIES(from == RegisterRepresentation::Word64() ||
                        to == RegisterRepresentation::Word64(),
@@ -813,7 +814,7 @@ void AllocateOp::PrintOptions(std::ostream& os) const {
   os << ']';
 }
 
-#if V8_ENABLE_SANDBOX
+#ifdef V8_COMPRESS_POINTERS
 void LoadExternalPointerOp::PrintOptions(std::ostream& os) const {
   os << '[';
   os << "tag_range: [" << tag_range.first << ", " << tag_range.last << "]";

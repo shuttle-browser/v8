@@ -532,7 +532,7 @@ class JSFunctionData : public JSObjectData {
     DCHECK(serialized_);
     return context_;
   }
-  ObjectData* initial_map() const {
+  MapData* initial_map() const {
     DCHECK(serialized_);
     return initial_map_;
   }
@@ -596,8 +596,7 @@ class JSFunctionData : public JSObjectData {
   bool PrototypeRequiresRuntimeLookup_ = false;
 
   ObjectData* context_ = nullptr;
-  ObjectData* initial_map_ =
-      nullptr;  // Derives from prototype_or_initial_map_.
+  MapData* initial_map_ = nullptr;  // Derives from prototype_or_initial_map_.
   ObjectData* instance_prototype_ =
       nullptr;  // Derives from prototype_or_initial_map_.
   ObjectData* shared_ = nullptr;
@@ -738,8 +737,11 @@ void JSFunctionData::Cache(JSHeapBroker* broker) {
   // guaranteed to see an initialized JSFunction object, and after
   // initialization fields remain in a valid state.
 
+  // `context` can be updated in-place with a newly allocated Context by
+  // `Compiler::GetFunctionFromEval` using `kReleaseStore`, so it needs
+  // `kAcquireLoad` to synchronize with the new Context's initialization.
   ContextRef context =
-      MakeRefAssumeMemoryFence(broker, function->context(kRelaxedLoad));
+      MakeRefAssumeMemoryFence(broker, function->context(kAcquireLoad));
   context_ = context.data();
 
   SharedFunctionInfoRef shared =
@@ -767,10 +769,7 @@ void JSFunctionData::Cache(JSHeapBroker* broker) {
 
       has_initial_map_ = proto_or_map->IsMap();
       if (has_initial_map_) {
-        // MapData is not used for initial_map_ because some
-        // AlwaysSharedSpaceJSObject subclass constructors (e.g. SharedArray)
-        // have initial maps in RO space, which can be accessed directly.
-        initial_map_ = proto_or_map;
+        initial_map_ = proto_or_map->AsMap();
 
         MapRef initial_map_ref =
             TryMakeRefFromData<Map>(broker, initial_map_).value();
@@ -1520,10 +1519,6 @@ OptionalObjectRef JSObjectRef::RawInobjectPropertyAt(JSHeapBroker* broker,
   return TryMakeRef(broker, value);
 }
 
-bool JSObjectRef::IsElementsTenured(FixedArrayBaseRef elements) {
-  return !HeapLayout::InYoungGeneration(*elements.object());
-}
-
 FieldIndex MapRef::GetFieldIndexFor(InternalIndex descriptor_index) const {
   CHECK_LT(descriptor_index.as_int(), NumberOfOwnDescriptors());
   FieldIndex result = FieldIndex::ForDescriptor(*object(), descriptor_index);
@@ -1754,7 +1749,6 @@ ObjectRef AllocationSiteRef::nested_site(JSHeapBroker* broker) const {
 HEAP_ACCESSOR_C(AllocationSite, bool, IsSpeculationDisabled)
 HEAP_ACCESSOR_C(AllocationSite, bool, PointsToLiteral)
 HEAP_ACCESSOR_C(AllocationSite, ElementsKind, GetElementsKind)
-HEAP_ACCESSOR_C(AllocationSite, AllocationType, GetAllocationType)
 
 BIMODAL_ACCESSOR_C(BigInt, uint64_t, AsUint64)
 int64_t BigIntRef::AsInt64(bool* lossless) const {
@@ -1823,6 +1817,8 @@ HEAP_ACCESSOR_B(Map, bit_field3, NumberOfOwnDescriptors,
                 Map::Bits3::NumberOfOwnDescriptorsBits)
 HEAP_ACCESSOR_B(Map, bit_field3, is_migration_target,
                 Map::Bits3::IsMigrationTargetBit)
+HEAP_ACCESSOR_B(Map, bit_field3, is_prototype_map,
+                Map::Bits3::IsPrototypeMapBit)
 BIMODAL_ACCESSOR_B(Map, bit_field3, is_extensible, Map::Bits3::IsExtensibleBit)
 BIMODAL_ACCESSOR_B(Map, bit_field3, construction_counter,
                    Map::Bits3::ConstructionCounterBits)
@@ -1995,10 +1991,6 @@ ObjectRef FeedbackCellRef::value(JSHeapBroker* broker) const {
   return MakeRefAssumeMemoryFence(broker, object()->value(kAcquireLoad));
 }
 
-bool FeedbackVectorRef::was_once_deoptimized() const {
-  return object()->was_once_deoptimized();
-}
-
 OptionalObjectRef MapRef::GetStrongValue(JSHeapBroker* broker,
                                          InternalIndex descriptor_index) const {
   CHECK_LT(descriptor_index.as_int(), NumberOfOwnDescriptors());
@@ -2043,6 +2035,13 @@ OptionalObjectRef MapRef::GetConstructor(JSHeapBroker* broker) const {
 NativeContextRef MapRef::native_context(JSHeapBroker* broker) const {
   // Immutable after initialization.
   return MakeRefAssumeMemoryFence(broker, object()->native_context());
+}
+
+bool MapRef::BelongsToSameNativeContextAs(JSHeapBroker* broker,
+                                          ContextRef context) const {
+  MapRef this_meta_map = map(broker);
+  MapRef context_meta_map = context.map(broker).map(broker);
+  return this_meta_map.equals(context_meta_map);
 }
 
 OptionalHeapObjectRef MapRef::GetBackPointer(JSHeapBroker* broker) const {
@@ -2716,20 +2715,35 @@ int SharedFunctionInfoRef::
 }
 
 OptionalMapRef JSObjectRef::GetObjectCreateMap(JSHeapBroker* broker) const {
-  DirectHandle<Map> map_handle = Cast<Map>(map(broker).object());
+  MapRef map_ref = map(broker);
   // Note: implemented as an acquire-load.
-  if (!map_handle->is_prototype_map()) return {};
+  if (!map_ref.is_prototype_map()) return {};
+  NativeContextRef native_context = broker->target_native_context();
+  if (!map_ref.BelongsToSameNativeContextAs(broker, native_context)) return {};
 
   DirectHandle<Object> maybe_proto_info = broker->CanonicalPersistentHandle(
-      map_handle->prototype_info(kAcquireLoad));
+      map_ref.object()->prototype_info(kAcquireLoad));
   if (!IsPrototypeInfo(*maybe_proto_info)) return {};
 
   Tagged<MaybeObject> maybe_object_create_map =
       Cast<PrototypeInfo>(maybe_proto_info)->ObjectCreateMap(kAcquireLoad);
   if (!maybe_object_create_map.IsWeak()) return {};
 
-  return MapRef(broker->GetOrCreateData(
+  MapRef object_create_map(broker->GetOrCreateData(
       maybe_object_create_map.GetHeapObjectAssumeWeak(), kAssumeMemoryFence));
+  // A JSGlobalProxy might have navigated concurrently on the main thread and
+  // populated PrototypeInfo with a map from a different native context.
+  if (!object_create_map.BelongsToSameNativeContextAs(broker, native_context)) {
+    return {};
+  }
+  if (map_ref.IsJSGlobalProxyMap()) {
+    // Subscribe to map changes on the global proxy so that if it detaches or
+    // navigates to another context, the optimized code is deoptimized and stops
+    // using the pre-navigation ObjectCreateMap.
+    if (!map_ref.is_stable()) return {};
+    broker->dependencies()->DependOnStableMap(map_ref);
+  }
+  return object_create_map;
 }
 
 bool JSObjectRef::IsArrayOrObjectPrototype(JSHeapBroker* broker) const {
@@ -2757,13 +2771,16 @@ bool NativeContextRef::GlobalIsDetached(JSHeapBroker* broker) const {
   return !proxy_proto.equals(global_object(broker));
 }
 
-OptionalPropertyCellRef JSGlobalObjectRef::GetPropertyCell(JSHeapBroker* broker,
-                                                           NameRef name) const {
+OptionalPropertyCellRef JSGlobalObjectRef::GetPropertyCell(
+    JSHeapBroker* broker, NameRef name, AccessMode access_mode) const {
   std::optional<Tagged<PropertyCell>> maybe_cell =
       ConcurrentLookupIterator::TryGetPropertyCell(
           broker->isolate(), broker->local_isolate_or_isolate(),
           broker->target_native_context().global_object(broker).object(),
-          name.object());
+          name.object(),
+          access_mode == AccessMode::kLoad
+              ? ConcurrentLookupIterator::SearchCachedProperty::kYes
+              : ConcurrentLookupIterator::SearchCachedProperty::kNo);
   if (!maybe_cell.has_value()) return {};
   return TryMakeRef(broker, *maybe_cell);
 }

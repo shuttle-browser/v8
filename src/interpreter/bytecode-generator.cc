@@ -1506,7 +1506,7 @@ using NullContextScopeFor = typename NullContextScopeHelper<Isolate>::Type;
 template <typename IsolateT>
 Handle<BytecodeArray> BytecodeGenerator::FinalizeBytecode(
     IsolateT* isolate, Handle<Script> script) {
-  DCHECK_EQ(ThreadId::Current(), isolate->thread_id());
+  DCHECK_EQ(base::ThreadId::Current(), isolate->thread_id());
 #ifdef DEBUG
   // Unoptimized compilation should be context-independent. Verify that we don't
   // access the native context by nulling it out during finalization.
@@ -1527,6 +1527,9 @@ Handle<BytecodeArray> BytecodeGenerator::FinalizeBytecode(
 
   if (HasStackOverflow()) return Handle<BytecodeArray>();
   Handle<BytecodeArray> bytecode_array = builder()->ToBytecodeArray(isolate);
+  bytecode_array->set_source_positions_coverage_flags(
+      info()->flags().coverage_enabled(),
+      info()->flags().block_coverage_enabled());
 
   if (incoming_new_target_or_generator_.is_valid()) {
     bytecode_array->set_incoming_new_target_or_generator_register(
@@ -1544,7 +1547,7 @@ template Handle<BytecodeArray> BytecodeGenerator::FinalizeBytecode(
 template <typename IsolateT>
 DirectHandle<TrustedByteArray> BytecodeGenerator::FinalizeSourcePositionTable(
     IsolateT* isolate) {
-  DCHECK_EQ(ThreadId::Current(), isolate->thread_id());
+  DCHECK_EQ(base::ThreadId::Current(), isolate->thread_id());
 #ifdef DEBUG
   // Unoptimized compilation should be context-independent. Verify that we don't
   // access the native context by nulling it out during finalization.
@@ -4292,6 +4295,23 @@ void BytecodeGenerator::VisitObjectLiteral(ObjectLiteral* expr) {
           VisitForAccumulatorValue(property->value());
           if (key->IsStringLiteral()) {
             FeedbackSlot slot = feedback_spec()->AddDefineNamedOwnICSlot();
+            // DefineNamedOwnPropertyInLiteral (AccessMode::kStoreInLiteral /
+            // StoreICMode::kDefineNamedOwnInLiteral) may initialize or
+            // overwrite a PropertyConstness::kConst field on the freshly
+            // created, unescaped literal object without invalidating constness:
+            // - For boilerplate literals (!clone_object_spread), compile-time
+            //   values were skipped above and duplicate keys were deduplicated
+            //   by CalculateEmitStore, so the boilerplate slot is guaranteed to
+            //   hold uninitialized_value / UninitializedHeapNumber.
+            // - For object spread literals (clone_object_spread), the literal
+            //   was created by CloneObject (not an inlined boilerplate), and
+            //   since we are before any computed property names and only emit a
+            //   store for the last duplicate key, no prior value of this
+            //   property on the fresh literal can have been observed or cached.
+            DCHECK(!property->is_computed_name());
+            DCHECK(clone_object_spread || !property->IsCompileTimeValue());
+            DCHECK_IMPLIES(property->is_first_instance_of_key(),
+                           property->last_instance_index() == property_index);
             builder()->DefineNamedOwnPropertyInLiteral(
                 literal, key->AsRawPropertyName(), feedback_index(slot));
           } else {

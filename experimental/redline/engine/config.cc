@@ -23,6 +23,7 @@
 #include "experimental/redline/core/tunable.h"
 #include "experimental/redline/corpus/corpus.h"
 #include "experimental/redline/engine/amplifier.h"
+#include "experimental/redline/engine/d8_flags.h"
 #include "experimental/redline/engine/prelude.h"
 #include "experimental/redline/generators/generator.h"
 #include "experimental/redline/mutators/mutator.h"
@@ -201,6 +202,68 @@ bool ReadAmplifyConfig(const JsonValue& amplify, FuzzConfig* c,
   }
   c->amplify_strategy = strategy;
   c->amplify_params = params.is_null() ? "{}" : params.ToString();
+  return true;
+}
+
+// "coverage": {"targets": FILE, "watch_optimized": BOOL, "focus": BOOL,
+// "focus_optimized": BOOL, "drop_unfocused": BOOL, "target_boost": N,
+// "weights": {"builtins": N,
+// "optimized": N, "bucket": N, "unfocused": N}} (exec/coverage.h,
+// corpus/feature_weights.h).
+bool ReadCoverageConfig(const JsonValue& coverage, FuzzConfig* c,
+                        std::string* error) {
+  if (coverage.is_null()) {
+    return true;
+  }
+  if (!coverage.is_object()) {
+    *error = "config: \"coverage\" must be an object";
+    return false;
+  }
+  for (const auto& [key, value] : coverage.as_object()) {
+    if (key != "targets" && key != "watch_optimized" && key != "focus" &&
+        key != "focus_optimized" && key != "drop_unfocused" &&
+        key != "target_boost" && key != "weights") {
+      *error = "config: unknown key \"" + key +
+               "\" in \"coverage\" (known: targets, watch_optimized, focus, "
+               "focus_optimized, drop_unfocused, target_boost, weights)";
+      return false;
+    }
+  }
+  c->targets_file = coverage.GetString("targets", c->targets_file);
+  c->watch_optimized = coverage.GetBool("watch_optimized", c->watch_optimized);
+  c->focus = coverage.GetBool("focus", c->focus);
+  FeatureWeights::Params& w = c->feature_weights;
+  w.optimized_in_focus =
+      coverage.GetBool("focus_optimized", w.optimized_in_focus);
+  w.drop_unfocused = coverage.GetBool("drop_unfocused", w.drop_unfocused);
+  w.target_boost = coverage.GetNumber("target_boost", w.target_boost);
+  const JsonValue& weights = coverage.Get("weights");
+  if (!weights.is_null()) {
+    if (!weights.is_object()) {
+      *error = "config: \"coverage.weights\" must be an object";
+      return false;
+    }
+    for (const auto& [key, value] : weights.as_object()) {
+      if (key != "builtins" && key != "optimized" && key != "bucket" &&
+          key != "unfocused") {
+        *error = "config: unknown key \"" + key +
+                 "\" in \"coverage.weights\" (known: builtins, optimized, "
+                 "bucket, unfocused)";
+        return false;
+      }
+    }
+    w.builtins = weights.GetNumber("builtins", w.builtins);
+    w.optimized = weights.GetNumber("optimized", w.optimized);
+    w.bucket = weights.GetNumber("bucket", w.bucket);
+    w.unfocused = weights.GetNumber("unfocused", w.unfocused);
+  }
+  for (double x :
+       {w.target_boost, w.builtins, w.optimized, w.bucket, w.unfocused}) {
+    if (!std::isfinite(x) || x < 0.0) {
+      *error = "config: the coverage weights must be finite and >= 0";
+      return false;
+    }
+  }
   return true;
 }
 
@@ -421,9 +484,9 @@ bool ReadStages(const JsonValue& json, FuzzConfig* c, std::string* error) {
   static constexpr std::initializer_list<std::string_view> kCommon = {
       "log", "capture", "stats"};
   static constexpr std::initializer_list<std::string_view> kKeys[kNumStages] = {
-      {},                                         // pick
-      {"enabled", "min_values", "extra_values"},  // prefix
-      {"consecutive", "rounds"},                  // mutate
+      {},                                                         // pick
+      {"enabled", "min_values", "extra_values", "from_scratch"},  // prefix
+      {"consecutive", "rounds", "scratch_codegen"},               // mutate
       {"min_reruns", "min_stable_reruns", "max_reruns",
        "flaky_threshold"},  // check
       {"enabled", "max_tests", "max_time_ms", "max_rounds", "target_time_ms",
@@ -473,12 +536,16 @@ bool ReadStages(const JsonValue& json, FuzzConfig* c, std::string* error) {
             static_cast<int>(object.GetInt("min_values", c->prefix_min_values));
         c->prefix_extra_values = static_cast<int>(
             object.GetInt("extra_values", c->prefix_extra_values));
+        c->prefix_from_scratch =
+            object.GetBool("from_scratch", c->prefix_from_scratch);
         break;
       case Stage::kMutate:
         c->consecutive_mutations = static_cast<int>(
             object.GetInt("consecutive", c->consecutive_mutations));
         c->mutation_rounds =
             static_cast<int>(object.GetInt("rounds", c->mutation_rounds));
+        c->scratch_codegen_links = static_cast<int>(
+            object.GetInt("scratch_codegen", c->scratch_codegen_links));
         break;
       case Stage::kCheck:
         c->min_reruns =
@@ -546,14 +613,16 @@ std::string StagesJson(const FuzzConfig& c) {
     JsonObject o;
     o.Add("enabled", c.value_prefix);
     o.Add("min_values", c.prefix_min_values)
-        .Add("extra_values", c.prefix_extra_values);
+        .Add("extra_values", c.prefix_extra_values)
+        .Add("from_scratch", c.prefix_from_scratch);
     common(Stage::kPrefix, &o);
     stages.AddRaw("prefix", o.ToString());
   }
   {
     JsonObject o;
     o.Add("consecutive", c.consecutive_mutations)
-        .Add("rounds", c.mutation_rounds);
+        .Add("rounds", c.mutation_rounds)
+        .Add("scratch_codegen", c.scratch_codegen_links);
     common(Stage::kMutate, &o);
     stages.AddRaw("mutate", o.ToString());
   }
@@ -598,7 +667,11 @@ std::string StagesJson(const FuzzConfig& c) {
   return stages.ToString();
 }
 
-bool ApplyJson(const JsonValue& json, FuzzConfig* c, std::string* error) {
+// Applies one layer of JSON configuration to `c`. If `kept_extra_args` is
+// not null, it collects the "d8_extra_args" that are still in the d8 flags
+// after this layer.
+bool ApplyJson(const JsonValue& json, FuzzConfig* c, std::string* error,
+               std::vector<std::string>* kept_extra_args = nullptr) {
   if (!json.is_object()) {
     *error = "config: top level must be an object";
     return false;
@@ -633,6 +706,12 @@ bool ApplyJson(const JsonValue& json, FuzzConfig* c, std::string* error) {
   c->value_prefix = json.GetBool("value_prefix", c->value_prefix);
   c->minimize = json.GetBool("minimize", c->minimize);
   c->minimize_crashes = json.GetBool("minimize_crashes", c->minimize_crashes);
+  c->harvest_crashes = json.GetBool("harvest_crashes", c->harvest_crashes);
+  c->randomize_d8_flags =
+      json.GetBool("randomize_d8_flags", c->randomize_d8_flags);
+  c->d8_flag_profile = json.GetString("d8_flag_profile", c->d8_flag_profile);
+  c->minimize_code_edges =
+      json.GetBool("minimize_code_edges", c->minimize_code_edges);
   c->minimize_imports = json.GetBool("minimize_imports", c->minimize_imports);
   c->import_all = json.GetBool("import_all", c->import_all);
   c->initial_programs =
@@ -653,6 +732,8 @@ bool ApplyJson(const JsonValue& json, FuzzConfig* c, std::string* error) {
       static_cast<int>(json.GetInt("crash_history", c->crash_history));
   c->crash_history_budget_sec =
       json.GetNumber("crash_history_budget_sec", c->crash_history_budget_sec);
+  c->crash_bundle_runs =
+      static_cast<int>(json.GetInt("crash_bundle_runs", c->crash_bundle_runs));
   c->target.timeout_us = static_cast<uint64_t>(
       json.GetNumber("timeout_ms",
                      static_cast<double>(c->target.timeout_us) / 1000.0) *
@@ -664,7 +745,11 @@ bool ApplyJson(const JsonValue& json, FuzzConfig* c, std::string* error) {
   }
   const JsonValue& d8_args = json.Get("d8_args");
   if (d8_args.is_array()) {
+    // "d8_args" replaces all the d8 flags of the earlier layers.
     c->target.args.clear();
+    if (kept_extra_args != nullptr) {
+      kept_extra_args->clear();
+    }
     for (const JsonValue& arg : d8_args.as_array()) {
       if (arg.is_string()) {
         c->target.args.push_back(arg.as_string());
@@ -677,6 +762,9 @@ bool ApplyJson(const JsonValue& json, FuzzConfig* c, std::string* error) {
     for (const JsonValue& arg : d8_extra_args.as_array()) {
       if (arg.is_string()) {
         c->target.args.push_back(arg.as_string());
+        if (kept_extra_args != nullptr) {
+          kept_extra_args->push_back(arg.as_string());
+        }
       }
     }
   }
@@ -700,7 +788,8 @@ bool ApplyJson(const JsonValue& json, FuzzConfig* c, std::string* error) {
   std::vector<std::string> explicit_imports = c->imports;
   if (!ReadInitConfig(json.Get("init"), c, error) ||
       !ReadAcceptConfig(json.Get("accept"), c, error) ||
-      !ReadAmplifyConfig(json.Get("amplify"), c, error)) {
+      !ReadAmplifyConfig(json.Get("amplify"), c, error) ||
+      !ReadCoverageConfig(json.Get("coverage"), c, error)) {
     return false;
   }
   if (c->imports.empty() && !explicit_imports.empty() &&
@@ -767,6 +856,9 @@ bool FuzzConfig::Load(const Flags& flags, FuzzConfig* c, std::string* error,
   // almost always an endless loop, and it would eat the time of ten others.
   c->target.timeout_us = static_cast<uint64_t>(500) * 1000;
   c->prelude_source = "default";
+  // The "d8_extra_args" of the preset and of --config. The flag --d8-args
+  // replaces the other d8 flags and keeps these flags.
+  std::vector<std::string> kept_extra_args;
 
   // Layer 1b: a preset (DESIGN.md 8), a configuration for one use case:
   // --preset=NAME loads experimental/redline/presets/NAME.json (found next to
@@ -785,7 +877,8 @@ bool FuzzConfig::Load(const Flags& flags, FuzzConfig* c, std::string* error,
       return false;
     }
     JsonValue json;
-    if (!JsonValue::Parse(text, &json, error) || !ApplyJson(json, c, error)) {
+    if (!JsonValue::Parse(text, &json, error) ||
+        !ApplyJson(json, c, error, &kept_extra_args)) {
       *error = "--preset=" + preset + ": " + *error;
       return false;
     }
@@ -810,7 +903,7 @@ bool FuzzConfig::Load(const Flags& flags, FuzzConfig* c, std::string* error,
       *error = where + ":" + *error;
       return false;
     }
-    if (!ApplyJson(json, c, error)) {
+    if (!ApplyJson(json, c, error, &kept_extra_args)) {
       return false;
     }
   }
@@ -842,6 +935,8 @@ bool FuzzConfig::Load(const Flags& flags, FuzzConfig* c, std::string* error,
     c->target.executable = d8;
     if (flags.Has("d8-args")) {
       c->target.args = SplitWhitespace(flags.GetString("d8-args"));
+      c->target.args.insert(c->target.args.end(), kept_extra_args.begin(),
+                            kept_extra_args.end());
     }
     for (const std::string& arg :
          SplitWhitespace(flags.GetString("d8-extra-args"))) {
@@ -876,6 +971,27 @@ bool FuzzConfig::Load(const Flags& flags, FuzzConfig* c, std::string* error,
   c->jobs = static_cast<int>(flags.GetInt("jobs", c->jobs));
   c->seed = static_cast<uint64_t>(
       flags.GetInt("seed", static_cast<int64_t>(c->seed)));
+  // Coverage counters and change-based fuzzing.
+  c->targets_file = flags.GetString("targets", c->targets_file);
+  c->watch_optimized = flags.GetBool("watch-optimized", c->watch_optimized);
+  c->focus = flags.GetBool("focus", c->focus);
+  {
+    FeatureWeights::Params& w = c->feature_weights;
+    w.target_boost = flags.GetDouble("target-boost", w.target_boost);
+    w.builtins = flags.GetDouble("builtins-weight", w.builtins);
+    w.optimized = flags.GetDouble("optimized-weight", w.optimized);
+    w.bucket = flags.GetDouble("bucket-weight", w.bucket);
+    w.unfocused = flags.GetDouble("unfocused-weight", w.unfocused);
+    w.optimized_in_focus =
+        flags.GetBool("focus-optimized", w.optimized_in_focus);
+    for (double x :
+         {w.target_boost, w.builtins, w.optimized, w.bucket, w.unfocused}) {
+      if (!std::isfinite(x) || x < 0.0) {
+        *error = "the coverage weights must be finite and >= 0";
+        return false;
+      }
+    }
+  }
   c->out_dir = flags.GetString("out", c->out_dir);
   c->import_root = flags.GetString("import-root", c->import_root);
   c->duration_sec = flags.GetDouble("duration", c->duration_sec);
@@ -900,6 +1016,12 @@ bool FuzzConfig::Load(const Flags& flags, FuzzConfig* c, std::string* error,
       static_cast<int>(flags.GetInt("flaky-threshold", c->flaky_threshold));
   c->value_prefix = flags.GetBool("value-prefix", c->value_prefix);
   c->minimize = flags.GetBool("minimize", c->minimize);
+  c->harvest_crashes = flags.GetBool("harvest-crashes", c->harvest_crashes);
+  c->randomize_d8_flags =
+      flags.GetBool("randomize-d8-flags", c->randomize_d8_flags);
+  c->d8_flag_profile = flags.GetString("d8-flag-profile", c->d8_flag_profile);
+  c->minimize_code_edges =
+      flags.GetBool("minimize-code-edges", c->minimize_code_edges);
   c->minimize_crashes = flags.GetBool("minimize-crashes", c->minimize_crashes);
   c->minimize_imports = flags.GetBool("minimize-imports", c->minimize_imports);
   c->import_all = flags.GetBool("import-all", c->import_all);
@@ -922,6 +1044,8 @@ bool FuzzConfig::Load(const Flags& flags, FuzzConfig* c, std::string* error,
       static_cast<int>(flags.GetInt("crash-history", c->crash_history));
   c->crash_history_budget_sec =
       flags.GetDouble("crash-history-budget", c->crash_history_budget_sec);
+  c->crash_bundle_runs =
+      static_cast<int>(flags.GetInt("crash-bundle-runs", c->crash_bundle_runs));
   c->crash_minimizer.max_tests = static_cast<int>(
       flags.GetInt("crash-minimizer-max-tests", c->crash_minimizer.max_tests));
   c->crash_minimizer.max_time_ms = static_cast<uint64_t>(
@@ -962,6 +1086,10 @@ bool FuzzConfig::Load(const Flags& flags, FuzzConfig* c, std::string* error,
       static_cast<int>(flags.GetInt("prefix-min-values", c->prefix_min_values));
   c->prefix_extra_values = static_cast<int>(
       flags.GetInt("prefix-extra-values", c->prefix_extra_values));
+  c->prefix_from_scratch =
+      flags.GetBool("prefix-from-scratch", c->prefix_from_scratch);
+  c->scratch_codegen_links = static_cast<int>(
+      flags.GetInt("scratch-codegen", c->scratch_codegen_links));
   for (const std::string& rule : flags.GetList("capture", ';')) {
     Stage stage;
     CaptureRule capture;
@@ -1002,6 +1130,12 @@ bool FuzzConfig::Load(const Flags& flags, FuzzConfig* c, std::string* error,
     *error = "--jobs must be at least 1";
     return false;
   }
+  D8FlagProfile flag_profile;
+  if (!ParseD8FlagProfile(c->d8_flag_profile, &flag_profile)) {
+    *error = "d8_flag_profile must be \"maglev\" or \"turbolev\", not \"" +
+             c->d8_flag_profile + "\"";
+    return false;
+  }
   // The run seed is drawn only when there is a run; --dump-config shows 0
   // (= from the clock) like the configuration said.
   if (c->seed == 0 && for_run) {
@@ -1018,6 +1152,9 @@ bool FuzzConfig::Load(const Flags& flags, FuzzConfig* c, std::string* error,
   }
   if (c->prefix_extra_values < 0) {
     c->prefix_extra_values = 0;
+  }
+  if (c->scratch_codegen_links < 1) {
+    c->scratch_codegen_links = 1;
   }
   if (c->min_stable_reruns < 1) {
     c->min_stable_reruns = 1;
@@ -1148,6 +1285,10 @@ std::string FuzzConfig::ToJson(Detail detail) const {
   o.Add("syntax_check", syntax_check);
   o.Add("component_stats", component_stats);
   o.Add("minimize_crashes", minimize_crashes);
+  o.Add("harvest_crashes", harvest_crashes);
+  o.Add("randomize_d8_flags", randomize_d8_flags);
+  o.Add("d8_flag_profile", d8_flag_profile);
+  o.Add("minimize_code_edges", minimize_code_edges);
   o.Add("minimize_imports", minimize_imports);
   o.Add("import_all", import_all);
   o.Add("initial_programs", initial_programs);
@@ -1157,6 +1298,7 @@ std::string FuzzConfig::ToJson(Detail detail) const {
   o.Add("minimize_crashes_per_signature", minimize_crashes_per_signature);
   o.Add("crash_history", crash_history);
   o.Add("crash_history_budget_sec", crash_history_budget_sec);
+  o.Add("crash_bundle_runs", crash_bundle_runs);
   o.AddRaw("crash_minimizer", MinimizerOptionsJson(crash_minimizer));
   {
     // The Init strategy as the fields describe it, so that loading the
@@ -1181,6 +1323,20 @@ std::string FuzzConfig::ToJson(Detail detail) const {
     amplify.Add("strategy", amplify_strategy);
     amplify.AddRaw("params", amplify_params);
     o.AddRaw("amplify", amplify.ToString());
+    JsonObject coverage;
+    coverage.Add("targets", targets_file)
+        .Add("watch_optimized", watch_optimized);
+    coverage.Add("focus", focus)
+        .Add("focus_optimized", feature_weights.optimized_in_focus)
+        .Add("drop_unfocused", feature_weights.drop_unfocused)
+        .Add("target_boost", feature_weights.target_boost);
+    JsonObject weights;
+    weights.Add("builtins", feature_weights.builtins)
+        .Add("optimized", feature_weights.optimized);
+    weights.Add("bucket", feature_weights.bucket)
+        .Add("unfocused", feature_weights.unfocused);
+    coverage.AddRaw("weights", weights.ToString());
+    o.AddRaw("coverage", coverage.ToString());
   }
   JsonObject sel;
   BuiltSelectors built;
@@ -1256,6 +1412,11 @@ std::string FuzzConfig::JsonHelp() {
       "    \"d8\": \"out/fuzzbuild/d8\", \"d8_args\": [\"--expose-gc\", ...],\n"
       "    \"d8_extra_args\": [\"--maglev\"],  // appended to d8_args (like "
       "--d8-extra-args)\n"
+      "    \"randomize_d8_flags\": false,     // random extra d8 flags for "
+      "each "
+      "new d8 (flags.* tunables)\n"
+      "    \"d8_flag_profile\": \"maglev\",    // the random flags: "
+      "\"maglev\" or \"turbolev\"\n"
       "    \"timeout_ms\": 1000, \"jobs\": 8, \"seed\": 1, \"out_dir\": "
       "\"redline-out\",\n"
       "    \"imports\": [\"test/mjsunit\"], \"import_root\": \".\", "
@@ -1268,9 +1429,13 @@ std::string FuzzConfig::JsonHelp() {
       "stage\n"
       "      \"pick\":     {\"stats\": true},\n"
       "      \"prefix\":   {\"enabled\": true, \"min_values\": 10, "
-      "\"extra_values\": 5},\n"
+      "\"extra_values\": 5,\n"
+      "                   \"from_scratch\": true},  // also prefix the "
+      "empty program\n"
       "      \"mutate\":   {\"consecutive\": 5, \"rounds\": 0, \"log\": "
       "\"off\",\n"
+      "                   \"scratch_codegen\": 3,  // CodeGen-only links "
+      "from scratch\n"
       "                   \"capture\": {\"on\": [\"timeout\"], \"mutators\": "
       "[\"Splice\"], \"max\": 50}},\n"
       "      \"check\":    {\"min_reruns\": 5, \"min_stable_reruns\": 1, "
@@ -1293,7 +1458,7 @@ std::string FuzzConfig::JsonHelp() {
       "    \"crash_reruns\": 3, \"crash_reruns_stop_after\": 2, "
       "\"max_crashes_per_signature\": 5,\n"
       "    \"minimize_crashes_per_signature\": 2, \"crash_history\": 100,\n"
-      "    \"crash_history_budget_sec\": 90,\n"
+      "    \"crash_history_budget_sec\": 90, \"crash_bundle_runs\": 3,\n"
       "    \"crash_minimizer\": {\"max_tests\": 1000, \"max_time_ms\": 120000, "
       "\"max_rounds\": 4,\n"
       "                        \"target_time_ms\": 30000, \"min_tests\": "

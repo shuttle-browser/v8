@@ -1681,7 +1681,7 @@ THREADED_TEST(InterceptorLoadGlobalICGlobalWithMaskingInterceptor) {
 // Test load of a non-existing global through prototype chain when a global
 // object has an interceptor.
 void InterceptorLoadICGlobalWithInterceptor(bool masking) {
-  i::v8_flags.allow_natives_syntax = true;
+  i::v8_flags.allow_natives_syntax.Set(true);
   v8::Isolate* isolate = CcTest::isolate();
   v8::HandleScope scope(isolate);
   v8::Local<v8::ObjectTemplate> templ_global = v8::ObjectTemplate::New(isolate);
@@ -2980,7 +2980,7 @@ THREADED_TEST(PropertyDefinerCallbackInDefineNamedOwnIC) {
   }
 
   {
-    i::v8_flags.lazy_feedback_allocation = false;
+    i::v8_flags.lazy_feedback_allocation.Set(false);
     i::FlagList::EnforceFlagImplications();
     LocalContext env;
     v8::HandleScope scope(env.isolate());
@@ -2988,7 +2988,7 @@ THREADED_TEST(PropertyDefinerCallbackInDefineNamedOwnIC) {
   }
 
   {
-    i::v8_flags.lazy_feedback_allocation = false;
+    i::v8_flags.lazy_feedback_allocation.Set(false);
     i::FlagList::EnforceFlagImplications();
     LocalContext env;
     v8::HandleScope scope(env.isolate());
@@ -4875,7 +4875,7 @@ v8::Intercepted InterceptorCallICGetter6(
 // Same test as above, except the code is wrapped in a function
 // to test the optimized compiler.
 THREADED_TEST(InterceptorCallICConstantFunctionNotNeededWrapped) {
-  i::v8_flags.allow_natives_syntax = true;
+  i::v8_flags.allow_natives_syntax.Set(true);
   v8::Isolate* isolate = CcTest::isolate();
   v8::HandleScope scope(isolate);
   v8::Local<v8::ObjectTemplate> templ = ObjectTemplate::New(isolate);
@@ -5440,7 +5440,7 @@ THREADED_TEST(NamedPropertyHandlerGetterAttributes) {
 
 THREADED_TEST(Regress256330) {
   if (!i::v8_flags.turbofan) return;
-  i::v8_flags.allow_natives_syntax = true;
+  i::v8_flags.allow_natives_syntax.Set(true);
   LocalContext context;
   v8::HandleScope scope(context.isolate());
   Local<FunctionTemplate> templ = FunctionTemplate::New(context.isolate());
@@ -5463,7 +5463,7 @@ THREADED_TEST(Regress256330) {
 }
 
 THREADED_TEST(OptimizedInterceptorSetter) {
-  i::v8_flags.allow_natives_syntax = true;
+  i::v8_flags.allow_natives_syntax.Set(true);
   v8::HandleScope scope(CcTest::isolate());
   Local<FunctionTemplate> templ = FunctionTemplate::New(CcTest::isolate());
   AddInterceptor(templ, InterceptorGetter, InterceptorSetter);
@@ -5493,7 +5493,7 @@ THREADED_TEST(OptimizedInterceptorSetter) {
 }
 
 THREADED_TEST(OptimizedInterceptorGetter) {
-  i::v8_flags.allow_natives_syntax = true;
+  i::v8_flags.allow_natives_syntax.Set(true);
   v8::HandleScope scope(CcTest::isolate());
   Local<FunctionTemplate> templ = FunctionTemplate::New(CcTest::isolate());
   AddInterceptor(templ, InterceptorGetter, InterceptorSetter);
@@ -5520,7 +5520,7 @@ THREADED_TEST(OptimizedInterceptorGetter) {
 }
 
 THREADED_TEST(OptimizedInterceptorFieldRead) {
-  i::v8_flags.allow_natives_syntax = true;
+  i::v8_flags.allow_natives_syntax.Set(true);
   v8::HandleScope scope(CcTest::isolate());
   Local<FunctionTemplate> templ = FunctionTemplate::New(CcTest::isolate());
   AddInterceptor(templ, InterceptorGetter, InterceptorSetter);
@@ -5544,7 +5544,7 @@ THREADED_TEST(OptimizedInterceptorFieldRead) {
 }
 
 THREADED_TEST(OptimizedInterceptorFieldWrite) {
-  i::v8_flags.allow_natives_syntax = true;
+  i::v8_flags.allow_natives_syntax.Set(true);
   v8::HandleScope scope(CcTest::isolate());
   Local<FunctionTemplate> templ = FunctionTemplate::New(CcTest::isolate());
   AddInterceptor(templ, InterceptorGetter, InterceptorSetter);
@@ -6245,7 +6245,7 @@ void TestPreprocessExceptionFromInterceptors(
 // Can't use THREADED_TEST because this test requires setting an exception
 // preprocessing callback which might be observable in other tests.
 TEST(PreprocessExceptionFromInterceptorsWithoutDescriptorCallback) {
-  i::v8_flags.experimental_report_exceptions_from_callbacks = true;
+  i::v8_flags.experimental_report_exceptions_from_callbacks.Set(true);
   v8::Isolate* isolate = CcTest::isolate();
   v8::HandleScope handle_scope(isolate);
 
@@ -6285,7 +6285,7 @@ TEST(PreprocessExceptionFromInterceptorsWithoutDescriptorCallback) {
 // Can't use THREADED_TEST because this test requires setting an exception
 // preprocessing callback which might be observable in other tests.
 TEST(PreprocessExceptionFromInterceptorsWithDescriptorCallback) {
-  i::v8_flags.experimental_report_exceptions_from_callbacks = true;
+  i::v8_flags.experimental_report_exceptions_from_callbacks.Set(true);
   v8::Isolate* isolate = CcTest::isolate();
   v8::HandleScope handle_scope(isolate);
 
@@ -7430,7 +7430,7 @@ class ArrayLike {
 
 THREADED_TEST(ArrayLikeInterceptor) {
   auto isolate = CcTest::isolate();
-  i::v8_flags.fast_api_indexof = true;
+  i::v8_flags.fast_api_indexof.Set(true);
   v8::HandleScope handle_scope(isolate);
   LocalContext context;
 
@@ -7729,7 +7729,7 @@ v8::Intercepted DenseSetterMonomorphicBypass(
 }  // namespace
 
 TEST(RegressKeyedStoreICMonomorphicBypassInterceptor) {
-  v8::internal::v8_flags.allow_natives_syntax = true;
+  v8::internal::v8_flags.allow_natives_syntax.Set(true);
   v8::Isolate* isolate = CcTest::isolate();
   v8::HandleScope scope(isolate);
   LocalContext env;

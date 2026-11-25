@@ -215,13 +215,6 @@ void MaglevGraphBuilder::MinimizeContextChainDepth(
   }
 }
 
-void MaglevGraphBuilder::EscapeContext() {
-  ValueNode* context = GetContext();
-  if (InlinedAllocation* alloc = context->TryCast<InlinedAllocation>()) {
-    alloc->ForceEscaping();
-  }
-}
-
 // TODO(victorgomes): This scope should be moved to MaglevReducer after all its
 // uses were moved.
 class V8_NODISCARD MaglevGraphBuilder::SaveCallSpeculationScope {
@@ -520,6 +513,19 @@ void MaglevGraphBuilder::MaglevSubGraphBuilder::EndLoop(LoopLabel* loop_label) {
   block->set_predecessor_id(merge_state->predecessor_count() - 1);
 }
 
+template <typename FBody>
+ReduceResult MaglevGraphBuilder::MaglevSubGraphBuilder::BuildLoop(
+    std::initializer_list<Variable*> loop_vars, FBody&& body_fn) {
+  Label loop_end(this, kMaxLoopExitPredecessors, loop_vars);
+  LoopLabel loop_header = BeginLoop(loop_vars);
+  MaybeReduceResult body_result = body_fn(&loop_end);
+  CHECK(body_result.IsDone());
+  DCHECK_EQ(body_result.IsDoneWithAbort(),
+            builder_->current_block() == nullptr);
+  EndLoop(&loop_header);
+  return TrimPredecessorsAndBind(&loop_end);
+}
+
 void MaglevGraphBuilder::MaglevSubGraphBuilder::Bind(Label* label) {
   DCHECK_NULL(builder_->current_block());
   CHECK_NOT_NULL(label->variable_merge_state_);
@@ -615,27 +621,28 @@ void MaglevGraphBuilder::MaglevSubGraphBuilder::
     TakeKnownNodeAspectsAndVOsFromParent() {
   DCHECK_NULL(variable_frame_.known_node_aspects());
   variable_frame_.set_known_node_aspects(
-      builder_->current_interpreter_frame_.known_node_aspects());
+      builder_->current_interpreter_frame_.TakeKnownNodeAspects());
 }
 
 void MaglevGraphBuilder::MaglevSubGraphBuilder::
     MoveKnownNodeAspectsAndVOsToParent() {
   DCHECK_NOT_NULL(variable_frame_.known_node_aspects());
   builder_->current_interpreter_frame_.set_known_node_aspects(
-      variable_frame_.known_node_aspects());
-  variable_frame_.clear_known_node_aspects();
+      variable_frame_.TakeKnownNodeAspects());
 }
 
 void MaglevGraphBuilder::MaglevSubGraphBuilder::MergeIntoLabel(
     Label* label, BasicBlock* predecessor) {
-  BorrowParentKnownNodeAspectsAndVOs borrow(this);
   if (label->variable_merge_state_ == nullptr) {
     // If there's no merge state, allocate a new one.
     DCHECK_NULL(label->merge_state_);
-    label->variable_merge_state_ = MergePointInterpreterFrameState::New(
-        *dummy_unit_, variable_frame_, 0, label->predecessor_count_,
-        predecessor, label->variable_liveness_,
-        builder_->GetCurrentScopeInfo());
+    {
+      BorrowParentKnownNodeAspectsAndVOs borrow(this);
+      label->variable_merge_state_ = MergePointInterpreterFrameState::New(
+          *dummy_unit_, variable_frame_, 0, label->predecessor_count_,
+          predecessor, label->variable_liveness_,
+          builder_->GetCurrentScopeInfo());
+    }
     if (label->ShouldTrackInterpreterFrameState()) {
       label->merge_state_ = MergePointInterpreterFrameState::New(
           *compilation_unit(), builder_->current_interpreter_frame_, 0,
@@ -646,9 +653,14 @@ void MaglevGraphBuilder::MaglevSubGraphBuilder::MergeIntoLabel(
 
   } else {
     // If there already is a frame state, merge.
-    label->variable_merge_state_->Merge(
-        builder_->graph(), builder_->is_tracing(), *dummy_unit_,
-        variable_frame_, predecessor, builder_->GetCurrentScopeInfo());
+    CHECK_LT(label->variable_merge_state_->predecessors_so_far(),
+             label->predecessor_count_);
+    {
+      BorrowParentKnownNodeAspectsAndVOs borrow(this);
+      label->variable_merge_state_->Merge(
+          builder_->graph(), builder_->is_tracing(), *dummy_unit_,
+          variable_frame_, predecessor, builder_->GetCurrentScopeInfo());
+    }
     if (label->ShouldTrackInterpreterFrameState()) {
       DCHECK_NOT_NULL(label->merge_state_);
       label->merge_state_->Merge(builder_->graph(), builder_->is_tracing(),
@@ -685,14 +697,12 @@ MaglevGraphBuilder::MaglevGraphBuilder(LocalIsolate* local_isolate,
       // Overallocate merge_states_ by one to allow always looking up the
       // next offset. This overallocated slot can also be used for the inline
       // exit when needed.
-      merge_states_(zone()->AllocateArray<MergePointInterpreterFrameState*>(
-          bytecode().length() + 1)),
+      merge_states_(bytecode().length() + 1, zone()),
       register_scope_infos_(*compilation_unit_),
       current_interpreter_frame_(
           *compilation_unit_,
-          is_inline() ? caller_details->known_node_aspects
-                      : compilation_unit_->zone()->New<KnownNodeAspects>(
-                            compilation_unit_->zone())),
+          is_inline() ? std::move(caller_details->known_node_aspects)
+                      : KnownNodeAspects::New(graph_->kna_pool())),
       is_turbolev_(compilation_unit->info()->is_turbolev()),
       entrypoint_(compilation_unit->is_osr()
                       ? bytecode_analysis_.osr_entry_point()
@@ -719,8 +729,6 @@ MaglevGraphBuilder::MaglevGraphBuilder(LocalIsolate* local_isolate,
       graph_->set_inlining_tree_debug_info(current_inlining_tree_debug_info_);
     }
   }
-  memset(merge_states_, 0,
-         (bytecode().length() + 1) * sizeof(InterpreterFrameState*));
   // Default construct basic block refs.
   // TODO(leszeks): This could be a memset of nullptr to ..._jump_targets_.
   for (int i = 0; i < bytecode().length(); ++i) {
@@ -733,7 +741,6 @@ MaglevGraphBuilder::MaglevGraphBuilder(LocalIsolate* local_isolate,
     // The allocation/initialisation logic here relies on inline_exit_offset
     // being the offset one past the end of the bytecode.
     DCHECK_EQ(inline_exit_offset(), bytecode().length());
-    merge_states_[inline_exit_offset()] = nullptr;
     new (&jump_targets_[inline_exit_offset()]) BasicBlockRef();
     if (caller_details->loop_effects) {
       loop_effects_ = caller_details->loop_effects;
@@ -1090,7 +1097,6 @@ DeoptFrame* MaglevGraphBuilder::GetLatestCheckpointedFrame() {
     return GetDeoptFrameForEntryStackCheck();
   }
   if (!latest_checkpointed_frame_) {
-    current_interpreter_frame_.virtual_objects().Snapshot();
     latest_checkpointed_frame_ = zone()->New<InterpretedDeoptFrame>(
         *compilation_unit_,
         zone()->New<CompactInterpreterFrameState>(
@@ -1209,7 +1215,6 @@ DeoptFrame* MaglevGraphBuilder::GetDeoptFrameForLazyDeoptHelper(
     }
 #endif
 
-    current_interpreter_frame_.virtual_objects().Snapshot();
     InterpretedDeoptFrame* ret = zone()->New<InterpretedDeoptFrame>(
         *compilation_unit_,
         zone()->New<CompactInterpreterFrameState>(*compilation_unit_, liveness,
@@ -1341,7 +1346,7 @@ ValueNode* MaglevGraphBuilder::GetUint8ClampedForToNumber(ValueNode* value) {
       if (SmiConstant* constant = value->TryCast<SmiConstant>()) {
         return GetInt32Constant(ClampToUint8(constant->value().value()));
       }
-      NodeInfo* info = known_node_aspects().TryGetInfoFor(value);
+      const NodeInfo* info = known_node_aspects().TryGetInfoFor(value);
       if (info && info->alternative().int32()) {
         return AddNewNodeNoInputConversion<Int32ToUint8Clamped>(
             {info->alternative().int32()});
@@ -1867,8 +1872,8 @@ uint32_t MaglevGraphBuilder::StringLengthStaticLowerBound(ValueNode* string,
   return 0;
 }
 
-MaybeReduceResult MaglevGraphBuilder::TryBuildNewConsString(
-    ValueNode* left, ValueNode* right, AllocationType allocation_type) {
+MaybeReduceResult MaglevGraphBuilder::TryBuildNewConsString(ValueNode* left,
+                                                            ValueNode* right) {
   if (!v8_flags.maglev_cons_string_elision) {
     return ReduceResult::Fail();
   }
@@ -1934,7 +1939,7 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildNewConsString(
     GET_VALUE_OR_ABORT(new_map, BuildNewConsStringMap(left, right));
     VirtualObject* cons_string =
         reducer_.CreateConsString(new_map, new_length, left, right);
-    return reducer_.BuildInlinedAllocation(cons_string, allocation_type);
+    return reducer_.BuildInlinedAllocation(cons_string);
   };
 
   if (unconditionally) {
@@ -3613,7 +3618,6 @@ ReduceResult MaglevGraphBuilder::VisitStaLookupSlot() {
   ValueNode* value = GetAccumulator();
   ValueNode* name = GetConstant(GetRefOperand<Name>(0));
   uint32_t flags = GetFlag8Operand(1);
-  EscapeContext();
   SetAccumulator(
       BuildCallRuntime(StaLookupSlotFunction(flags), {name, value}).value());
   return ReduceResult::Done();
@@ -3673,7 +3677,14 @@ ReduceResult MaglevGraphBuilder::BuildCheckStringOrOddball(ValueNode* object) {
 ReduceResult MaglevGraphBuilder::BuildCheckNumber(ValueNode* object) {
   RETURN_IF_DONE(reducer_.EnsureType(object, NodeType::kNumber,
                                      DeoptimizeReason::kNotANumber));
-  return AddNewNode<CheckNumber>({object}, Object::Conversion::kToNumber);
+  if (object->is_holey_float64()) {
+    DCHECK(!object->Is<HoleyFloat64Constant>());
+    return AddNewNodeNoInputConversion<CheckHoleyFloat64NotHoleOrUndefined>(
+        {object});
+  }
+  DCHECK(object->is_tagged());
+  return AddNewNodeNoInputConversion<CheckNumber>(
+      {object}, Object::Conversion::kToNumber);
 }
 
 ReduceResult MaglevGraphBuilder::BuildCheckSymbol(ValueNode* object) {
@@ -3729,12 +3740,11 @@ ReduceResult MaglevGraphBuilder::BuildTransitionElementsKindOrCheckMap(
     CHECK(!transition_source.is_migration_target());
   }
 
-  NodeInfo* known_info = GetOrCreateInfoFor(heap_object);
-
   RETURN_IF_ABORT(AddNewNode<TransitionElementsKindOrCheckMap>(
       {heap_object, object_map}, transition_sources, transition_target));
   // After this operation, heap_object's map is transition_target (or we
   // deopted).
+  NodeInfo* known_info = GetOrCreateInfoFor(heap_object);
   if (!known_info->SetPossibleMaps(
           PossibleMaps{transition_target}, !transition_target.is_stable(),
           StaticTypeForMap(transition_target, broker()), broker(),
@@ -3814,8 +3824,6 @@ ReduceResult MaglevGraphBuilder::BuildTransitionElementsKindAndCompareMaps(
     std::optional<MaglevSubGraphBuilder::Label>& if_not_matched) {
   DCHECK(!transition_target.is_migration_target());
 
-  NodeInfo* known_info = GetOrCreateInfoFor(heap_object);
-
   // TODO(pthier): Calculate and use the intersection of known maps with
   // (transition_sources union transition_target).
 
@@ -3831,6 +3839,7 @@ ReduceResult MaglevGraphBuilder::BuildTransitionElementsKindAndCompareMaps(
       &*if_not_matched, {new_map, GetConstant(transition_target)}));
   // After the branch, object's map is transition_target.
   DCHECK(transition_target.IsJSReceiverMap());
+  NodeInfo* known_info = GetOrCreateInfoFor(heap_object);
   if (!known_info->SetPossibleMaps(
           PossibleMaps{transition_target}, !transition_target.is_stable(),
           StaticTypeForMap(transition_target, broker()), broker(),
@@ -3857,176 +3866,30 @@ bool MaglevGraphBuilder::IsEscaping(InlinedAllocation* alloc) {
   return false;
 }
 
-namespace {
-
-bool VerifyIsNotEscaping(VirtualObjectList vos, InlinedAllocation* alloc) {
-  for (VirtualObject* vo : vos) {
-    DCHECK_NOT_NULL(vo->allocation());
-    if (vo->allocation() == alloc) continue;
-    bool escaped = false;
-    vo->ForEachSlot([&](ValueNode* nested_value, vobj::Field desc) -> bool {
-      if (escaped) return true;
-      if (!nested_value->Is<InlinedAllocation>()) return true;
-      ValueNode* nested_alloc = nested_value->Cast<InlinedAllocation>();
-      if (nested_alloc == alloc) {
-        if (vo->allocation()->HasEscapingUses() ||
-            !VerifyIsNotEscaping(vos, vo->allocation())) {
-          escaped = true;
-        }
-      }
-      return true;
-    });
-    if (escaped) return false;
-  }
-  return true;
-}
-}  // namespace
-
-bool MaglevGraphBuilder::CanTrackObjectChanges(ValueNode* receiver,
-                                               TrackObjectMode mode) {
-  DCHECK(!receiver->Is<VirtualObject>());
-  if (!v8_flags.maglev_object_tracking) return false;
-  if (!receiver->Is<InlinedAllocation>()) return false;
-  InlinedAllocation* alloc = receiver->Cast<InlinedAllocation>();
-  if (IsEscaping(alloc)) return false;
-  if (mode == TrackObjectMode::kStore) {
-    // If we have two objects A and B, such that A points to B (it contains B in
-    // one of its field), we cannot change B without also changing A, even if
-    // both can be elided. For now, we escape both objects instead.
-    if (graph_->allocations_elide_map().find(alloc) !=
-        graph_->allocations_elide_map().end()) {
-      return false;
-    }
-    // Ensure object is escaped if we are within a try-catch block. This is
-    // crucial because a deoptimization point inside the catch handler could
-    // re-materialize objects differently, depending on whether the throw
-    // occurred before or after this store. We could potentially relax this
-    // requirement by verifying that no throwable nodes have been emitted since
-    // the try-block started,  but for now, err on the side of caution and
-    // always escape.
-    if (IsInsideTryBlock()) return false;
-  }
-  // We don't support loop phis inside VirtualObjects, so any access inside a
-  // loop should escape the object, except for objects that were created since
-  // the last loop header.
-  if (IsInsideLoop()) {
-    if (!is_loop_effect_tracking() ||
-        !loop_effects_->allocations.contains(alloc)) {
-      return false;
-    }
-  }
-  // Iterate all live objects to be sure that the allocation is not escaping.
-  SLOW_DCHECK(
-      VerifyIsNotEscaping(current_interpreter_frame_.virtual_objects(), alloc));
-  return true;
-}
-
 bool MaglevGraphBuilder::IsFieldConstant(ValueNode* receiver, int offset) {
   if (!receiver->Is<InlinedAllocation>()) {
     return false;
   }
   InlinedAllocation* alloc = receiver->Cast<InlinedAllocation>();
-  VirtualObject* vobject = GetObjectFromAllocation(alloc);
-  if (vobject && static_cast<size_t>(offset) < vobject->size() &&
+  VirtualObject* vobject = alloc->object();
+  if (static_cast<size_t>(offset) < vobject->size() &&
       vobject->FieldForOffset(offset).constness ==
           vobj::FieldConstness::kConstAfterInit) {
+    DCHECK_NE(static_cast<size_t>(offset), offsetof(HeapObject, map_));
     return true;
   }
   return false;
 }
 
-VirtualObject* MaglevGraphBuilder::GetObjectFromAllocation(
-    InlinedAllocation* allocation) {
-  VirtualObject* vobject = allocation->object();
-  // If it hasn't be snapshotted yet, it is the latest created version of this
-  // object, we don't need to search for it.
-  if (vobject->IsSnapshot()) {
-    vobject = current_interpreter_frame_.virtual_objects().FindAllocatedWith(
-        allocation);
-  }
-  return vobject;
-}
-
-VirtualObject* MaglevGraphBuilder::GetModifiableObjectFromAllocation(
-    InlinedAllocation* allocation) {
-  VirtualObject* vobject = allocation->object();
-  // If it hasn't be snapshotted yet, it is the latest created version of this
-  // object and we can still modify it, we don't need to copy it.
-  if (vobject->IsSnapshot()) {
-    return DeepCopyVirtualObject(
-        current_interpreter_frame_.virtual_objects().FindAllocatedWith(
-            allocation));
-  }
-  return vobject;
-}
-
-void MaglevGraphBuilder::TryBuildStoreTaggedFieldToAllocation(ValueNode* object,
-                                                              ValueNode* value,
-                                                              int offset) {
-  if (offset == offsetof(HeapObject, map_)) return;
-  if (!CanTrackObjectChanges(object, TrackObjectMode::kStore)) return;
-  // This avoids loop in the object graph.
-  if (value->Is<InlinedAllocation>()) return;
-  InlinedAllocation* allocation = object->Cast<InlinedAllocation>();
-  VirtualObject* vobject = GetModifiableObjectFromAllocation(allocation);
-  CHECK_NOT_NULL(vobject);
-  vobject->set(offset, value);
-  reducer_.AddNonEscapingUses(allocation, 1);
-  if (v8_flags.trace_maglev_object_tracking) {
-    std::cout << "  * Setting value in virtual object "
-              << PrintNodeLabel(vobject) << "[" << offset
-              << "]: " << PrintNode(value) << std::endl;
-  }
-}
-
 std::optional<ValueNode*>
 MaglevGraphBuilder::TryBuildLoadTaggedFieldFromAllocation(ValueNode* object,
                                                           int offset) {
-  // TODO(jgruber): The VirtualObject now stores map slots, so theoretically we
-  // could let the path below handle map loads as well. But, maglev currently
-  // doesn't like this at all - doing so creates problems like OOB vobject field
-  // loads, and missed JSArray elements kind transitions. We should understand
-  // whether this is an issue with --maglev-object-tracking.
-  if (offset == offsetof(HeapObject, map_)) return std::nullopt;
-  if (!(IsFieldConstant(object, offset) ||
-        CanTrackObjectChanges(object, TrackObjectMode::kLoad))) {
+  if (!IsFieldConstant(object, offset)) {
     return std::nullopt;
   }
-  VirtualObject* vobject =
-      GetObjectFromAllocation(object->Cast<InlinedAllocation>());
+  VirtualObject* vobject = object->Cast<InlinedAllocation>()->object();
   CHECK_EQ(vobject->FieldForOffset(offset).type, vobj::FieldType::kTagged);
-  ValueNode* value = vobject->get(offset);
-  if (v8_flags.trace_maglev_object_tracking) {
-    std::cout << "  * Reusing value in virtual object "
-              << PrintNodeLabel(vobject) << "[" << offset
-              << "]: " << PrintNode(value) << std::endl;
-  }
-  return value;
-}
-
-MaybeReduceResult
-MaglevGraphBuilder::TryBuildLoadFixedDoubleArrayElementFromAllocation(
-    ValueNode* elements, int index) {
-  RETURN_IF_ABORT(
-      reducer_.AbortIfInvalidFixedArrayIndex<FixedDoubleArray>(index));
-  if (!CanTrackObjectChanges(elements, TrackObjectMode::kLoad)) {
-    return {};
-  }
-  VirtualObject* vobject =
-      GetObjectFromAllocation(elements->Cast<InlinedAllocation>());
-  std::optional<uint32_t> length =
-      TryGetUint32Constant(vobject->get(FixedArrayBase::kLengthOffset));
-  if (!length.has_value()) {
-    return {};
-  }
-  if (static_cast<uint32_t>(index) >= length.value()) {
-    return reducer_.BuildAbort(AbortReason::kUnreachable);
-  }
-  // Initializing stores can place conversion nodes (e.g.
-  // ChangeInt32ToFloat64) into the virtual object, but conversion nodes
-  // must not leak into the interpreter frame state -- they belong in
-  // NodeInfo as alternative representations.
-  return vobject->get(FixedDoubleArray::OffsetOfElementAt(index))->Unwrap();
+  return vobject->get(offset);
 }
 
 bool MaglevGraphBuilder::TryElideWriteBarrierForAllocation(ValueNode* object,
@@ -4042,14 +3905,12 @@ bool MaglevGraphBuilder::TryElideWriteBarrierForAllocation(ValueNode* object,
   };
   // No need for a write barrier if both object and value are part of the same
   // folded young allocation.
-  // Turbolev will do this optimization later after allocation folding. Doing it
-  // here could interfere with turboshaft pretenuring.
+  // Turbolev will do this optimization later after allocation folding.
   AllocationBlock* allocation = get_allocation(object);
   if (!is_turbolev() && allocation != nullptr &&
       reducer_.current_allocation_block() == allocation &&
       allocation->allocation_type() == AllocationType::kYoung &&
       allocation == get_allocation(value)) {
-    allocation->set_elided_write_barriers_depend_on_type();
     return true;
   }
   return false;
@@ -4062,19 +3923,6 @@ ReduceResult MaglevGraphBuilder::BuildLoadFixedArrayElement(ValueNode* elements,
   // cannot end up with an empty type for it.
   DCHECK(!IsEmptyNodeType(GetType(elements)));
 
-  if (CanTrackObjectChanges(elements, TrackObjectMode::kLoad)) {
-    VirtualObject* vobject =
-        GetObjectFromAllocation(elements->Cast<InlinedAllocation>());
-    DCHECK(vobject->map()->IsFixedArrayMap());
-    ValueNode* length_node = vobject->get(offsetof(FixedArray, length_));
-    if (auto length = TryGetInt32Constant(length_node)) {
-      if (index >= 0 && index < length.value()) {
-        return vobject->get(FixedArray::OffsetOfElementAt(index));
-      } else {
-        return reducer_.BuildAbort(AbortReason::kUnreachable);
-      }
-    }
-  }
   RETURN_IF_DONE(reducer_.TryBuildLoadFixedArrayElementConstantIndex(
       elements, index, type));
   return reducer_.BuildAbort(AbortReason::kUnreachable);
@@ -4102,9 +3950,6 @@ void MaglevGraphBuilder::MarkArgumentsElementsMaybeMutated(
 ReduceResult MaglevGraphBuilder::BuildStoreFixedArrayElement(
     ValueNode* elements, ValueNode* index, ValueNode* value) {
   MarkArgumentsElementsMaybeMutated(elements);
-  // TODO(victorgomes): Support storing element to a virtual object. If we
-  // modify the elements array, we need to modify the original object to point
-  // to the new elements array.
 
   // Unfortunately we need to check for empty types this late. If you think we
   // can detect them earlier, have a look at
@@ -4126,7 +3971,6 @@ ReduceResult MaglevGraphBuilder::BuildStoreFixedDoubleArrayElement(
     ElementsKind elements_kind, ValueNode* elements, ValueNode* index,
     ValueNode* value) {
   MarkArgumentsElementsMaybeMutated(elements);
-  // TODO(victorgomes): Support storing double element to a virtual object.
   DCHECK(value->is_float64_or_holey_float64());
   RETURN_IF_ABORT(
       reducer_.AbortIfInvalidFixedArrayIndex<FixedDoubleArray>(index));
@@ -4362,7 +4206,7 @@ ReduceResult MaglevGraphBuilder::BuildLoadField(
         heap_number,
         AddNewNode<LoadTaggedField>(
             {load_source}, field_index.offset(), NodeType::kHeapNumber,
-            PropertyConstness::kMutable, PropertyKey::None(),
+            PropertyConstness::kMutable, PropertyKey::DoubleField(name),
             IsArrayLength::kNo, compiler::OptionalMapRef{}));
     return AddNewNode<LoadFloat64>(
         {heap_number}, static_cast<int>(offsetof(HeapNumber, value_)));
@@ -4540,12 +4384,12 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildStoreField(
     if (access_info.HasTransitionMap()) {
       // Allocate the mutable double box owned by the field.
       ValueNode* heapnumber_value;
-      GET_VALUE_OR_ABORT(heapnumber_value, reducer_.BuildInlinedAllocation(
-                                               reducer_.CreateHeapNumber(value),
-                                               AllocationType::kYoung));
+      GET_VALUE_OR_ABORT(
+          heapnumber_value,
+          reducer_.BuildInlinedAllocation(reducer_.CreateHeapNumber(value)));
       RETURN_IF_ABORT(BuildStoreTaggedField(
           store_target, heapnumber_value, field_index.offset(),
-          StoreTaggedMode::kTransitioning, name));
+          StoreTaggedMode::kTransitioning, PropertyKey::DoubleField(name)));
       return reducer_.BuildStoreMap(receiver,
                                     access_info.transition_map().value(),
                                     StoreMap::Kind::kTransitioning);
@@ -4554,9 +4398,32 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildStoreField(
       GET_VALUE_OR_ABORT(
           heap_number,
           AddNewNode<LoadTaggedField>(
-              {store_target}, field_index.offset(), NodeType::kHeapNumber,
-              PropertyConstness::kMutable, PropertyKey::None(),
+              {store_target}, field_index.offset(),
+              IsDefiningStore(access_mode) ? NodeType::kAnyHeapObject
+                                           : NodeType::kHeapNumber,
+              PropertyConstness::kMutable, PropertyKey::DoubleField(name),
               IsArrayLength::kNo, compiler::OptionalMapRef{}));
+#ifdef DEBUG
+      if (access_info.IsFastDataConstant()) {
+        // In Maglev, only VisitDefineNamedOwnPropertyInLiteral passes
+        // AccessMode::kStoreInLiteral to TryBuildStoreField, and store_target
+        // is only an InlinedAllocation when the literal was allocated from a
+        // boilerplate via CreateObjectLiteral (!clone_object_spread), where
+        // BytecodeGenerator::VisitObjectLiteral guarantees the boilerplate slot
+        // holds an UninitializedHeapNumber.
+        DCHECK_EQ(access_mode, compiler::AccessMode::kStoreInLiteral);
+        DCHECK_EQ(iterator_.current_bytecode(),
+                  interpreter::Bytecode::kDefineNamedOwnPropertyInLiteral);
+        if (InlinedAllocation* alloc =
+                store_target->TryCast<InlinedAllocation>()) {
+          VirtualObject* vobject = alloc->object();
+          InlinedAllocation* vnumber =
+              vobject->get(field_index.offset())->Cast<InlinedAllocation>();
+          DCHECK(vnumber->object()->map()->equals(
+              broker()->uninitialized_heap_number_map()));
+        }
+      }
+#endif
       RETURN_IF_ABORT(AddNewNode<StoreFloat64>(
           {heap_number, value},
           static_cast<int>(offsetof(HeapNumber, value_))));
@@ -4570,6 +4437,25 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildStoreField(
       return ReduceResult::Done();
     }
   }
+
+#ifdef DEBUG
+  if (!access_info.HasTransitionMap() && access_info.IsFastDataConstant()) {
+    DCHECK_EQ(access_mode, compiler::AccessMode::kStoreInLiteral);
+    DCHECK_EQ(iterator_.current_bytecode(),
+              interpreter::Bytecode::kDefineNamedOwnPropertyInLiteral);
+    if (InlinedAllocation* alloc = store_target->TryCast<InlinedAllocation>()) {
+      VirtualObject* vobject = alloc->object();
+      ValueNode* existing = vobject->get(field_index.offset());
+      DCHECK(
+          (existing->Is<RootConstant>() &&
+           existing->Cast<RootConstant>()->index() ==
+               RootIndex::kUninitializedValue) ||
+          (existing->Is<HeapConstant>() && existing->Cast<HeapConstant>()
+                                               ->object()
+                                               .IsUninitializedHeapNumber()));
+    }
+  }
+#endif
 
   StoreTaggedMode store_mode = access_info.HasTransitionMap()
                                    ? StoreTaggedMode::kTransitioning
@@ -4835,7 +4721,7 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildNamedAccess(
       if (!native_context.GlobalIsDetached(broker())) {
         compiler::OptionalPropertyCellRef cell =
             native_context.global_object(broker()).GetPropertyCell(
-                broker(), feedback.name());
+                broker(), feedback.name(), access_mode);
         if (!cell.has_value()) return {};
         // Note: The map check generated below ensures that we will deopt
         // when/if GlobalIsDetached becomes true.
@@ -4861,14 +4747,6 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildNamedAccess(
 
   for (compiler::MapRef map : inferred_maps) {
     if (map.is_deprecated()) continue;
-
-    // TODO(v8:12547): Support writing to objects in shared space, which
-    // need a write barrier that calls Object::Share to ensure the RHS is
-    // shared.
-    if (InstanceTypeChecker::IsAlwaysSharedSpaceJSObject(map.instance_type()) &&
-        access_mode == compiler::AccessMode::kStore) {
-      return {};
-    }
 
     compiler::OptionalObjectRef handler;
     auto it = std::find(feedback.maps().begin(), feedback.maps().end(), map);
@@ -5735,14 +5613,6 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildElementAccess(
                 broker(), &prototype_maps)) {
           return {};
         }
-
-        // TODO(v8:12547): Support writing to objects in shared space, which
-        // need a write barrier that calls Object::Share to ensure the RHS is
-        // shared.
-        if (InstanceTypeChecker::IsAlwaysSharedSpaceJSObject(
-                receiver_map.instance_type())) {
-          return {};
-        }
       }
     }
     for (compiler::MapRef prototype_map : prototype_maps) {
@@ -6491,8 +6361,7 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildProxyPropertyAccess(
     LazyDeoptFrameScope deopt_continuation(
         &reducer_, GetContext(),
         Builtin::kProxyGetPropertyTrapResultLazyDeoptContinuation, {},
-        base::VectorOf<ValueNode*>(
-            {proxy_target, lookup_start_object, argument_name}));
+        base::VectorOf<ValueNode*>({proxy_target, argument_name}));
     MaybeReduceResult call_result =
         TryReduceCallForConstant(trap_js_function_ref, args, feedback_source);
     if (!call_result.IsDone()) {
@@ -7501,8 +7370,7 @@ MaglevGraphBuilder::TryBuildFindNonDefaultConstructorOrConstruct(
           GET_VALUE(
               object,
               reducer_.BuildInlinedAllocation(
-                  reducer_.CreateJSConstructor(new_target_function.value()),
-                  AllocationType::kYoung));
+                  reducer_.CreateJSConstructor(new_target_function.value())));
         } else {
           // We've already stored "true" into result.first, so a deopt here just
           // has to store result.second.
@@ -7762,8 +7630,8 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildInlineCall(
   auto [result, arguments] = GetArgumentsAsArrayOfValueNodes(shared, args);
   RETURN_IF_ABORT(result);
 
-  if (!reducer_.CanInlineCall(compilation_unit(), shared, call_frequency,
-                              arguments, {})) {
+  if (!reducer_.CanInlineCall(compilation_unit(), shared, feedback_cell,
+                              call_frequency, arguments, {})) {
     return {};
   }
 
@@ -7816,7 +7684,7 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildInlineCall(
   // Creating the CallKnownJSFUnction node will conservatively clear the
   // unstable maps from the KNA. So, we save them before doing this, since this
   // could clear maps that don't need to be cleared.
-  KnownNodeAspects* call_aspects = known_node_aspects().Clone(zone());
+  KnownNodeAspects::Ptr call_aspects = known_node_aspects().Clone();
 
   CallKnownJSFunction* generic_call;
   GET_VALUE_OR_ABORT(generic_call, BuildCallKnownJSFunction(
@@ -7835,12 +7703,14 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildInlineCall(
   float score =
       (call_frequency / bytecode.length()) * (IsInsideLoop() ? 1.5 : 1.0);
   MaglevCallSiteInfo* call_site = zone()->New<MaglevCallSiteInfo>(
-      MaglevCallerDetails{
-          arguments, &generic_call->lazy_deopt_info()->top_frame(),
-          call_aspects, loop_effects_, unobserved_context_slot_stores_,
-          catch_details, GetLoopDepth(), peeled_iteration_count_,
-          /* is_eager_inline */ false, /* is_small_function */ false,
-          call_frequency, current_inlining_tree_debug_info_},
+      MaglevCallerDetails{arguments,
+                          &generic_call->lazy_deopt_info()->top_frame(),
+                          std::move(call_aspects), loop_effects_,
+                          unobserved_context_slot_stores_, catch_details,
+                          GetLoopDepth(), peeled_iteration_count_,
+                          /* is_eager_inline */ false,
+                          /* is_small_function */ false, call_frequency,
+                          current_inlining_tree_debug_info_},
       generic_call, feedback_cell, score, bytecode.length());
   TRACE_INLINING(TracePush(shared)
                  << "Score: " << std::right << std::setw(6) << std::fixed
@@ -7878,7 +7748,7 @@ ReduceResult MaglevGraphBuilder::BuildEagerInlineCall(
       GetDeoptFrameForEagerCall(inner_unit, function, arguments_vector);
   MaglevCallerDetails* caller_details = zone()->New<MaglevCallerDetails>(
       arguments_vector, deopt_frame,
-      current_interpreter_frame_.known_node_aspects(), loop_effects_,
+      current_interpreter_frame_.TakeKnownNodeAspects(), loop_effects_,
       unobserved_context_slot_stores_, catch_block_details, GetLoopDepth(),
       peeled_iteration_count_,
       /* is_eager_inline */ true, /* is_small_function */ true, call_frequency,
@@ -7906,15 +7776,15 @@ ReduceResult MaglevGraphBuilder::BuildEagerInlineCall(
     should_abort_compilation_ = true;
   }
 
+  // Propagate frame information back to the caller.
+  current_interpreter_frame_.set_known_node_aspects(
+      inner_graph_builder.current_interpreter_frame_.TakeKnownNodeAspects());
+
   if (result.IsDoneWithAbort()) {
     DCHECK_NULL(inner_graph_builder.current_block());
     set_current_block(nullptr);
     return ReduceResult::DoneWithAbort();
   }
-
-  // Propagate frame information back to the caller.
-  current_interpreter_frame_.set_known_node_aspects(
-      inner_graph_builder.current_interpreter_frame_.known_node_aspects());
   if (inner_graph_builder.may_have_changed_maps()) {
     may_have_changed_maps_ = true;
     current_for_in_state.receiver_needs_map_check = true;
@@ -8037,15 +7907,14 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceArrayMap(
   auto initial_callback = [this, &result_array,
                            holey_smi_map](ValueNode* length_smi) {
     ValueNode* elements;
-    GET_VALUE_OR_ABORT(elements, AddNewNode<CreateFastArrayElements>(
-                                     {length_smi}, AllocationType::kYoung));
+    GET_VALUE_OR_ABORT(elements,
+                       AddNewNode<CreateFastArrayElements>({length_smi}));
     VirtualObject* array;
     GET_VALUE_OR_ABORT(
         array, reducer_.CreateJSArray(
                    holey_smi_map, holey_smi_map.instance_size(), length_smi));
     array->set(offsetof(JSObject, elements_), elements);
-    GET_VALUE_OR_ABORT(result_array, reducer_.BuildInlinedAllocation(
-                                         array, AllocationType::kYoung));
+    GET_VALUE_OR_ABORT(result_array, reducer_.BuildInlinedAllocation(array));
     return ReduceResult::Done();
   };
 
@@ -8180,227 +8049,225 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceArrayIteratingBuiltin(
   MaglevSubGraphBuilder::Variable var_index(0);
   MaglevSubGraphBuilder::Variable var_length(1);
 
-  MaglevSubGraphBuilder::Label loop_end(&sub_builder, 1);
-
   // ```
   // index = 0
   // bind loop_header
   // ```
   sub_builder.set(var_index, GetSmiConstant(0));
   sub_builder.set(var_length, original_length);
-  MaglevSubGraphBuilder::LoopLabel loop_header =
-      sub_builder.BeginLoop({&var_index, &var_length});
+  RETURN_IF_ABORT(sub_builder.BuildLoop(
+      {&var_index, &var_length},
+      [&](MaglevSubGraphBuilder::Label* loop_end) -> ReduceResult {
+        // Reset known state that is cleared by BeginLoop, but is known to be
+        // true on the first iteration, and will be re-checked at the end of the
+        // loop.
 
-  // Reset known state that is cleared by BeginLoop, but is known to be true on
-  // the first iteration, and will be re-checked at the end of the loop.
+        // Reload node_info which may have changed in BeginLoop, and reset the
+        // known receiver maps if necessary.
+        if (receiver_maps_were_unstable) {
+          NodeInfo* mutable_info =
+              known_node_aspects().TryGetMutableInfoFor(receiver);
+          DCHECK_NOT_NULL(mutable_info);
+          if (!mutable_info->SetPossibleMaps(
+                  receiver_maps_before_loop, receiver_maps_were_unstable,
+                  // Node type is monotonic, no need to reset it.
+                  NodeType::kUnknown, broker(), known_node_aspects())) {
+            return reducer_.EmitUnconditionalDeopt(
+                DeoptimizeReason::kWrongValue);
+          }
+          known_node_aspects().MarkSideEffectsRequireInvalidation();
+        } else if (node_info != nullptr) {
+          node_info = known_node_aspects().TryGetInfoFor(receiver);
+          DCHECK_NOT_NULL(node_info);
+          DCHECK_EQ(node_info->possible_maps().size(),
+                    receiver_maps_before_loop.size());
+        }
+        // Reset the cached loaded array length to the length var.
+        reducer_.RecordKnownProperty(
+            receiver, broker()->length_string(), sub_builder.get(var_length),
+            PropertyConstness::kMutable, compiler::AccessMode::kLoad);
 
-  // Reload node_info which may have changed in BeginLoop.
-  if (node_info != nullptr) {
-    node_info = known_node_aspects().TryGetInfoFor(receiver);
-    DCHECK_NOT_NULL(node_info);
-  }
+        // ```
+        // if (index_int32 < length_int32)
+        //   fallthrough
+        // else
+        //   goto end
+        // ```
+        Phi* index_tagged = sub_builder.get(var_index)->Cast<Phi>();
+        RETURN_IF_ABORT(reducer_.RecordType(index_tagged, NodeType::kSmi));
+        ValueNode* index_int32;
+        GET_VALUE_OR_ABORT(index_int32, GetInt32(index_tagged));
 
-  // Reset the known receiver maps if necessary.
-  if (receiver_maps_were_unstable) {
-    DCHECK(node_info);
-    if (!node_info->SetPossibleMaps(
-            receiver_maps_before_loop, receiver_maps_were_unstable,
-            // Node type is monotonic, no need to reset it.
-            NodeType::kUnknown, broker(), known_node_aspects())) {
-      return reducer_.EmitUnconditionalDeopt(DeoptimizeReason::kWrongValue);
-    }
-    known_node_aspects().MarkSideEffectsRequireInvalidation();
-  } else {
-    if (node_info) {
-      DCHECK_EQ(node_info->possible_maps().size(),
-                receiver_maps_before_loop.size());
-    }
-  }
-  // Reset the cached loaded array length to the length var.
-  reducer_.RecordKnownProperty(
-      receiver, broker()->length_string(), sub_builder.get(var_length),
-      PropertyConstness::kMutable, compiler::AccessMode::kLoad);
+        RETURN_IF_ABORT(sub_builder.GotoIfFalse<BranchIfInt32Compare>(
+            loop_end, {index_int32, original_length_int32},
+            Operation::kLessThan));
 
-  // ```
-  // if (index_int32 < length_int32)
-  //   fallthrough
-  // else
-  //   goto end
-  // ```
-  Phi* index_tagged = sub_builder.get(var_index)->Cast<Phi>();
-  RETURN_IF_ABORT(reducer_.RecordType(index_tagged, NodeType::kSmi));
-  ValueNode* index_int32;
-  GET_VALUE_OR_ABORT(index_int32, GetInt32(index_tagged));
+        // ```
+        // next_index = index + 1
+        // ```
+        ValueNode* next_index_int32 = nullptr;
+        {
+          // Eager deopt scope for index increment overflow.
+          // TODO(pthier): In practice this increment can never overflow, as the
+          // max possible array length is less than int32 max value. Add a new
+          // Int32Increment that asserts no overflow instead of deopting.
+          EagerDeoptFrameScope eager_deopt_scope =
+              get_eager_deopt_scope(target, receiver, callback, this_arg,
+                                    index_int32, index_int32, original_length);
+          GET_VALUE_OR_ABORT(
+              next_index_int32,
+              AddNewNode<Int32IncrementWithOverflow>({index_int32}));
+          RETURN_IF_ABORT(
+              reducer_.RecordType(next_index_int32, NodeType::kSmi));
+        }
+        // TODO(leszeks): Assert Smi.
 
-  RETURN_IF_ABORT(sub_builder.GotoIfFalse<BranchIfInt32Compare>(
-      &loop_end, {index_int32, original_length_int32}, Operation::kLessThan));
+        // ```
+        // element = array.elements[index]
+        // ```
+        ValueNode* elements;
+        GET_VALUE_OR_ABORT(elements,
+                           BuildLoadElements(receiver, elements_kind));
+        ValueNode* element;
+        if (elements_kind == PACKED_DOUBLE_ELEMENTS) {
+          GET_VALUE_OR_ABORT(
+              element, BuildLoadFixedDoubleArrayElement(elements, index_int32));
+        } else if (elements_kind == HOLEY_DOUBLE_ELEMENTS) {
+          GET_VALUE_OR_ABORT(element, BuildLoadHoleyFixedDoubleArrayElement(
+                                          elements, index_int32, true));
+        } else {
+          GET_VALUE_OR_ABORT(element,
+                             BuildLoadFixedArrayElement(elements, index_int32));
+        }
 
-  // ```
-  // next_index = index + 1
-  // ```
-  ValueNode* next_index_int32 = nullptr;
-  {
-    // Eager deopt scope for index increment overflow.
-    // TODO(pthier): In practice this increment can never overflow, as the max
-    // possible array length is less than int32 max value. Add a new
-    // Int32Increment that asserts no overflow instead of deopting.
-    EagerDeoptFrameScope eager_deopt_scope =
-        get_eager_deopt_scope(target, receiver, callback, this_arg, index_int32,
-                              index_int32, original_length);
-    GET_VALUE_OR_ABORT(next_index_int32,
-                       AddNewNode<Int32IncrementWithOverflow>({index_int32}));
-    RETURN_IF_ABORT(reducer_.RecordType(next_index_int32, NodeType::kSmi));
-  }
-  // TODO(leszeks): Assert Smi.
-
-  // ```
-  // element = array.elements[index]
-  // ```
-  ValueNode* elements;
-  GET_VALUE_OR_ABORT(elements, BuildLoadElements(receiver, elements_kind));
-  ValueNode* element;
-  if (elements_kind == PACKED_DOUBLE_ELEMENTS) {
-    GET_VALUE_OR_ABORT(element,
-                       BuildLoadFixedDoubleArrayElement(elements, index_int32));
-  } else if (elements_kind == HOLEY_DOUBLE_ELEMENTS) {
-    GET_VALUE_OR_ABORT(element, BuildLoadHoleyFixedDoubleArrayElement(
-                                    elements, index_int32, true));
-  } else {
-    GET_VALUE_OR_ABORT(element,
-                       BuildLoadFixedArrayElement(elements, index_int32));
-  }
-
-  std::optional<MaglevSubGraphBuilder::Label> skip_call;
-  if (IsHoleyElementsKind(elements_kind)) {
-    // ```
-    // if (element is hole) goto skip_call
-    // ```
-    skip_call.emplace(
-        &sub_builder, 2,
-        std::initializer_list<MaglevSubGraphBuilder::Variable*>{&var_length});
-    if (elements_kind == HOLEY_DOUBLE_ELEMENTS) {
-      RETURN_IF_ABORT(sub_builder.GotoIfTrue<BranchIfFloat64IsHole>(&*skip_call,
-                                                                    {element}));
-    } else {
-      RETURN_IF_ABORT(sub_builder.GotoIfTrue<BranchIfRootConstant>(
-          &*skip_call, {element}, RootIndex::kTheHoleValue));
-    }
-  }
-
-  // ```
-  // callback(this_arg, element, array)
-  // ```
-  MaybeReduceResult result;
-  {
-    const LazyDeoptFrameScope& lazy_deopt_scope =
-        get_lazy_deopt_scope(target, receiver, callback, this_arg, index_int32,
-                             next_index_int32, original_length);
-    CallArguments call_args =
-        args.count() < 2
-            ? CallArguments(ConvertReceiverMode::kNullOrUndefined,
-                            {element, index_tagged, receiver})
-            : CallArguments(ConvertReceiverMode::kAny,
-                            {this_arg, element, index_tagged, receiver});
-
-    SaveCallSpeculationScope saved(this);
-    result = ReduceCall(callback, call_args, saved.value());
-  }
-
-  // ```
-  // index = next_index
-  // jump loop_header
-  // ```
-  DCHECK_IMPLIES(result.IsDoneWithAbort(), current_block() == nullptr);
-
-  // No need to finish the loop if this code is unreachable.
-  if (!result.IsDoneWithAbort()) {
-    ReduceResult loop_body_result = [&]() -> ReduceResult {
-      if (process_element_callback) {
-        ValueNode* value = result.value();
-        RETURN_IF_ABORT((*process_element_callback)(index_int32, value));
-      }
-
-      // If any of the receiver's maps were unstable maps, we have to re-check
-      // the maps on each iteration, in case the callback changed them. That
-      // said, we know that the maps are valid on the first iteration, so we can
-      // rotate the check to _after_ the callback, and then elide it if the
-      // receiver maps are still known to be valid (i.e. the known maps after
-      // the call are contained inside the known maps before the call).
-      bool recheck_maps_after_call = receiver_maps_were_unstable;
-      if (recheck_maps_after_call) {
-        // No need to recheck maps if there are known maps...
-        MapInference inference_after_call(this, receiver);
-        // ... for which no side effect has occurred after recording them...
-        if (inference_after_call.all_maps_are_fresh()) {
-          if (auto receiver_maps_after_call =
-                  inference_after_call.TryGetPossibleMaps()) {
-            // ... and those known maps are equal to, or a subset of, the maps
-            // before the call.
-            recheck_maps_after_call =
-                !receiver_maps_before_loop.contains(*receiver_maps_after_call);
+        std::optional<MaglevSubGraphBuilder::Label> skip_call;
+        if (IsHoleyElementsKind(elements_kind)) {
+          // ```
+          // if (element is hole) goto skip_call
+          // ```
+          skip_call.emplace(
+              &sub_builder, 2,
+              std::initializer_list<MaglevSubGraphBuilder::Variable*>{
+                  &var_length});
+          if (elements_kind == HOLEY_DOUBLE_ELEMENTS) {
+            RETURN_IF_ABORT(sub_builder.GotoIfTrue<BranchIfFloat64IsHole>(
+                &*skip_call, {element}));
+          } else {
+            RETURN_IF_ABORT(sub_builder.GotoIfTrue<BranchIfRootConstant>(
+                &*skip_call, {element}, RootIndex::kTheHoleValue));
           }
         }
-      }
 
-      // Make sure to finish the loop if we eager deopt in the map check or
-      // index check.
-      const EagerDeoptFrameScope& eager_deopt_scope =
-          get_eager_deopt_scope(target, receiver, callback, this_arg,
-                                index_int32, next_index_int32, original_length);
+        auto emit_call_and_rechecks = [&]() -> ReduceResult {
+          // ```
+          // callback(this_arg, element, array)
+          // ```
+          ValueNode* value;
+          {
+            const LazyDeoptFrameScope& lazy_deopt_scope = get_lazy_deopt_scope(
+                target, receiver, callback, this_arg, index_int32,
+                next_index_int32, original_length);
+            CallArguments call_args =
+                args.count() < 2
+                    ? CallArguments(ConvertReceiverMode::kNullOrUndefined,
+                                    {element, index_tagged, receiver})
+                    : CallArguments(
+                          ConvertReceiverMode::kAny,
+                          {this_arg, element, index_tagged, receiver});
 
-      if (recheck_maps_after_call) {
-        // Build the CheckMap manually, since we're doing it with already known
-        // maps rather than feedback, and we don't need to update known node
-        // aspects or types since we're at the end of the loop anyway.
-        bool emit_check_with_migration = std::any_of(
-            receiver_maps_before_loop.begin(), receiver_maps_before_loop.end(),
-            [](compiler::MapRef map) { return map.is_migration_target(); });
-        if (emit_check_with_migration) {
-          RETURN_IF_ABORT(AddNewNode<CheckMapsWithMigration>(
-              {receiver}, receiver_maps_before_loop,
-              CheckType::kOmitHeapObjectCheck));
+            SaveCallSpeculationScope saved(this);
+            GET_VALUE_OR_ABORT(value,
+                               ReduceCall(callback, call_args, saved.value()));
+          }
+
+          if (process_element_callback) {
+            RETURN_IF_ABORT((*process_element_callback)(index_int32, value));
+          }
+
+          // If any of the receiver's maps were unstable maps, we have to
+          // re-check the maps on each iteration, in case the callback changed
+          // them. That said, we know that the maps are valid on the first
+          // iteration, so we can rotate the check to _after_ the callback,
+          // and then elide it if the receiver maps are still known to be
+          // valid (i.e. the known maps after the call are contained inside
+          // the known maps before the call).
+          bool recheck_maps_after_call = receiver_maps_were_unstable;
+          if (recheck_maps_after_call) {
+            // No need to recheck maps if there are known maps...
+            MapInference inference_after_call(this, receiver);
+            // ... for which no side effect has occurred after recording
+            // them...
+            if (inference_after_call.all_maps_are_fresh()) {
+              if (auto receiver_maps_after_call =
+                      inference_after_call.TryGetPossibleMaps()) {
+                // ... and those known maps are equal to, or a subset of, the
+                // maps before the call.
+                recheck_maps_after_call = !receiver_maps_before_loop.contains(
+                    *receiver_maps_after_call);
+              }
+            }
+          }
+
+          // Make sure to finish the loop if we eager deopt in the map check
+          // or index check.
+          const EagerDeoptFrameScope& eager_deopt_scope = get_eager_deopt_scope(
+              target, receiver, callback, this_arg, index_int32,
+              next_index_int32, original_length);
+
+          if (recheck_maps_after_call) {
+            // Build the CheckMap manually, since we're doing it with already
+            // known maps rather than feedback, and we don't need to update
+            // known node aspects or types since we're at the end of the loop
+            // anyway.
+            bool emit_check_with_migration = std::any_of(
+                receiver_maps_before_loop.begin(),
+                receiver_maps_before_loop.end(),
+                [](compiler::MapRef map) { return map.is_migration_target(); });
+            if (emit_check_with_migration) {
+              RETURN_IF_ABORT(AddNewNode<CheckMapsWithMigration>(
+                  {receiver}, receiver_maps_before_loop,
+                  CheckType::kOmitHeapObjectCheck));
+            } else {
+              RETURN_IF_ABORT(
+                  AddNewNode<CheckMaps>({receiver}, receiver_maps_before_loop,
+                                        CheckType::kOmitHeapObjectCheck));
+            }
+          }
+
+          // Check if the index is still in bounds, in case the callback
+          // changed the length.
+          ValueNode* current_length;
+          GET_VALUE_OR_ABORT(current_length, BuildLoadJSArrayLength(receiver));
+          sub_builder.set(var_length, current_length);
+
+          // Reference compare the loaded length against the original length.
+          // If this is the same value node, then we didn't have any side
+          // effects and didn't clear the cached length.
+          if (current_length != original_length) {
+            RETURN_IF_ABORT(TryBuildCheckInt32Condition(
+                original_length_int32, current_length,
+                AssertCondition::kUnsignedLessThanEqual,
+                DeoptimizeReason::kArrayLengthChanged));
+          }
+          return ReduceResult::Done();
+        };
+
+        if (skip_call.has_value()) {
+          ReduceResult call_result = emit_call_and_rechecks();
+          USE(call_result);
+          sub_builder.GotoOrTrim(&*skip_call);
+          RETURN_IF_ABORT(sub_builder.TrimPredecessorsAndBind(&*skip_call));
         } else {
-          RETURN_IF_ABORT(
-              AddNewNode<CheckMaps>({receiver}, receiver_maps_before_loop,
-                                    CheckType::kOmitHeapObjectCheck));
+          RETURN_IF_ABORT(emit_call_and_rechecks());
         }
-      }
 
-      // Check if the index is still in bounds, in case the callback changed the
-      // length.
-      ValueNode* current_length;
-      GET_VALUE_OR_ABORT(current_length, BuildLoadJSArrayLength(receiver));
-      sub_builder.set(var_length, current_length);
-
-      // Reference compare the loaded length against the original length. If
-      // this is the same value node, then we didn't have any side effects and
-      // didn't clear the cached length.
-      if (current_length != original_length) {
-        RETURN_IF_ABORT(
-            TryBuildCheckInt32Condition(original_length_int32, current_length,
-                                        AssertCondition::kUnsignedLessThanEqual,
-                                        DeoptimizeReason::kArrayLengthChanged));
-      }
-      return ReduceResult::Done();
-    }();
-    // loop_body_result is either Done or DoneWithAbort. An abort sets
-    // current_block to null, which GotoOrTrim and EndLoop below both handle --
-    // no explicit check needed.
-    USE(loop_body_result);
-  }
-
-  if (skip_call.has_value()) {
-    sub_builder.GotoOrTrim(&*skip_call);
-    RETURN_IF_ABORT(sub_builder.TrimPredecessorsAndBind(&*skip_call));
-  }
-
-  sub_builder.set(var_index, next_index_int32);
-  sub_builder.EndLoop(&loop_header);
-
-  // ```
-  // bind end
-  // ```
-  RETURN_IF_ABORT(sub_builder.TrimPredecessorsAndBind(&loop_end));
+        // ```
+        // index = next_index
+        // jump loop_header
+        // ```
+        sub_builder.set(var_index, next_index_int32);
+        return ReduceResult::Done();
+      }));
   return ReduceResult::Done();
 }
 
@@ -8477,6 +8344,13 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceGeneratorPrototypeNext(
   ValueNode* alloc_skipped_constant =
       GetSmiConstant(JSGeneratorObject::kNextAllocSkipped);
 
+  ValueNode* undefined_constant = GetRootConstant(RootIndex::kUndefinedValue);
+  ValueNode* false_constant = GetBooleanConstant(false);
+  ValueNode* true_constant = GetBooleanConstant(true);
+  // Used inside CreateJSIteratorResult.
+  ValueNode* empty_fixed_array_constant =
+      GetRootConstant(RootIndex::kEmptyFixedArray);
+
   // If any of the constants have an empty type, we're in dead code, and the
   // write barrier elision logic inside StoreTaggedFieldNoWriteBarrier will be
   // confused. Bail out now. Ideally, this would be done inside
@@ -8488,6 +8362,10 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceGeneratorPrototypeNext(
   ABORT_IF_EMPTY_TYPE(next_constant);
   ABORT_IF_EMPTY_TYPE(try_skip_alloc_constant);
   ABORT_IF_EMPTY_TYPE(alloc_skipped_constant);
+  ABORT_IF_EMPTY_TYPE(undefined_constant);
+  ABORT_IF_EMPTY_TYPE(false_constant);
+  ABORT_IF_EMPTY_TYPE(true_constant);
+  ABORT_IF_EMPTY_TYPE(empty_fixed_array_constant);
 
   // The fast path below asks the generator to hand back the bare yielded value
   // rather than allocate a result object, and rebuilds the object here as a
@@ -8496,133 +8374,137 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceGeneratorPrototypeNext(
   // defeats that as would pay for the protocol and allocate anyway.
   const bool can_skip_allocation = GetCurrentTryCatchBlock().ref == nullptr;
 
-  MaglevSubGraphBuilder::Label generator_already_closed(&subgraph, 1);
-  MaglevSubGraphBuilder::Label generator_finished(&subgraph, 1);
-  MaglevSubGraphBuilder::Label done(&subgraph, can_skip_allocation ? 4 : 3,
-                                    {&ret_value});
+  RETURN_IF_ABORT(subgraph.WithFallback(
+      {&ret_value},
+      [&](MaglevSubGraphBuilder::Label* generator_already_closed)
+          -> ReduceResult {
+        RETURN_IF_ABORT(subgraph.GotoIfTrue<BranchIfReferenceEqual>(
+            generator_already_closed, {continuation, closed_constant}));
 
-  RETURN_IF_ABORT(subgraph.GotoIfTrue<BranchIfReferenceEqual>(
-      &generator_already_closed, {continuation, closed_constant}));
+        // Generator was not closed.
+        ValueNode* continuation_int32;
+        GET_VALUE_OR_ABORT(continuation_int32, BuildSmiUntag(continuation));
 
-  // Generator was not closed.
-  ValueNode* continuation_int32;
-  GET_VALUE_OR_ABORT(continuation_int32, BuildSmiUntag(continuation));
+        // Deopt if we're calling into the generator recursively.
+        RETURN_IF_ABORT(TryBuildCheckInt32Condition(
+            continuation_int32,
+            GetInt32Constant(JSGeneratorObject::kGeneratorExecuting),
+            AssertCondition::kNotEqual, DeoptimizeReason::kWrongValue));
 
-  // Deopt if we're calling into the generator recursively.
-  RETURN_IF_ABORT(TryBuildCheckInt32Condition(
-      continuation_int32,
-      GetInt32Constant(JSGeneratorObject::kGeneratorExecuting),
-      AssertCondition::kNotEqual, DeoptimizeReason::kWrongValue));
+        CHECK(BuildStoreTaggedFieldNoWriteBarrier(
+                  receiver,
+                  can_skip_allocation ? try_skip_alloc_constant : next_constant,
+                  offsetof(JSGeneratorObject, resume_mode_),
+                  StoreTaggedMode::kDefault)
+                  .IsDoneWithoutAbort());
 
-  CHECK(BuildStoreTaggedFieldNoWriteBarrier(
-            receiver,
-            can_skip_allocation ? try_skip_alloc_constant : next_constant,
-            offsetof(JSGeneratorObject, resume_mode_),
-            StoreTaggedMode::kDefault)
-            .IsDoneWithoutAbort());
+        ValueNode* result;
+        {
+          LazyDeoptFrameScope lazy_deopt_scope(
+              &reducer_, GetContext(),
+              Builtin::kGeneratorPrototypeNextLazyDeoptContinuation, target,
+              base::VectorOf<ValueNode*>(
+                  {undefined_constant, receiver,
+                   GetRootConstant(RootIndex::kTheHoleValue)}));
+          // Generators can accept an optional value when resumed (e.g.
+          // g.next("val")). This value becomes the result of the `yield`
+          // expression inside the generator.
+          ValueNode* value = GetValueOrUndefined(args[0]);
+          GET_VALUE_OR_ABORT(result,
+                             BuildCallBuiltinWithTaggedInputs<
+                                 Builtin::kResumeGeneratorTrampoline_WithCatch>(
+                                 {value, receiver}));
+        }
 
-  ValueNode* result;
-  {
-    LazyDeoptFrameScope lazy_deopt_scope(
-        &reducer_, GetContext(),
-        Builtin::kGeneratorPrototypeNextLazyDeoptContinuation, target,
-        base::VectorOf<ValueNode*>(
-            {GetRootConstant(RootIndex::kUndefinedValue), receiver,
-             GetRootConstant(RootIndex::kTheHoleValue)}));
-    // Generators can accept an optional value when resumed (e.g.
-    // g.next("val")). This value becomes the result of the `yield`
-    // expression inside the generator.
-    ValueNode* value = GetValueOrUndefined(args[0]);
-    GET_VALUE_OR_ABORT(
-        result,
-        BuildCallBuiltinWithTaggedInputs<
-            Builtin::kResumeGeneratorTrampoline_WithCatch>({value, receiver}));
-  }
+        ValueNode* result_continuation;
+        GET_VALUE(result_continuation,
+                  BuildLoadTaggedField(
+                      receiver, offsetof(JSGeneratorObject, continuation_)));
 
-  ValueNode* result_continuation;
-  GET_VALUE(result_continuation,
-            BuildLoadTaggedField(receiver,
-                                 offsetof(JSGeneratorObject, continuation_)));
+        return subgraph.WithFallback(
+            {&ret_value},
+            [&](MaglevSubGraphBuilder::Label* generator_finished)
+                -> ReduceResult {
+              CHECK(subgraph
+                        .GotoIfTrue<BranchIfReferenceEqual>(
+                            generator_finished,
+                            {result_continuation, executing_constant})
+                        .IsDoneWithoutAbort());
 
-  CHECK(subgraph
-            .GotoIfTrue<BranchIfReferenceEqual>(
-                &generator_finished, {result_continuation, executing_constant})
-            .IsDoneWithoutAbort());
+              if (can_skip_allocation) {
+                return subgraph.WithFallback(
+                    {&ret_value},
+                    [&](MaglevSubGraphBuilder::Label* allocation_not_skipped)
+                        -> ReduceResult {
+                      // Check whether skipping allocating the result object was
+                      // successful.
+                      ValueNode* generator_mode;
+                      GET_VALUE(generator_mode,
+                                BuildLoadTaggedField(
+                                    receiver,
+                                    offsetof(JSGeneratorObject, resume_mode_)));
+                      CHECK(subgraph
+                                .GotoIfFalse<BranchIfReferenceEqual>(
+                                    allocation_not_skipped,
+                                    {generator_mode, alloc_skipped_constant})
+                                .IsDoneWithoutAbort());
 
-  if (can_skip_allocation) {
-    MaglevSubGraphBuilder::Label allocation_not_skipped(&subgraph, 1);
+                      // Was able to avoid allocating the result object.
+                      compiler::MapRef map =
+                          broker()->target_native_context().iterator_result_map(
+                              broker());
+                      VirtualObject* iter_result =
+                          reducer_.CreateJSIteratorResult(map, result,
+                                                          false_constant);
+                      ValueNode* alloc_result;
+                      GET_VALUE(alloc_result,
+                                reducer_.BuildInlinedAllocation(iter_result));
+                      subgraph.set(ret_value, alloc_result);
+                      return ReduceResult::Done();
+                    },
+                    [&]() -> ReduceResult {
+                      subgraph.set(ret_value, result);
+                      return ReduceResult::Done();
+                    });
+              }
+              // The builtin allocated the result object for us.
+              subgraph.set(ret_value, result);
+              return ReduceResult::Done();
+            },
+            [&]() -> ReduceResult {
+              // Continuation being the executing_constant means the generator
+              // has finished.
+              CHECK(BuildStoreTaggedFieldNoWriteBarrier(
+                        receiver, closed_constant,
+                        offsetof(JSGeneratorObject, continuation_),
+                        StoreTaggedMode::kDefault)
+                        .IsDoneWithoutAbort());
 
-    // Check whether skipping allocating the result object was successful.
-    ValueNode* generator_mode;
-    GET_VALUE(generator_mode,
-              BuildLoadTaggedField(receiver,
-                                   offsetof(JSGeneratorObject, resume_mode_)));
-    CHECK(subgraph
-              .GotoIfFalse<BranchIfReferenceEqual>(
-                  &allocation_not_skipped,
-                  {generator_mode, alloc_skipped_constant})
-              .IsDoneWithoutAbort());
-
-    // Was able to avoid allocating the result object.
-    compiler::MapRef map =
-        broker()->target_native_context().iterator_result_map(broker());
-    VirtualObject* iter_result =
-        reducer_.CreateJSIteratorResult(map, result, GetBooleanConstant(false));
-    ValueNode* alloc_result;
-    GET_VALUE(alloc_result, reducer_.BuildInlinedAllocation(
-                                iter_result, AllocationType::kYoung));
-    subgraph.set(ret_value, alloc_result);
-    subgraph.Goto(&done);
-
-    subgraph.Bind(&allocation_not_skipped);
-
-    subgraph.set(ret_value, result);
-    subgraph.Goto(&done);
-  } else {
-    // The builtin allocated the result object for us.
-    subgraph.set(ret_value, result);
-    subgraph.Goto(&done);
-  }
-
-  subgraph.Bind(&generator_already_closed);
-  {
-    compiler::MapRef map =
-        broker()->target_native_context().iterator_result_map(broker());
-    VirtualObject* iter_result = reducer_.CreateJSIteratorResult(
-        map, GetRootConstant(RootIndex::kUndefinedValue),
-        GetBooleanConstant(true));
-    ValueNode* alloc_result;
-    GET_VALUE(alloc_result, reducer_.BuildInlinedAllocation(
-                                iter_result, AllocationType::kYoung));
-    subgraph.set(ret_value, alloc_result);
-    subgraph.Goto(&done);
-  }
-
-  subgraph.Bind(&generator_finished);
-  {
-    // Continuation being the executing_constant means the generator
-    // has finished.
-    CHECK(BuildStoreTaggedFieldNoWriteBarrier(
-              receiver, closed_constant,
-              offsetof(JSGeneratorObject, continuation_),
-              StoreTaggedMode::kDefault)
-              .IsDoneWithoutAbort());
-
-    // When the generator finishes, `result` holds the actual value
-    // returned by the generator function. We use it to construct the
-    // final {value: result, done: true} IteratorResult object.
-    compiler::MapRef map =
-        broker()->target_native_context().iterator_result_map(broker());
-    VirtualObject* iter_result =
-        reducer_.CreateJSIteratorResult(map, result, GetBooleanConstant(true));
-    ValueNode* alloc_result;
-    GET_VALUE(alloc_result, reducer_.BuildInlinedAllocation(
-                                iter_result, AllocationType::kYoung));
-    subgraph.set(ret_value, alloc_result);
-    subgraph.Goto(&done);
-  }
-
-  subgraph.Bind(&done);
+              // When the generator finishes, `result` holds the actual value
+              // returned by the generator function. We use it to construct the
+              // final {value: result, done: true} IteratorResult object.
+              compiler::MapRef map =
+                  broker()->target_native_context().iterator_result_map(
+                      broker());
+              VirtualObject* iter_result =
+                  reducer_.CreateJSIteratorResult(map, result, true_constant);
+              ValueNode* alloc_result;
+              GET_VALUE(alloc_result,
+                        reducer_.BuildInlinedAllocation(iter_result));
+              subgraph.set(ret_value, alloc_result);
+              return ReduceResult::Done();
+            });
+      },
+      [&]() -> ReduceResult {
+        compiler::MapRef map =
+            broker()->target_native_context().iterator_result_map(broker());
+        VirtualObject* iter_result = reducer_.CreateJSIteratorResult(
+            map, undefined_constant, true_constant);
+        ValueNode* alloc_result;
+        GET_VALUE(alloc_result, reducer_.BuildInlinedAllocation(iter_result));
+        subgraph.set(ret_value, alloc_result);
+        return ReduceResult::Done();
+      }));
   return subgraph.get(ret_value);
 }
 
@@ -8772,41 +8654,43 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceArrayIteratorPrototypeNext(
                     KeyedAccessLoadMode::kHandleOOBAndHoles));
             subgraph.set(ret_value, value);
           } else {
-            MaglevSubGraphBuilder::Label double_branch(
-                &subgraph, static_cast<int>(double_maps.size()));
-            MaglevSubGraphBuilder::Label done_loading(&subgraph, 2,
-                                                      {&ret_value});
+            RETURN_IF_ABORT(subgraph.WithFallback(
+                {&ret_value},
+                [&](MaglevSubGraphBuilder::Label* double_branch)
+                    -> ReduceResult {
+                  ValueNode* iterated_object_map;
+                  GET_VALUE_OR_ABORT(iterated_object_map,
+                                     BuildLoadMap(iterated_object));
+                  for (compiler::MapRef map : double_maps) {
+                    RETURN_IF_ABORT(subgraph.GotoIfTrue<BranchIfReferenceEqual>(
+                        double_branch,
+                        {iterated_object_map, GetConstant(map)}));
+                  }
 
-            ValueNode* iterated_object_map;
-            GET_VALUE_OR_ABORT(iterated_object_map,
-                               BuildLoadMap(iterated_object));
-            for (compiler::MapRef map : double_maps) {
-              RETURN_IF_ABORT(subgraph.GotoIfTrue<BranchIfReferenceEqual>(
-                  &double_branch, {iterated_object_map, GetConstant(map)}));
-            }
-
-            // Tagged path (fallthrough)
-            ValueNode* tagged_value;
-            GET_VALUE_OR_ABORT(
-                tagged_value,
-                BuildElementLoadOnJSArrayOrJSObject(
-                    iterated_object, int32_index, base::VectorOf(tagged_maps),
-                    *tagged_kind, KeyedAccessLoadMode::kHandleOOBAndHoles));
-            subgraph.set(ret_value, tagged_value);
-            subgraph.Goto(&done_loading);
-
-            // Double path
-            subgraph.Bind(&double_branch);
-            ValueNode* double_value;
-            GET_VALUE_OR_ABORT(
-                double_value,
-                BuildElementLoadOnJSArrayOrJSObject(
-                    iterated_object, int32_index, base::VectorOf(double_maps),
-                    *double_kind, KeyedAccessLoadMode::kHandleOOBAndHoles));
-            subgraph.set(ret_value, double_value);
-            subgraph.Goto(&done_loading);
-
-            subgraph.Bind(&done_loading);
+                  // Tagged path (fallthrough)
+                  ValueNode* tagged_value;
+                  GET_VALUE_OR_ABORT(
+                      tagged_value,
+                      BuildElementLoadOnJSArrayOrJSObject(
+                          iterated_object, int32_index,
+                          base::VectorOf(tagged_maps), *tagged_kind,
+                          KeyedAccessLoadMode::kHandleOOBAndHoles));
+                  subgraph.set(ret_value, tagged_value);
+                  return ReduceResult::Done();
+                },
+                [&]() -> ReduceResult {
+                  // Double path
+                  ValueNode* double_value;
+                  GET_VALUE_OR_ABORT(
+                      double_value,
+                      BuildElementLoadOnJSArrayOrJSObject(
+                          iterated_object, int32_index,
+                          base::VectorOf(double_maps), *double_kind,
+                          KeyedAccessLoadMode::kHandleOOBAndHoles));
+                  subgraph.set(ret_value, double_value);
+                  return ReduceResult::Done();
+                },
+                static_cast<int>(double_maps.size())));
           }
           if (iteration_kind == IterationKind::kEntries) {
             ValueNode* key_value_array;
@@ -8849,7 +8733,7 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceArrayIteratorPrototypeNext(
       broker()->target_native_context().iterator_result_map(broker());
   VirtualObject* iter_result = reducer_.CreateJSIteratorResult(
       map, subgraph.get(ret_value), subgraph.get(is_done));
-  return reducer_.BuildInlinedAllocation(iter_result, AllocationType::kYoung);
+  return reducer_.BuildInlinedAllocation(iter_result);
 }
 
 MaybeReduceResult MaglevGraphBuilder::TryReduceArrayPrototypeSlice(
@@ -8946,67 +8830,72 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceStringPrototypeStartsWith(
   MaglevSubGraphBuilder sub_graph(this, 2);
   MaglevSubGraphBuilder::Variable ret_val(0);
   MaglevSubGraphBuilder::Variable var_i(1);
-  MaglevSubGraphBuilder::Label done(&sub_graph, 2, {&ret_val});
-  MaglevSubGraphBuilder::Label return_false(&sub_graph, 2);
 
-  // receiver_length - clamped_start < search_length
-  ValueNode* remaining;
-  GET_VALUE_OR_ABORT(
-      remaining, AddNewNode<Int32Subtract>({receiver_length, clamped_start}));
-  RETURN_IF_ABORT(sub_graph.GotoIfTrue<BranchIfInt32Compare>(
-      &return_false, {remaining, search_length}, Operation::kLessThan));
+  RETURN_IF_ABORT(sub_graph.WithFallback(
+      {&ret_val},
+      [&](MaglevSubGraphBuilder::Label* return_false) -> ReduceResult {
+        // receiver_length - clamped_start < search_length
+        ValueNode* remaining;
+        GET_VALUE_OR_ABORT(remaining, AddNewNode<Int32Subtract>(
+                                          {receiver_length, clamped_start}));
+        RETURN_IF_ABORT(sub_graph.GotoIfTrue<BranchIfInt32Compare>(
+            return_false, {remaining, search_length}, Operation::kLessThan));
 
-  // i = 0
-  sub_graph.set(var_i, GetInt32Constant(0));
-  MaglevSubGraphBuilder::LoopLabel loop_header = sub_graph.BeginLoop({&var_i});
-  MaglevSubGraphBuilder::Label return_true(&sub_graph, 1);
+        // i = 0
+        sub_graph.set(var_i, GetInt32Constant(0));
+        RETURN_IF_ABORT(sub_graph.BuildLoop(
+            {&var_i},
+            [&](MaglevSubGraphBuilder::Label* return_true) -> ReduceResult {
+              ValueNode* index_int32 = sub_graph.get(var_i);
 
-  ValueNode* index_int32 = sub_graph.get(var_i);
+              // if (i < search_length) continue; else exit loop
+              RETURN_IF_ABORT(sub_graph.GotoIfFalse<BranchIfInt32Compare>(
+                  return_true, {index_int32, search_length},
+                  Operation::kLessThan));
 
-  // if (i < search_length) continue; else exit loop
-  RETURN_IF_ABORT(sub_graph.GotoIfFalse<BranchIfInt32Compare>(
-      &return_true, {index_int32, search_length}, Operation::kLessThan));
+              // pos = clamped_start + i
+              ValueNode* pos;
+              GET_VALUE_OR_ABORT(
+                  pos, AddNewNode<Int32Add>({clamped_start, index_int32}));
 
-  // pos = clamped_start + i
-  ValueNode* pos;
-  GET_VALUE_OR_ABORT(pos, AddNewNode<Int32Add>({clamped_start, index_int32}));
+              // TODO(dmercadier): without static knowledge about maps shapes
+              // (which we probably don't have), BuildGetCharCodeAt generates
+              // fairly expensive code since it needs to handle all string
+              // shapes. It would be more efficient to have a pre-processing
+              // before the loop that computes a single linear buffer for each
+              // string (+ maybe an index, for SlicedString in particular),
+              // that's then accessed directly in the loop (cf
+              // StringPrepareForGetCodeUnit in Turboshaft). Here in particular,
+              // the loop doesn't contain anything that can trigger a GC, so
+              // this should be safe.
+              ValueNode* lhs_ch;
+              GET_VALUE_OR_ABORT(lhs_ch, BuildGetCharCodeAt(receiver, pos));
+              ValueNode* rhs_ch;
+              GET_VALUE_OR_ABORT(
+                  rhs_ch, BuildGetCharCodeAt(search_element, index_int32));
+              ValueNode* is_equal;
+              GET_VALUE_OR_ABORT(is_equal, BuildTaggedEqual(lhs_ch, rhs_ch));
 
-  // TODO(dmercadier): without static knowledge about maps shapes (which we
-  // probably don't have), BuildGetCharCodeAt generates fairly expensive code
-  // since it needs to handle all string shapes. It would be more efficient to
-  // have a pre-processing before the loop that computes a single linear buffer
-  // for each string (+ maybe an index, for SlicedString in particular), that's
-  // then accessed directly in the loop (cf StringPrepareForGetCodeUnit in
-  // Turboshaft). Here in particular, the loop doesn't contain anything that can
-  // trigger a GC, so this should be safe.
-  ValueNode* lhs_ch;
-  GET_VALUE_OR_ABORT(lhs_ch, BuildGetCharCodeAt(receiver, pos));
-  ValueNode* rhs_ch;
-  GET_VALUE_OR_ABORT(rhs_ch, BuildGetCharCodeAt(search_element, index_int32));
-  ValueNode* is_equal;
-  GET_VALUE_OR_ABORT(is_equal, BuildTaggedEqual(lhs_ch, rhs_ch));
+              // If chars are not equal, return false.
+              RETURN_IF_ABORT(sub_graph.GotoIfFalse<BranchIfRootConstant>(
+                  return_false, {is_equal}, RootIndex::kTrueValue));
 
-  // If chars are not equal, return false.
-  RETURN_IF_ABORT(sub_graph.GotoIfFalse<BranchIfRootConstant>(
-      &return_false, {is_equal}, RootIndex::kTrueValue));
+              // i++; goto loop_header
+              ValueNode* next_index_int32;
+              GET_VALUE_OR_ABORT(next_index_int32,
+                                 AddNewNode<Int32Add>({sub_graph.get(var_i),
+                                                       GetInt32Constant(1)}));
+              sub_graph.set(var_i, next_index_int32);
+              return ReduceResult::Done();
+            }));
 
-  // i++; goto loop_header
-  ValueNode* next_index_int32;
-  GET_VALUE_OR_ABORT(
-      next_index_int32,
-      AddNewNode<Int32Add>({sub_graph.get(var_i), GetInt32Constant(1)}));
-  sub_graph.set(var_i, next_index_int32);
-  sub_graph.EndLoop(&loop_header);
-
-  sub_graph.Bind(&return_true);
-  sub_graph.set(ret_val, GetRootConstant(RootIndex::kTrueValue));
-  sub_graph.Goto(&done);
-
-  sub_graph.Bind(&return_false);
-  sub_graph.set(ret_val, GetRootConstant(RootIndex::kFalseValue));
-  sub_graph.Goto(&done);
-
-  sub_graph.Bind(&done);
+        sub_graph.set(ret_val, GetRootConstant(RootIndex::kTrueValue));
+        return ReduceResult::Done();
+      },
+      [&]() -> ReduceResult {
+        sub_graph.set(ret_val, GetRootConstant(RootIndex::kFalseValue));
+        return ReduceResult::Done();
+      }));
   return sub_graph.get(ret_val);
 }
 
@@ -9235,8 +9124,7 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceCollectionIteratorPrototypeNext(
             broker()->target_native_context().iterator_result_map(broker());
         VirtualObject* iter_result =
             reducer_.CreateJSIteratorResult(iter_result_map, value, is_done);
-        return reducer_.BuildInlinedAllocation(iter_result,
-                                               AllocationType::kYoung);
+        return reducer_.BuildInlinedAllocation(iter_result);
       });
 }
 
@@ -9311,12 +9199,6 @@ MaybeReduceResult MaglevGraphBuilder::BuildCollectionIteratorStep(
           "of this context");
     }
     static_instance_type = kind_map->first;
-    // The table transition below is a subgraph loop, which the virtual
-    // object tracking does not recognise as a loop: its loads would fold to
-    // the state from before the loop and never observe the stores on the
-    // backedge. Materialize the iterator so those become real memory
-    // accesses.
-    allocation->ForceEscaping();
   } else if (MapInference inference(this, receiver);
              auto possible_maps = inference.TryGetPossibleMaps()) {
     if (possible_maps->is_empty()) {
@@ -9371,41 +9253,40 @@ MaybeReduceResult MaglevGraphBuilder::BuildCollectionIteratorStep(
   // (rehash/shrink) while iterating: an obsolete table's number-of-elements
   // slot is reused as the link to its replacement, so the hot path only
   // checks that the slot still holds a Smi.
-  {
-    MaglevSubGraphBuilder::Label table_is_current(&sub_builder, 1);
-    MaglevSubGraphBuilder::LoopLabel heal_loop = sub_builder.BeginLoop({});
-    ValueNode* table;
-    GET_VALUE_OR_ABORT(
-        table,
-        BuildLoadTaggedField(receiver, offsetof(JSCollectionIterator, table_),
-                             NodeType::kAnyHeapObject));
-    ValueNode* next_table;
-    GET_VALUE_OR_ABORT(
-        next_table,
-        AddNewNode<LoadFixedArrayElement>(
-            {table, GetInt32Constant(OrderedHashMap::NextTableIndex())},
-            LoadType::kUnknown));
-    RETURN_IF_ABORT(
-        sub_builder.GotoIfTrue<BranchIfSmi>(&table_is_current, {next_table}));
-    ValueNode* index;
-    GET_VALUE_OR_ABORT(
-        index,
-        BuildLoadTaggedField(receiver, offsetof(JSCollectionIterator, index_),
-                             NodeType::kSmi));
-    // Nothing has been stored to the iterator yet, so the frame state attached
-    // to the call can safely re-execute next() from the beginning.
-    ValueNode* healed_index =
-        BuildCallBuiltin<Builtin::kOrderedHashTableHealIndex>({table, index});
-    RETURN_IF_ABORT(reducer_.RecordType(healed_index, NodeType::kSmi));
-    RETURN_IF_ABORT(BuildStoreTaggedField(
-        receiver, healed_index, offsetof(JSCollectionIterator, index_),
-        StoreTaggedMode::kDefault));
-    RETURN_IF_ABORT(BuildStoreTaggedField(
-        receiver, next_table, offsetof(JSCollectionIterator, table_),
-        StoreTaggedMode::kDefault));
-    sub_builder.EndLoop(&heal_loop);
-    RETURN_IF_ABORT(sub_builder.TrimPredecessorsAndBind(&table_is_current));
-  }
+  RETURN_IF_ABORT(sub_builder.BuildLoop(
+      {}, [&](MaglevSubGraphBuilder::Label* table_is_current) -> ReduceResult {
+        ValueNode* table;
+        GET_VALUE_OR_ABORT(
+            table, BuildLoadTaggedField(receiver,
+                                        offsetof(JSCollectionIterator, table_),
+                                        NodeType::kAnyHeapObject));
+        ValueNode* next_table;
+        GET_VALUE_OR_ABORT(
+            next_table,
+            AddNewNode<LoadFixedArrayElement>(
+                {table, GetInt32Constant(OrderedHashMap::NextTableIndex())},
+                LoadType::kUnknown));
+        RETURN_IF_ABORT(sub_builder.GotoIfTrue<BranchIfSmi>(table_is_current,
+                                                            {next_table}));
+        ValueNode* index;
+        GET_VALUE_OR_ABORT(
+            index, BuildLoadTaggedField(receiver,
+                                        offsetof(JSCollectionIterator, index_),
+                                        NodeType::kSmi));
+        // Nothing has been stored to the iterator yet, so the frame state
+        // attached to the call can safely re-execute next() from the beginning.
+        ValueNode* healed_index =
+            BuildCallBuiltin<Builtin::kOrderedHashTableHealIndex>(
+                {table, index});
+        RETURN_IF_ABORT(reducer_.RecordType(healed_index, NodeType::kSmi));
+        RETURN_IF_ABORT(BuildStoreTaggedField(
+            receiver, healed_index, offsetof(JSCollectionIterator, index_),
+            StoreTaggedMode::kDefault));
+        RETURN_IF_ABORT(BuildStoreTaggedField(
+            receiver, next_table, offsetof(JSCollectionIterator, table_),
+            StoreTaggedMode::kDefault));
+        return ReduceResult::Done();
+      }));
 
   ValueNode* table;
   GET_VALUE_OR_ABORT(
@@ -9887,316 +9768,295 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceArrayPrototypeSort(
   MaglevSubGraphBuilder::Variable var_j(1);
   MaglevSubGraphBuilder::Variable var_copy(2);
 
-  MaglevSubGraphBuilder::Label slow_label(&sub_builder, 1);
-  MaglevSubGraphBuilder::Label join_label(&sub_builder, 2);
-
-  // Branch: length > kMaxInlineSortSize -> slow path.
-  RETURN_IF_ABORT(sub_builder.GotoIfFalse<BranchIfInt32Compare>(
-      &slow_label, {length, GetInt32Constant(kMaxInlineSortSize)},
-      Operation::kLessThanOrEqual));
-
-  // Fast path: inline insertion sort.
-  //
-  // Use a lambda so that RETURN_IF_ABORT inside the fast path returns from the
-  // lambda (not from this function), ensuring the slow path is always emitted
-  // even if an unexpected abort occurs.
-  ReduceResult fast_path_result = [&]() -> ReduceResult {
-    // comparefn is statically known to be a callable function (checked above).
-
-    // Load the elements backing store.
-    ValueNode* elements;
-    GET_VALUE_OR_ABORT(elements, BuildLoadElements(receiver, elements_kind));
-
-    // Allocate a temporary FixedArray of kMaxInlineSortSize elements and
-    // copy the receiver's elements into it.  The sort operates entirely on
-    // this copy: comparefn side effects on the receiver do not affect the
-    // sort result, matching ECMA-262 23.1.3.30 SortIndexedProperties
-    // semantics.  On deopt the temp_array is threaded through the deopt
-    // frame so the spec-correct snapshot is preserved.
-    ValueNode* temp_array;
-    {
-      base::SmallVector<ValueNode*, kMaxInlineSortSize> smis;
-      for (int k = 0; k < kMaxInlineSortSize; k++) {
-        smis.push_back(GetSmiConstant(0));
-      }
-      VirtualObject* temp_vobj =
-          reducer_.CreateFixedArray(base::VectorOf(smis));
-      GET_VALUE_OR_ABORT(temp_array, reducer_.BuildInlinedAllocation(
-                                         temp_vobj, AllocationType::kYoung));
-    }
-
-    // Helper: copy all elements in [0, length) between two FixedArrays.
-    // When `check_undefined` is true the copy deopts on the first Undefined
-    // value, unwinding to the bytecode-level .sort call so the generic
-    // Array.prototype.sort builtin handles the Undefined-compaction step
-    // that the inlined insertion sort omits.  Only PACKED_ELEMENTS receivers
-    // can hold Undefined; PACKED_SMI_ELEMENTS guarantees every value is a
-    // Smi.
-    auto BuildCopyLoop = [&](ValueNode* src, ValueNode* dst,
-                             bool check_undefined) -> ReduceResult {
-      sub_builder.set(var_copy, GetInt32Constant(0));
-      MaglevSubGraphBuilder::Label copy_end(&sub_builder, 1);
-      MaglevSubGraphBuilder::LoopLabel copy_loop =
-          sub_builder.BeginLoop({&var_copy});
-      {
-        ValueNode* k = sub_builder.get(var_copy);
+  RETURN_IF_ABORT(sub_builder.WithFallback(
+      {},
+      [&](MaglevSubGraphBuilder::Label* slow_label) -> ReduceResult {
+        // Branch: length > kMaxInlineSortSize -> slow path.
         RETURN_IF_ABORT(sub_builder.GotoIfFalse<BranchIfInt32Compare>(
-            &copy_end, {k, length}, Operation::kLessThan));
-        ValueNode* val;
-        GET_VALUE_OR_ABORT(val, BuildLoadFixedArrayElement(src, k));
-        if (check_undefined) {
-          RETURN_IF_ABORT(AddNewNode<CheckNotUndefined>({val}));
+            slow_label, {length, GetInt32Constant(kMaxInlineSortSize)},
+            Operation::kLessThanOrEqual));
+
+        // Fast path: inline insertion sort.
+        // comparefn is statically known to be a callable function (checked
+        // above).
+
+        // Load the elements backing store.
+        ValueNode* elements;
+        GET_VALUE_OR_ABORT(elements,
+                           BuildLoadElements(receiver, elements_kind));
+
+        // Allocate a temporary FixedArray of kMaxInlineSortSize elements and
+        // copy the receiver's elements into it.  The sort operates entirely on
+        // this copy: comparefn side effects on the receiver do not affect the
+        // sort result, matching ECMA-262 23.1.3.30 SortIndexedProperties
+        // semantics.  On deopt the temp_array is threaded through the deopt
+        // frame so the spec-correct snapshot is preserved.
+        ValueNode* temp_array;
+        {
+          base::SmallVector<ValueNode*, kMaxInlineSortSize> smis;
+          for (int k = 0; k < kMaxInlineSortSize; k++) {
+            smis.push_back(GetSmiConstant(0));
+          }
+          VirtualObject* temp_vobj =
+              reducer_.CreateFixedArray(base::VectorOf(smis));
+          GET_VALUE_OR_ABORT(temp_array,
+                             reducer_.BuildInlinedAllocation(temp_vobj));
         }
-        RETURN_IF_ABORT(BuildStoreFixedArrayElement(dst, k, val));
-        ValueNode* k_inc;
-        GET_VALUE_OR_ABORT(k_inc,
-                           AddNewNode<Int32Add>({k, GetInt32Constant(1)}));
-        sub_builder.set(var_copy, k_inc);
-      }
-      sub_builder.EndLoop(&copy_loop);
-      return sub_builder.TrimPredecessorsAndBind(&copy_end);
-    };
 
-    // Copy-in: temp_array[k] = elements[k] for k in [0, length).
-    RETURN_IF_ABORT(
-        BuildCopyLoop(elements, temp_array, !IsSmiElementsKind(elements_kind)));
+        // Helper: copy all elements in [0, length) between two FixedArrays.
+        // When `check_undefined` is true the copy deopts on the first Undefined
+        // value, unwinding to the bytecode-level .sort call so the generic
+        // Array.prototype.sort builtin handles the Undefined-compaction step
+        // that the inlined insertion sort omits.  Only PACKED_ELEMENTS
+        // receivers can hold Undefined; PACKED_SMI_ELEMENTS guarantees every
+        // value is a Smi.
+        auto BuildCopyLoop = [&](ValueNode* src, ValueNode* dst,
+                                 bool check_undefined) -> ReduceResult {
+          sub_builder.set(var_copy, GetInt32Constant(0));
+          return sub_builder.BuildLoop(
+              {&var_copy},
+              [&](MaglevSubGraphBuilder::Label* copy_end) -> ReduceResult {
+                ValueNode* k = sub_builder.get(var_copy);
+                RETURN_IF_ABORT(sub_builder.GotoIfFalse<BranchIfInt32Compare>(
+                    copy_end, {k, length}, Operation::kLessThan));
+                ValueNode* val;
+                GET_VALUE_OR_ABORT(val, BuildLoadFixedArrayElement(src, k));
+                if (check_undefined) {
+                  RETURN_IF_ABORT(AddNewNode<CheckNotUndefined>({val}));
+                }
+                RETURN_IF_ABORT(BuildStoreFixedArrayElement(dst, k, val));
+                ValueNode* k_inc;
+                GET_VALUE_OR_ABORT(
+                    k_inc, AddNewNode<Int32Add>({k, GetInt32Constant(1)}));
+                sub_builder.set(var_copy, k_inc);
+                return ReduceResult::Done();
+              });
+        };
 
-    // Outer loop: i = 1 .. length-1.
-    sub_builder.set(var_i, GetInt32Constant(1));
+        // Copy-in: temp_array[k] = elements[k] for k in [0, length).
+        RETURN_IF_ABORT(BuildCopyLoop(elements, temp_array,
+                                      !IsSmiElementsKind(elements_kind)));
 
-    // Eager deopts inside the sort continue from the temp_array snapshot via
-    // ArraySortContinueFromSnapshot.  The frame state carries (receiver,
-    // comparefn, temp_array, length) so the continuation reproduces the
-    // spec's _items_ snapshot and writes back originalLength elements,
-    // independent of any cmp side effects on the receiver.
-    EagerDeoptFrameScope eager_deopt_scope(
-        &reducer_, GetContext(),
-        Builtin::kArraySortContinueFromSnapshotEagerDeoptContinuation, target,
-        base::VectorOf<ValueNode*>({receiver, comparefn, temp_array, length}));
+        // Outer loop: i = 1 .. length-1.
+        sub_builder.set(var_i, GetInt32Constant(1));
 
-    MaglevSubGraphBuilder::Label outer_end(&sub_builder, 1);
-    MaglevSubGraphBuilder::LoopLabel outer_loop =
-        sub_builder.BeginLoop({&var_i});
+        // Eager deopts inside the sort continue from the temp_array snapshot
+        // via ArraySortContinueFromSnapshot.  The frame state carries
+        // (receiver, comparefn, temp_array, length) so the continuation
+        // reproduces the spec's _items_ snapshot and writes back originalLength
+        // elements, independent of any cmp side effects on the receiver.
+        EagerDeoptFrameScope eager_deopt_scope(
+            &reducer_, GetContext(),
+            Builtin::kArraySortContinueFromSnapshotEagerDeoptContinuation,
+            target,
+            base::VectorOf<ValueNode*>(
+                {receiver, comparefn, temp_array, length}));
 
-    // After BeginLoop the known map/length info is reset.  Restore it following
-    // the same pattern as TryReduceArrayIteratingBuiltin.
-    if (node_info != nullptr) {
-      node_info = known_node_aspects().TryGetInfoFor(receiver);
-      DCHECK_NOT_NULL(node_info);
-    }
-    if (receiver_maps_were_unstable) {
-      DCHECK(node_info);
-      if (!node_info->SetPossibleMaps(
-              receiver_maps_before_loop, receiver_maps_were_unstable,
-              NodeType::kUnknown, broker(), known_node_aspects())) {
-        return reducer_.EmitUnconditionalDeopt(DeoptimizeReason::kWrongValue);
-      }
-      known_node_aspects().MarkSideEffectsRequireInvalidation();
-    }
-    ValueNode* i_int32 = sub_builder.get(var_i);
+        RETURN_IF_ABORT(sub_builder.BuildLoop(
+            {&var_i},
+            [&](MaglevSubGraphBuilder::Label* outer_end) -> ReduceResult {
+              // After BeginLoop the known map/length info is reset.  Restore it
+              // following the same pattern as TryReduceArrayIteratingBuiltin.
+              if (receiver_maps_were_unstable) {
+                NodeInfo* mutable_info =
+                    known_node_aspects().TryGetMutableInfoFor(receiver);
+                DCHECK_NOT_NULL(mutable_info);
+                if (!mutable_info->SetPossibleMaps(
+                        receiver_maps_before_loop, receiver_maps_were_unstable,
+                        NodeType::kUnknown, broker(), known_node_aspects())) {
+                  return reducer_.EmitUnconditionalDeopt(
+                      DeoptimizeReason::kWrongValue);
+                }
+                known_node_aspects().MarkSideEffectsRequireInvalidation();
+              } else if (node_info != nullptr) {
+                node_info = known_node_aspects().TryGetInfoFor(receiver);
+                DCHECK_NOT_NULL(node_info);
+              }
+              ValueNode* i_int32 = sub_builder.get(var_i);
 
-    RETURN_IF_ABORT(sub_builder.GotoIfFalse<BranchIfInt32Compare>(
-        &outer_end, {i_int32, length}, Operation::kLessThan));
+              RETURN_IF_ABORT(sub_builder.GotoIfFalse<BranchIfInt32Compare>(
+                  outer_end, {i_int32, length}, Operation::kLessThan));
 
-    // Load pivot = temp_array[i].
-    ValueNode* pivot;
-    {
-      LoadType load_type = IsSmiElementsKind(elements_kind)
-                               ? LoadType::kSmi
-                               : LoadType::kUnknown;
-      GET_VALUE_OR_ABORT(
-          pivot, BuildLoadFixedArrayElement(temp_array, i_int32, load_type));
-    }
+              // Load pivot = temp_array[i].
+              ValueNode* pivot;
+              {
+                LoadType load_type = IsSmiElementsKind(elements_kind)
+                                         ? LoadType::kSmi
+                                         : LoadType::kUnknown;
+                GET_VALUE_OR_ABORT(pivot, BuildLoadFixedArrayElement(
+                                              temp_array, i_int32, load_type));
+              }
 
-    // Initialize inner-loop index: j = i - 1.
-    ValueNode* j_init;
-    GET_VALUE_OR_ABORT(j_init,
-                       AddNewNode<Int32Add>({i_int32, GetInt32Constant(-1)}));
-    sub_builder.set(var_j, j_init);
+              // Initialize inner-loop index: j = i - 1.
+              ValueNode* j_init;
+              GET_VALUE_OR_ABORT(j_init, AddNewNode<Int32Add>(
+                                             {i_int32, GetInt32Constant(-1)}));
+              sub_builder.set(var_j, j_init);
 
-    // Inner loop: j = i-1 down to 0 (or until insertion point found).
-    MaglevSubGraphBuilder::Label inner_end(&sub_builder, 2);
-    MaglevSubGraphBuilder::LoopLabel inner_loop =
-        sub_builder.BeginLoop({&var_j});
+              // Inner loop: j = i-1 down to 0 (or until insertion point found).
+              RETURN_IF_ABORT(sub_builder.BuildLoop(
+                  {&var_j},
+                  [&](MaglevSubGraphBuilder::Label* inner_end) -> ReduceResult {
+                    ValueNode* j_int32 = sub_builder.get(var_j);
 
-    ValueNode* j_int32 = sub_builder.get(var_j);
+                    RETURN_IF_ABORT(
+                        sub_builder.GotoIfFalse<BranchIfInt32Compare>(
+                            inner_end, {j_int32, GetInt32Constant(0)},
+                            Operation::kGreaterThanOrEqual));
 
-    RETURN_IF_ABORT(sub_builder.GotoIfFalse<BranchIfInt32Compare>(
-        &inner_end, {j_int32, GetInt32Constant(0)},
-        Operation::kGreaterThanOrEqual));
+                    // Load elem = temp_array[j].
+                    ValueNode* elem;
+                    {
+                      LoadType load_type = IsSmiElementsKind(elements_kind)
+                                               ? LoadType::kSmi
+                                               : LoadType::kUnknown;
+                      GET_VALUE_OR_ABORT(
+                          elem, BuildLoadFixedArrayElement(temp_array, j_int32,
+                                                           load_type));
+                    }
 
-    // Load elem = temp_array[j].
-    ValueNode* elem;
-    {
-      LoadType load_type = IsSmiElementsKind(elements_kind)
-                               ? LoadType::kSmi
-                               : LoadType::kUnknown;
-      GET_VALUE_OR_ABORT(
-          elem, BuildLoadFixedArrayElement(temp_array, j_int32, load_type));
-    }
+                    // Call comparefn(pivot, elem).
+                    ValueNode* cmp_result;
+                    {
+                      CallArguments cmp_args(
+                          ConvertReceiverMode::kNullOrUndefined, {pivot, elem});
 
-    // Call comparefn(pivot, elem).
-    MaybeReduceResult cmp_maybe;
-    {
-      CallArguments cmp_args(ConvertReceiverMode::kNullOrUndefined,
-                             {pivot, elem});
+                      // Lazy deopt at the cmp call boundary: temp_array is a
+                      // valid permutation of the original receiver elements at
+                      // this point (the pivot is restored to temp_array[j]
+                      // after each successful shift in the inner-loop body
+                      // below).  The continuation feeds temp_array and the
+                      // original length to the generic PowerSort tail.
+                      LazyDeoptFrameScope restart_sort(
+                          &reducer_, GetContext(),
+                          Builtin::
+                              kArraySortContinueFromSnapshotLazyDeoptContinuation,
+                          target,
+                          base::VectorOf<ValueNode*>(
+                              {receiver, comparefn, temp_array, length}));
 
-      // Lazy deopt at the cmp call boundary: temp_array is a valid
-      // permutation of the original receiver elements at this point (the
-      // pivot is restored to temp_array[j] after each successful shift in
-      // the inner-loop body below).  The continuation feeds temp_array and
-      // the original length to the generic PowerSort tail.
-      LazyDeoptFrameScope restart_sort(
-          &reducer_, GetContext(),
-          Builtin::kArraySortContinueFromSnapshotLazyDeoptContinuation, target,
-          base::VectorOf<ValueNode*>(
-              {receiver, comparefn, temp_array, length}));
+                      SaveCallSpeculationScope saved(this);
+                      GET_VALUE_OR_ABORT(
+                          cmp_result,
+                          ReduceCall(comparefn, cmp_args, saved.value()));
+                    }
 
-      SaveCallSpeculationScope saved(this);
-      cmp_maybe = ReduceCall(comparefn, cmp_args, saved.value());
-    }
+                    // Compare cmp_result < 0.  Use int32 when the result is
+                    // already integral (raw int32 or tagged Smi); fall back to
+                    // float64 otherwise.
+                    if (NodeTypeIs(GetType(cmp_result), NodeType::kSmi) ||
+                        reducer_.TryGetInt32(cmp_result)) {
+                      RETURN_IF_ABORT(
+                          sub_builder.GotoIfFalse<BranchIfInt32Compare>(
+                              inner_end, {cmp_result, GetInt32Constant(0)},
+                              Operation::kLessThan));
+                    } else {
+                      ValueNode* cmp_f64;
+                      GET_VALUE_OR_ABORT(
+                          cmp_f64,
+                          GetFloat64ForToNumber(cmp_result, NodeType::kNumber));
+                      RETURN_IF_ABORT(
+                          sub_builder.GotoIfFalse<BranchIfFloat64Compare>(
+                              inner_end, {cmp_f64, GetFloat64Constant(0.0)},
+                              Operation::kLessThan));
+                    }
 
-    // Process the comparefn result inside a nested lambda so that any abort
-    // (e.g. unconditional deopt from a non-numeric comparefn return value)
-    // returns from THIS lambda, not from the outer fast-path lambda.  This
-    // ensures EndLoop / TrimPredecessorsAndBind below are always reached.
-    ReduceResult inner_body_result = [&]() -> ReduceResult {
-      if (cmp_maybe.IsDoneWithAbort()) return ReduceResult::DoneWithAbort();
-      ValueNode* cmp_result = cmp_maybe.value();
+                    // cmp_result < 0: pivot < elem, so shift elem right.
+                    // temp_array[j+1] = elem
+                    ValueNode* j_plus1;
+                    GET_VALUE_OR_ABORT(
+                        j_plus1,
+                        AddNewNode<Int32Add>({j_int32, GetInt32Constant(1)}));
+                    RETURN_IF_ABORT(
+                        BuildStoreFixedArrayElement(temp_array, j_plus1, elem));
 
-      // Compare cmp_result < 0.  Use int32 when the result is already
-      // integral (raw int32 or tagged Smi); fall back to float64 otherwise.
-      if (NodeTypeIs(GetType(cmp_result), NodeType::kSmi) ||
-          reducer_.TryGetInt32(cmp_result)) {
-        RETURN_IF_ABORT(sub_builder.GotoIfFalse<BranchIfInt32Compare>(
-            &inner_end, {cmp_result, GetInt32Constant(0)},
-            Operation::kLessThan));
-      } else {
-        ValueNode* cmp_f64;
-        GET_VALUE_OR_ABORT(
-            cmp_f64, GetFloat64ForToNumber(cmp_result, NodeType::kNumber));
-        RETURN_IF_ABORT(sub_builder.GotoIfFalse<BranchIfFloat64Compare>(
-            &inner_end, {cmp_f64, GetFloat64Constant(0.0)},
-            Operation::kLessThan));
-      }
+                    // Store pivot at temp_array[j] to keep temp_array a valid
+                    // permutation of the original elements at every cmp call
+                    // boundary. The next iteration reads temp_array[j-1], so
+                    // overwriting [j] is benign; on inner-loop exit pivot is at
+                    // temp_array[j_exit + 1].
+                    RETURN_IF_ABORT(BuildStoreFixedArrayElement(
+                        temp_array, j_int32, pivot));
 
-      // cmp_result < 0: pivot < elem, so shift elem right.
-      // temp_array[j+1] = elem
-      ValueNode* j_plus1;
-      GET_VALUE_OR_ABORT(j_plus1,
-                         AddNewNode<Int32Add>({j_int32, GetInt32Constant(1)}));
-      RETURN_IF_ABORT(BuildStoreFixedArrayElement(temp_array, j_plus1, elem));
+                    // j--
+                    ValueNode* j_dec;
+                    GET_VALUE_OR_ABORT(
+                        j_dec,
+                        AddNewNode<Int32Add>({j_int32, GetInt32Constant(-1)}));
+                    sub_builder.set(var_j, j_dec);
+                    return ReduceResult::Done();
+                  }));
 
-      // Store pivot at temp_array[j] to keep temp_array a valid
-      // permutation of the original elements at every cmp call boundary.
-      // The next iteration reads temp_array[j-1], so overwriting [j] is
-      // benign; on inner-loop exit pivot is at temp_array[j_exit + 1].
-      RETURN_IF_ABORT(BuildStoreFixedArrayElement(temp_array, j_int32, pivot));
+              // i++
+              ValueNode* i_inc;
+              GET_VALUE_OR_ABORT(
+                  i_inc, AddNewNode<Int32Add>({i_int32, GetInt32Constant(1)}));
+              sub_builder.set(var_i, i_inc);
+              return ReduceResult::Done();
+            }));
 
-      // j--
-      ValueNode* j_dec;
-      GET_VALUE_OR_ABORT(j_dec,
-                         AddNewNode<Int32Add>({j_int32, GetInt32Constant(-1)}));
-      sub_builder.set(var_j, j_dec);
-      return ReduceResult::Done();
-    }();
-    // inner_body_result is deliberately unused: an abort sets current_block_
-    // to null, which EndLoop/TrimPredecessorsAndBind handle correctly below.
-    USE(inner_body_result);
+        // Guard: comparefn side effects may have changed the receiver's map or
+        // length.  Check once here before the copy-back (the sort loop only
+        // touches the temp array, so in-loop checks are unnecessary).
+        {
+          if (receiver_maps_were_unstable) {
+            bool emit_check_with_migration = std::any_of(
+                receiver_maps_before_loop.begin(),
+                receiver_maps_before_loop.end(),
+                [](compiler::MapRef map) { return map.is_migration_target(); });
+            if (emit_check_with_migration) {
+              RETURN_IF_ABORT(AddNewNode<CheckMapsWithMigration>(
+                  {receiver}, receiver_maps_before_loop,
+                  CheckType::kOmitHeapObjectCheck));
+            } else {
+              RETURN_IF_ABORT(
+                  AddNewNode<CheckMaps>({receiver}, receiver_maps_before_loop,
+                                        CheckType::kOmitHeapObjectCheck));
+            }
+          }
 
-    sub_builder.EndLoop(&inner_loop);
-
-    // Bind inner_end.  TrimPredecessorsAndBind handles the case where the
-    // cmp-result path was never taken (due to abort); inner_end always has at
-    // least one predecessor from the j < 0 check above.
-    RETURN_IF_ABORT(sub_builder.TrimPredecessorsAndBind(&inner_end));
-
-    // i++
-    ValueNode* i_inc;
-    GET_VALUE_OR_ABORT(i_inc,
-                       AddNewNode<Int32Add>({i_int32, GetInt32Constant(1)}));
-    sub_builder.set(var_i, i_inc);
-
-    sub_builder.EndLoop(&outer_loop);
-
-    // Bind outer_end.  Always has at least one predecessor from the i >= length
-    // check above.
-    RETURN_IF_ABORT(sub_builder.TrimPredecessorsAndBind(&outer_end));
-
-    // Guard: comparefn side effects may have changed the receiver's map or
-    // length.  Check once here before the copy-back (the sort loop only
-    // touches the temp array, so in-loop checks are unnecessary).
-    {
-      if (receiver_maps_were_unstable) {
-        bool emit_check_with_migration = std::any_of(
-            receiver_maps_before_loop.begin(), receiver_maps_before_loop.end(),
-            [](compiler::MapRef map) { return map.is_migration_target(); });
-        if (emit_check_with_migration) {
-          RETURN_IF_ABORT(AddNewNode<CheckMapsWithMigration>(
-              {receiver}, receiver_maps_before_loop,
-              CheckType::kOmitHeapObjectCheck));
-        } else {
-          RETURN_IF_ABORT(
-              AddNewNode<CheckMaps>({receiver}, receiver_maps_before_loop,
-                                    CheckType::kOmitHeapObjectCheck));
+          ValueNode* current_length_int32;
+          GET_VALUE_OR_ABORT(
+              current_length_int32,
+              GetInt32(BuildLoadJSArrayLength(receiver).value()));
+          // Deopt if comparefn side effects changed the array length.
+          RETURN_IF_ABORT(TryBuildCheckInt32Condition(
+              length, current_length_int32, AssertCondition::kEqual,
+              DeoptimizeReason::kArrayLengthChanged));
         }
-      }
 
-      ValueNode* current_length_int32;
-      GET_VALUE_OR_ABORT(current_length_int32,
-                         GetInt32(BuildLoadJSArrayLength(receiver).value()));
-      // Deopt if comparefn side effects changed the array length.
-      RETURN_IF_ABORT(TryBuildCheckInt32Condition(
-          length, current_length_int32, AssertCondition::kEqual,
-          DeoptimizeReason::kArrayLengthChanged));
-    }
+        // Re-load the elements pointer: comparefn may have grown/shrunk the
+        // backing store via push/pop, replacing receiver.elements.  The map and
+        // length checks above don't catch a same-length push-then-pop sequence.
+        ValueNode* writable_elements;
+        GET_VALUE_OR_ABORT(writable_elements,
+                           BuildLoadElements(receiver, elements_kind));
+        // Ensure the elements backing store isn't COW before we write into it.
+        // Array literals share a COW FixedArray; writing back without copying
+        // it first would corrupt every other invocation of the literal site.
+        // elements_kind is always PACKED_SMI or PACKED_ELEMENTS here
+        // (PACKED_DOUBLE bailed out above).
+        DCHECK(IsSmiOrObjectElementsKind(elements_kind));
+        GET_VALUE_OR_ABORT(writable_elements,
+                           AddNewNode<EnsureWritableFastElements>(
+                               {writable_elements, receiver}));
 
-    // Re-load the elements pointer: comparefn may have grown/shrunk the
-    // backing store via push/pop, replacing receiver.elements.  The map and
-    // length checks above don't catch a same-length push-then-pop sequence.
-    ValueNode* writable_elements;
-    GET_VALUE_OR_ABORT(writable_elements,
-                       BuildLoadElements(receiver, elements_kind));
-    // Ensure the elements backing store isn't COW before we write into it.
-    // Array literals share a COW FixedArray; writing back without copying it
-    // first would corrupt every other invocation of the literal site.
-    // elements_kind is always PACKED_SMI or PACKED_ELEMENTS here (PACKED_DOUBLE
-    // bailed out above).
-    DCHECK(IsSmiOrObjectElementsKind(elements_kind));
-    GET_VALUE_OR_ABORT(
-        writable_elements,
-        AddNewNode<EnsureWritableFastElements>({writable_elements, receiver}));
-
-    // Copy-back: elements[k] = temp_array[k] for k in [0, length).
-    // temp_array was already filtered on copy-in, so no undefined check.
-    RETURN_IF_ABORT(BuildCopyLoop(temp_array, writable_elements,
-                                  /*check_undefined=*/false));
-
-    return ReduceResult::Done();
-  }();
-  // fast_path_result is either Done or DoneWithAbort.  An abort sets
-  // current_block to null, which GotoOrTrim handles by trimming the join
-  // predecessor count -- no explicit check needed.
-  USE(fast_path_result);
-
-  // Jump to join (handles null current_block if fast path aborted).
-  sub_builder.GotoOrTrim(&join_label);
-
-  // Slow path (length > kMaxInlineSortSize): call the unoptimised builtin.
-  // TODO(jgruber): When this reduction moves to MaglevGraphOptimizer, the
-  // slow-path call to Array.prototype.sort will be re-reduced, causing
-  // infinite recursion.  Add a disallow_speculation flag on
-  // CallKnownJSFunction to prevent this.
-  sub_builder.Bind(&slow_label);
-  {
-    ValueNode* sort_fn_node = GetConstant(target);
-    RETURN_IF_ABORT(
-        BuildGenericCall(sort_fn_node, Call::TargetType::kJSFunction, args));
-  }
-  sub_builder.GotoOrTrim(&join_label);
-
-  // Join fast and slow paths.
-  RETURN_IF_ABORT(sub_builder.TrimPredecessorsAndBind(&join_label));
+        // Copy-back: elements[k] = temp_array[k] for k in [0, length).
+        // temp_array was already filtered on copy-in, so no undefined check.
+        return BuildCopyLoop(temp_array, writable_elements,
+                             /*check_undefined=*/false);
+      },
+      [&]() -> ReduceResult {
+        // Slow path (length > kMaxInlineSortSize): call the unoptimised
+        // builtin.
+        // TODO(jgruber): When this reduction moves to MaglevGraphOptimizer, the
+        // slow-path call to Array.prototype.sort will be re-reduced, causing
+        // infinite recursion.  Add a disallow_speculation flag on
+        // CallKnownJSFunction to prevent this.
+        ValueNode* sort_fn_node = GetConstant(target);
+        return BuildGenericCall(sort_fn_node, Call::TargetType::kJSFunction,
+                                args);
+      }));
 
   // Array.prototype.sort returns the sorted array (the receiver).
   return receiver;
@@ -10347,9 +10207,11 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceArrayPrototypePush(
         AddNewNode<MaybeGrowFastElements>(
             {elements_array, receiver, last_index, elements_array_length},
             kind));
-    // If {MaybeGrowFastElements} doesn't deopt, then we're guaranteed that the
-    // new length fits in a Smi.
-    reducer_.RecordTypeNoAbort(new_array_length, NodeType::kSmi);
+    // If {MaybeGrowFastElements} doesn't deopt, then we're guaranteed at
+    // runtime that the new length fits in a Smi. {RecordType} can still abort
+    // if {new_array_length} was reused via CSE with a conflicting type (making
+    // this point unreachable).
+    RETURN_IF_ABORT(reducer_.RecordType(new_array_length, NodeType::kSmi));
     ValueNode* new_array_length_smi;
     GET_VALUE_OR_ABORT(new_array_length_smi,
                        AddNewNode<UnsafeSmiTagInt32>({new_array_length}));
@@ -10478,81 +10340,92 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceArrayPrototypePop(
   MaglevSubGraphBuilder::Variable var_value(0);
   MaglevSubGraphBuilder::Variable var_new_array_length(1);
 
-  std::optional<MaglevSubGraphBuilder::Label> do_return =
-      std::make_optional<MaglevSubGraphBuilder::Label>(
-          &sub_graph, unique_kind_count + 1,
-          std::initializer_list<MaglevSubGraphBuilder::Variable*>{
-              &var_value, &var_new_array_length});
-  MaglevSubGraphBuilder::Label empty_array(&sub_graph, 1);
-
   ValueNode* old_array_length_smi;
   GET_VALUE_OR_ABORT(old_array_length_smi,
                      GetSmiValue(BuildLoadJSArrayLength(receiver)));
 
-  // If the array is empty, skip the pop and return undefined.
-  RETURN_IF_ABORT(sub_graph.GotoIfTrue<BranchIfReferenceEqual>(
-      &empty_array, {old_array_length_smi, GetSmiConstant(0)}));
+  RETURN_IF_ABORT(sub_graph.WithFallback(
+      {&var_value, &var_new_array_length},
+      [&](MaglevSubGraphBuilder::Label* empty_array) -> ReduceResult {
+        // If the array is empty, skip the pop and return undefined.
+        RETURN_IF_ABORT(sub_graph.GotoIfTrue<BranchIfReferenceEqual>(
+            empty_array, {old_array_length_smi, GetSmiConstant(0)}));
 
-  ValueNode* elements_array;
-  GET_VALUE_OR_ABORT(elements_array, BuildLoadElements(receiver));
-  ValueNode* new_array_length_smi;
-  GET_VALUE_OR_ABORT(new_array_length_smi,
-                     AddNewNode<CheckedSmiDecrement>({old_array_length_smi}));
-  ValueNode* new_array_length;
-  GET_VALUE_OR_ABORT(new_array_length,
-                     AddNewNode<UnsafeSmiUntag>({new_array_length_smi}));
-  sub_graph.set(var_new_array_length, new_array_length_smi);
+        ValueNode* elements_array;
+        GET_VALUE_OR_ABORT(elements_array, BuildLoadElements(receiver));
+        ValueNode* new_array_length_smi;
+        GET_VALUE_OR_ABORT(
+            new_array_length_smi,
+            AddNewNode<CheckedSmiDecrement>({old_array_length_smi}));
+        ValueNode* new_array_length;
+        GET_VALUE_OR_ABORT(new_array_length,
+                           AddNewNode<UnsafeSmiUntag>({new_array_length_smi}));
+        sub_graph.set(var_new_array_length, new_array_length_smi);
 
-  auto build_array_pop = [&](ElementsKind kind) {
-    // Handle COW if needed.
-    ValueNode* writable_elements_array;
-    if (IsSmiOrObjectElementsKind(kind)) {
-      GET_VALUE_OR_ABORT(
-          writable_elements_array,
-          AddNewNode<EnsureWritableFastElements>({elements_array, receiver}));
-    } else {
-      writable_elements_array = elements_array;
-    }
+        auto build_array_pop = [&](ElementsKind kind) {
+          // Handle COW if needed.
+          ValueNode* writable_elements_array;
+          if (IsSmiOrObjectElementsKind(kind)) {
+            GET_VALUE_OR_ABORT(writable_elements_array,
+                               AddNewNode<EnsureWritableFastElements>(
+                                   {elements_array, receiver}));
+          } else {
+            writable_elements_array = elements_array;
+          }
 
-    // Store new length.
-    RETURN_IF_ABORT(AddNewNode<StoreTaggedFieldNoWriteBarrier>(
-        {receiver, new_array_length_smi},
-        static_cast<int>(offsetof(JSArray, length_)), StoreTaggedMode::kDefault,
-        broker()->length_string()));
+          // Store new length.
+          RETURN_IF_ABORT(AddNewNode<StoreTaggedFieldNoWriteBarrier>(
+              {receiver, new_array_length_smi},
+              static_cast<int>(offsetof(JSArray, length_)),
+              StoreTaggedMode::kDefault, broker()->length_string()));
 
-    // Load the value and store the hole in it's place.
-    ValueNode* value;
-    if (IsDoubleElementsKind(kind)) {
-      GET_VALUE_OR_ABORT(value, BuildLoadFixedDoubleArrayElement(
-                                    writable_elements_array, new_array_length));
-      RETURN_IF_ABORT(AddNewNode<StoreFixedDoubleArrayHole>(
-          {writable_elements_array, new_array_length}));
-    } else {
-      DCHECK(IsSmiElementsKind(kind) || IsObjectElementsKind(kind));
-      GET_VALUE_OR_ABORT(value, BuildLoadFixedArrayElement(
-                                    writable_elements_array, new_array_length));
-      RETURN_IF_ABORT(BuildStoreFixedArrayElement(
-          writable_elements_array, new_array_length,
-          GetRootConstant(RootIndex::kTheHoleValue)));
-    }
+          // Load the value and store the hole in it's place.
+          ValueNode* value;
+          if (IsDoubleElementsKind(kind)) {
+            GET_VALUE_OR_ABORT(
+                value, BuildLoadFixedDoubleArrayElement(writable_elements_array,
+                                                        new_array_length));
+            RETURN_IF_ABORT(AddNewNode<StoreFixedDoubleArrayHole>(
+                {writable_elements_array, new_array_length}));
+          } else {
+            DCHECK(IsSmiElementsKind(kind) || IsObjectElementsKind(kind));
+            GET_VALUE_OR_ABORT(
+                value, BuildLoadFixedArrayElement(writable_elements_array,
+                                                  new_array_length));
+            RETURN_IF_ABORT(BuildStoreFixedArrayElement(
+                writable_elements_array, new_array_length,
+                GetRootConstant(RootIndex::kTheHoleValue)));
+          }
 
-    if (IsHoleyElementsKind(kind)) {
-      GET_VALUE_OR_ABORT(value, AddNewNode<ConvertHoleToUndefined>({value}));
-    }
-    sub_graph.set(var_value, value);
-    return ReduceResult::Done();
-  };
+          if (IsHoleyElementsKind(kind)) {
+            GET_VALUE_OR_ABORT(value,
+                               AddNewNode<ConvertHoleToUndefined>({value}));
+          }
+          sub_graph.set(var_value, value);
+          return ReduceResult::Done();
+        };
 
-  RETURN_IF_ABORT(BuildJSArrayBuiltinMapSwitchOnElementsKind(
-      receiver, map_kinds, sub_graph, do_return, unique_kind_count,
-      index_to_elements_kind, build_array_pop));
+        std::optional<MaglevSubGraphBuilder::Label> do_return;
+        if (unique_kind_count > 1) {
+          do_return.emplace(
+              &sub_graph, unique_kind_count,
+              std::initializer_list<MaglevSubGraphBuilder::Variable*>{
+                  &var_value, &var_new_array_length});
+        }
+        RETURN_IF_ABORT(BuildJSArrayBuiltinMapSwitchOnElementsKind(
+            receiver, map_kinds, sub_graph, do_return, unique_kind_count,
+            index_to_elements_kind, build_array_pop));
+        if (do_return.has_value()) {
+          RETURN_IF_ABORT(sub_graph.TrimPredecessorsAndBind(&*do_return));
+        }
+        return ReduceResult::Done();
+      },
+      [&]() -> ReduceResult {
+        sub_graph.set(var_new_array_length, GetSmiConstant(0));
+        sub_graph.set(var_value, GetRootConstant(RootIndex::kUndefinedValue));
+        return ReduceResult::Done();
+      }));
 
-  sub_graph.Bind(&empty_array);
-  sub_graph.set(var_new_array_length, GetSmiConstant(0));
-  sub_graph.set(var_value, GetRootConstant(RootIndex::kUndefinedValue));
-  sub_graph.Goto(&*do_return);
-
-  sub_graph.Bind(&*do_return);
   reducer_.RecordKnownProperty(
       receiver, broker()->length_string(), sub_graph.get(var_new_array_length),
       PropertyConstness::kMutable, compiler::AccessMode::kStore);
@@ -11465,14 +11338,14 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceCallForConstant(
   }
   compiler::SharedFunctionInfoRef shared = target.shared(broker());
   ValueNode* target_node = GetConstant(target);
+  if (IsClassConstructor(shared.kind())) {
+    // If we have a class constructor, we should raise an exception.
+    return reducer_.EmitThrow(Throw::kThrowConstructorNonCallableError,
+                              target_node);
+  }
+  DCHECK(target.map(broker()).IsCallableJSFunctionMap());
   // Do not reduce calls to functions with break points.
   if (!shared.HasBreakInfo(broker())) {
-    if (IsClassConstructor(shared.kind())) {
-      // If we have a class constructor, we should raise an exception.
-      return reducer_.EmitThrow(Throw::kThrowConstructorNonCallableError,
-                                target_node);
-    }
-    DCHECK(IsCallable(*target.object()));
     RETURN_IF_DONE(TryReduceBuiltin(target, shared, args, feedback_source));
     RETURN_IF_DONE(TryBuildCallKnownJSFunction(
         target, GetRootConstant(RootIndex::kUndefinedValue), args,
@@ -11563,18 +11436,18 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceCallForNewClosure(
     JSDispatchHandle dispatch_handle, compiler::SharedFunctionInfoRef shared,
     compiler::FeedbackCellRef feedback_cell, CallArguments& args,
     const compiler::FeedbackSource& feedback_source) {
-  // Do not reduce calls to functions with break points.
   if (args.mode() != CallArguments::kDefault) {
     // TODO(victorgomes): Maybe inline the spread stub? Or call known function
     // directly if arguments list is an array.
     return {};
   }
+  if (IsClassConstructor(shared.kind())) {
+    // If we have a class constructor, we should raise an exception.
+    return reducer_.EmitThrow(Throw::kThrowConstructorNonCallableError,
+                              target_node);
+  }
+  // Do not reduce calls to functions with break points.
   if (!shared.HasBreakInfo(broker())) {
-    if (IsClassConstructor(shared.kind())) {
-      // If we have a class constructor, we should raise an exception.
-      return reducer_.EmitThrow(Throw::kThrowConstructorNonCallableError,
-                                target_node);
-    }
     RETURN_IF_DONE(TryBuildCallKnownJSFunction(
         target_context, target_node,
         GetRootConstant(RootIndex::kUndefinedValue), dispatch_handle, shared,
@@ -11648,20 +11521,26 @@ ReduceResult MaglevGraphBuilder::BuildCallWithFeedback(
             broker()->target_native_context();
         compiler::JSFunctionRef apply_function =
             native_context.function_prototype_apply(broker());
-        RETURN_IF_ABORT(BuildCheckValueByReference(
-            target_node, apply_function, DeoptimizeReason::kWrongCallTarget));
-        PROCESS_AND_RETURN_IF_DONE(
-            TryReduceFunctionPrototypeApplyCallWithReceiver(
-                feedback_target, args, feedback_source),
-            SetAccumulator);
-        feedback_target = apply_function;
+        if (compiler::OptionalHeapObjectRef target_constant =
+                TryGetConstant<HeapObject>(target_node);
+            !target_constant.has_value() ||
+            target_constant->equals(apply_function)) {
+          RETURN_IF_ABORT(BuildCheckValueByReference(
+              target_node, apply_function, DeoptimizeReason::kWrongCallTarget));
+          PROCESS_AND_RETURN_IF_DONE(
+              TryReduceFunctionPrototypeApplyCallWithReceiver(
+                  feedback_target, args, feedback_source),
+              SetAccumulator);
+        }
       } else {
         DCHECK_EQ(CallFeedbackContent::kTarget, content);
+        RETURN_IF_ABORT(BuildCheckValueByReference(
+            target_node, feedback_target, DeoptimizeReason::kWrongCallTarget));
       }
-      RETURN_IF_ABORT(BuildCheckValueByReference(
-          target_node, feedback_target, DeoptimizeReason::kWrongCallTarget));
     } else if (call_feedback.target()->IsFeedbackCell() &&
                args.mode() == CallArguments::kDefault) {
+      DCHECK_EQ(CallFeedbackContent::kTarget,
+                call_feedback.call_feedback_content());
       compiler::FeedbackCellRef feedback_cell =
           call_feedback.target()->AsFeedbackCell();
       compiler::OptionalSharedFunctionInfoRef shared =
@@ -11825,7 +11704,7 @@ MaglevGraphBuilder::TryExtractArgumentsFromElements(
   }
 
   if (auto* inlined_allocation = elements_value->TryCast<InlinedAllocation>()) {
-    VirtualObject* elements = GetObjectFromAllocation(inlined_allocation);
+    VirtualObject* elements = inlined_allocation->object();
     ValueNode* elements_length_node =
         elements->get(offsetof(FixedArray, length_));
     std::optional<int32_t> maybe_elements_length =
@@ -11885,6 +11764,23 @@ MaglevGraphBuilder::TryExtractArgumentsFromElements(
   return {};
 }
 
+namespace {
+bool IsSloppyMappedArgumentsObject(compiler::JSHeapBroker* broker,
+                                   compiler::MapRef map) {
+  return broker->target_native_context()
+      .fast_aliased_arguments_map(broker)
+      .equals(map);
+}
+
+#ifdef DEBUG
+bool HasUnmutatedArgumentsOrRestLength(VirtualObject* arguments_object) {
+  ValueNode* length =
+      arguments_object->get(JSStrictArgumentsObject::kLengthOffset);
+  return length->Is<ArgumentsLength>() || length->Is<RestLength>();
+}
+#endif
+}  // namespace
+
 ReduceResult MaglevGraphBuilder::ReduceCallWithArrayLikeForArgumentsObject(
     ValueNode* target_node, CallArguments& args,
     VirtualObject* arguments_object,
@@ -11896,13 +11792,10 @@ ReduceResult MaglevGraphBuilder::ReduceCallWithArrayLikeForArgumentsObject(
       arguments_object->get(offsetof(JSObject, elements_));
   if (ArgumentsElements* arguments_elements =
           elements_value->TryCast<ArgumentsElements>()) {
-    ValueNode* length_node =
-        arguments_object->get(JSStrictArgumentsObject::kLengthOffset);
-    if (length_node->Is<ArgumentsLength>() || length_node->Is<RestLength>()) {
-      args.PopArrayLikeArgument();
-      return BuildCallForwardArgumentsElements<CallForwardVarargs>(
-          target_node, args, arguments_elements);
-    }
+    DCHECK(HasUnmutatedArgumentsOrRestLength(arguments_object));
+    args.PopArrayLikeArgument();
+    return BuildCallForwardArgumentsElements<CallForwardVarargs>(
+        target_node, args, arguments_elements);
   }
 
   std::optional<base::SmallVector<ValueNode*, 8>> arg_list =
@@ -11929,11 +11822,7 @@ MaglevGraphBuilder::TryReduceConstructWithSpreadForArgumentsObject(
   ValueNode* elements_value =
       arguments_object->get(offsetof(JSObject, elements_));
   if (auto* arguments_elements = elements_value->TryCast<ArgumentsElements>()) {
-    ValueNode* length_node =
-        arguments_object->get(JSStrictArgumentsObject::kLengthOffset);
-    if (!length_node->Is<ArgumentsLength>() && !length_node->Is<RestLength>()) {
-      return {};
-    }
+    DCHECK(HasUnmutatedArgumentsOrRestLength(arguments_object));
     if (!broker()->dependencies()->DependOnArrayIteratorProtector()) {
       return {};
     }
@@ -11959,15 +11848,6 @@ MaglevGraphBuilder::TryReduceConstructWithSpreadForArgumentsObject(
   return BuildConstruct(target, new_target, new_args, feedback_source);
 }
 
-namespace {
-bool IsSloppyMappedArgumentsObject(compiler::JSHeapBroker* broker,
-                                   compiler::MapRef map) {
-  return broker->target_native_context()
-      .fast_aliased_arguments_map(broker)
-      .equals(map);
-}
-}  // namespace
-
 std::optional<VirtualObject*>
 MaglevGraphBuilder::TryGetNonEscapingArgumentsOrArray(ValueNode* value) {
   auto try_get_non_escaping_alloc = [&](ValueNode* node) -> InlinedAllocation* {
@@ -11990,8 +11870,8 @@ MaglevGraphBuilder::TryGetNonEscapingArgumentsOrArray(ValueNode* value) {
     return {};
   }
 
-  VirtualObject* object = GetObjectFromAllocation(alloc);
-  if (!object || !object->has_static_map()) {
+  VirtualObject* object = alloc->object();
+  if (!object->has_static_map()) {
     return {};
   }
   compiler::MapRef map = *object->map();
@@ -12088,11 +11968,7 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceCallWithSpreadForArgumentsObject(
 
   auto* elements_value = arguments_object->get(offsetof(JSObject, elements_));
   if (auto* arguments_elements = elements_value->TryCast<ArgumentsElements>()) {
-    ValueNode* length_node =
-        arguments_object->get(JSStrictArgumentsObject::kLengthOffset);
-    if (!length_node->Is<ArgumentsLength>() && !length_node->Is<RestLength>()) {
-      return {};
-    }
+    DCHECK(HasUnmutatedArgumentsOrRestLength(arguments_object));
     if (!broker()->dependencies()->DependOnArrayIteratorProtector()) {
       return {};
     }
@@ -12446,8 +12322,7 @@ ReduceResult MaglevGraphBuilder::VisitIntrinsicGeneratorYieldResult(
             map, value, GetBooleanConstant(false));
         ValueNode* alloc_result;
         GET_VALUE_OR_ABORT(alloc_result,
-                           reducer_.BuildInlinedAllocation(
-                               iter_result, AllocationType::kYoung));
+                           reducer_.BuildInlinedAllocation(iter_result));
         subgraph.set(ret_val, alloc_result);
         return ReduceResult::Done();
       }));
@@ -12465,8 +12340,7 @@ ReduceResult MaglevGraphBuilder::VisitIntrinsicCreateIterResultObject(
       broker()->target_native_context().iterator_result_map(broker());
   VirtualObject* iter_result =
       reducer_.CreateJSIteratorResult(map, value, done);
-  return SetAccumulator(
-      reducer_.BuildInlinedAllocation(iter_result, AllocationType::kYoung));
+  return SetAccumulator(reducer_.BuildInlinedAllocation(iter_result));
 }
 
 ReduceResult MaglevGraphBuilder::VisitIntrinsicCreateAsyncFromSyncIterator(
@@ -12548,52 +12422,53 @@ ReduceResult MaglevGraphBuilder::VisitIntrinsicAsyncFunctionAwait(
 
   MaglevSubGraphBuilder sub_graph(this, 1);
   MaglevSubGraphBuilder::Variable ret_val(0);
-  MaglevSubGraphBuilder::Label slow_path(&sub_graph, 3);
-  MaglevSubGraphBuilder::Label done(&sub_graph, 2, {&ret_val});
 
-  RETURN_IF_ABORT(sub_graph.GotoIfTrue<BranchIfSmi>(&slow_path, {value}));
+  RETURN_IF_ABORT(sub_graph.WithFallback(
+      {&ret_val},
+      [&](MaglevSubGraphBuilder::Label* slow_path) -> ReduceResult {
+        RETURN_IF_ABORT(sub_graph.GotoIfTrue<BranchIfSmi>(slow_path, {value}));
 
-  ValueNode* value_map;
-  GET_VALUE_OR_ABORT(value_map, BuildLoadMap(value));
-  RETURN_IF_ABORT(sub_graph.GotoIfFalse<BranchIfReferenceEqual>(
-      &slow_path, {value_map, GetConstant(promise_map)}));
+        ValueNode* value_map;
+        GET_VALUE_OR_ABORT(value_map, BuildLoadMap(value));
+        RETURN_IF_ABORT(sub_graph.GotoIfFalse<BranchIfReferenceEqual>(
+            slow_path, {value_map, GetConstant(promise_map)}));
 
-  ValueNode* flags;
-  GET_VALUE_OR_ABORT(
-      flags,
-      BuildLoadTaggedField(value, offsetof(JSPromise, flags_), NodeType::kSmi));
-  RETURN_IF_ABORT(sub_graph.GotoIfFalse<BranchIfReferenceEqual>(
-      &slow_path,
-      {flags, GetSmiConstant(static_cast<int>(Promise::kFulfilled))}));
+        ValueNode* flags;
+        GET_VALUE_OR_ABORT(
+            flags, BuildLoadTaggedField(value, offsetof(JSPromise, flags_),
+                                        NodeType::kSmi));
+        RETURN_IF_ABORT(sub_graph.GotoIfFalse<BranchIfReferenceEqual>(
+            slow_path,
+            {flags, GetSmiConstant(static_cast<int>(Promise::kFulfilled))}));
 
-  ValueNode* fulfilled_value;
-  GET_VALUE_OR_ABORT(
-      fulfilled_value,
-      BuildLoadTaggedField(value, offsetof(JSPromise, reactions_or_result_)));
+        ValueNode* fulfilled_value;
+        GET_VALUE_OR_ABORT(
+            fulfilled_value,
+            BuildLoadTaggedField(value,
+                                 offsetof(JSPromise, reactions_or_result_)));
 
-  RETURN_IF_ABORT(BuildStoreTaggedFieldNoWriteBarrier(
-      value,
-      GetSmiConstant(static_cast<int>(Promise::kFulfilled) |
-                     JSPromise::Flags::HasHandlerBit::kMask),
-      offsetof(JSPromise, flags_), StoreTaggedMode::kDefault));
+        RETURN_IF_ABORT(BuildStoreTaggedFieldNoWriteBarrier(
+            value,
+            GetSmiConstant(static_cast<int>(Promise::kFulfilled) |
+                           JSPromise::Flags::HasHandlerBit::kMask),
+            offsetof(JSPromise, flags_), StoreTaggedMode::kDefault));
 
-  VirtualObject* task = reducer_.CreateAsyncResumeTask(
-      async_function_object, fulfilled_value,
-      GetSmiConstant(AsyncResumeTask::kAsyncFunctionAwait));
-  ValueNode* task_node;
-  GET_VALUE_OR_ABORT(
-      task_node, reducer_.BuildInlinedAllocation(task, AllocationType::kYoung));
-  BuildCallBuiltin<Builtin::kEnqueueMicrotask>({task_node});
+        VirtualObject* task = reducer_.CreateAsyncResumeTask(
+            async_function_object, fulfilled_value,
+            GetSmiConstant(AsyncResumeTask::kAsyncFunctionAwait));
+        ValueNode* task_node;
+        GET_VALUE_OR_ABORT(task_node, reducer_.BuildInlinedAllocation(task));
+        BuildCallBuiltin<Builtin::kEnqueueMicrotask>({task_node});
 
-  sub_graph.set(ret_val, outer_promise);
-  sub_graph.Goto(&done);
+        sub_graph.set(ret_val, outer_promise);
+        return ReduceResult::Done();
+      },
+      [&]() -> ReduceResult {
+        sub_graph.set(ret_val, BuildCallBuiltin<Builtin::kAsyncFunctionAwait>(
+                                   {async_function_object, value}));
+        return ReduceResult::Done();
+      }));
 
-  sub_graph.Bind(&slow_path);
-  sub_graph.set(ret_val, BuildCallBuiltin<Builtin::kAsyncFunctionAwait>(
-                             {async_function_object, value}));
-  sub_graph.Goto(&done);
-
-  sub_graph.Bind(&done);
   SetAccumulator(sub_graph.get(ret_val));
   return ReduceResult::Done();
 }
@@ -12622,8 +12497,7 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceAsyncFunctionEnter(
   VirtualObject* async_function = reducer_.CreateJSAsyncFunctionObject(
       GetContext(), closure, receiver, register_file, promise);
 
-  return reducer_.BuildInlinedAllocation(async_function,
-                                         AllocationType::kYoung);
+  return reducer_.BuildInlinedAllocation(async_function);
 }
 
 ReduceResult MaglevGraphBuilder::VisitIntrinsicAsyncFunctionEnter(
@@ -12694,11 +12568,10 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceAsyncFunctionResolve(
 
   ValueNode* promise = nullptr;
   if (auto* alloc = async_function_object->TryCast<InlinedAllocation>()) {
-    if (VirtualObject* vobj = GetObjectFromAllocation(alloc)) {
-      ValueNode* slot = vobj->get(offsetof(JSAsyncFunctionObject, promise_));
-      if (slot->Is<InlinedAllocation>()) {
-        promise = slot;
-      }
+    VirtualObject* vobj = alloc->object();
+    ValueNode* slot = vobj->get(offsetof(JSAsyncFunctionObject, promise_));
+    if (slot->Is<InlinedAllocation>()) {
+      promise = slot;
     }
   }
   if (promise == nullptr) {
@@ -12845,13 +12718,12 @@ ReduceResult MaglevGraphBuilder::BuildAndAllocateKeyValueArray(
   GET_VALUE_OR_ABORT(array, reducer_.CreateJSArray(map, map.instance_size(),
                                                    GetSmiConstant(2)));
   array->set(offsetof(JSObject, elements_), elements);
-  return reducer_.BuildInlinedAllocation(array, AllocationType::kYoung);
+  return reducer_.BuildInlinedAllocation(array);
 }
 
 ReduceResult MaglevGraphBuilder::BuildAndAllocateJSArray(
     compiler::MapRef map, ValueNode* length, ValueNode* elements,
-    const compiler::SlackTrackingPrediction& slack_tracking_prediction,
-    AllocationType allocation_type) {
+    const compiler::SlackTrackingPrediction& slack_tracking_prediction) {
   VirtualObject* array;
   GET_VALUE_OR_ABORT(
       array, reducer_.CreateJSArray(
@@ -12862,7 +12734,7 @@ ReduceResult MaglevGraphBuilder::BuildAndAllocateJSArray(
     array->set(map.GetInObjectPropertyOffset(i),
                GetRootConstant(RootIndex::kUndefinedValue));
   }
-  return reducer_.BuildInlinedAllocation(array, allocation_type);
+  return reducer_.BuildInlinedAllocation(array);
 }
 
 MaybeReduceResult MaglevGraphBuilder::TryBuildAndAllocateJSGeneratorObject(
@@ -12874,9 +12746,12 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildAndAllocateJSGeneratorObject(
   if (!function.has_initial_map(broker())) return {};
 
   // The shared function info of this JSFunction should be the same as the
-  // current one we are compiling.
-  DCHECK_EQ(compilation_unit()->shared_function_info(),
-            function.shared(broker()));
+  // current one we are compiling. Otherwise an earlier check narrowed the
+  // closure to a different function and this block is unreachable.
+  if (!function.shared(broker()).equals(
+          compilation_unit()->shared_function_info())) {
+    return reducer_.BuildAbort(AbortReason::kUnreachable);
+  }
 
   // Create the register file.
   int length = parameter_count_without_receiver() + register_count();
@@ -12903,7 +12778,7 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildAndAllocateJSGeneratorObject(
     generator->set(initial_map.GetInObjectPropertyOffset(i), undefined);
   }
 
-  return reducer_.BuildInlinedAllocation(generator, AllocationType::kYoung);
+  return reducer_.BuildInlinedAllocation(generator);
 }
 
 namespace {
@@ -13030,12 +12905,9 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceConstructArrayConstructor(
   // bit to do certain speculative optimizations. This mechanism protects
   // against deopt loops.
   bool can_speculate_call;
-  AllocationType allocation_type = AllocationType::kYoung;
 
   if (maybe_allocation_site) {
     can_speculate_call = !maybe_allocation_site->IsSpeculationDisabled();
-    allocation_type =
-        broker()->dependencies()->DependOnPretenureMode(*maybe_allocation_site);
     broker()->dependencies()->DependOnElementsKind(*maybe_allocation_site);
   } else {
     can_speculate_call = CanSpeculateCall();
@@ -13046,7 +12918,7 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceConstructArrayConstructor(
     return BuildAndAllocateJSArray(
         initial_map, GetSmiConstant(0),
         BuildElementsArray(elements_kind, JSArray::kPreallocatedArrayElements),
-        slack_tracking_prediction, allocation_type);
+        slack_tracking_prediction);
   }
 
   // Arity 1, `new Array(maybe_length)`.
@@ -13059,15 +12931,15 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceConstructArrayConstructor(
         return BuildAndAllocateJSArray(
             initial_map, GetSmiConstant(*maybe_length),
             BuildElementsArray(elements_kind, *maybe_length),
-            slack_tracking_prediction, allocation_type);
+            slack_tracking_prediction);
       } else {
         ValueNode* elements;
-        GET_VALUE_OR_ABORT(elements, AddNewNode<AllocateElementsArray>(
-                                         {GetInt32Constant(*maybe_length)},
-                                         elements_kind, allocation_type));
-        return BuildAndAllocateJSArray(
-            initial_map, GetSmiConstant(*maybe_length), elements,
-            slack_tracking_prediction, allocation_type);
+        GET_VALUE_OR_ABORT(
+            elements, AddNewNode<AllocateElementsArray>(
+                          {GetInt32Constant(*maybe_length)}, elements_kind));
+        return BuildAndAllocateJSArray(initial_map,
+                                       GetSmiConstant(*maybe_length), elements,
+                                       slack_tracking_prediction);
       }
     }
 
@@ -13083,12 +12955,10 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceConstructArrayConstructor(
         },
         [&] {
           ValueNode* elements;
-          GET_VALUE_OR_ABORT(elements,
-                             AddNewNode<AllocateElementsArray>(
-                                 {args[0]}, elements_kind, allocation_type));
+          GET_VALUE_OR_ABORT(elements, AddNewNode<AllocateElementsArray>(
+                                           {args[0]}, elements_kind));
           return BuildAndAllocateJSArray(initial_map, args[0], elements,
-                                         slack_tracking_prediction,
-                                         allocation_type);
+                                         slack_tracking_prediction);
         },
         [&] {
           ValueNode* error = GetSmiConstant(
@@ -13203,7 +13073,7 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceConstructArrayConstructor(
   return BuildAndAllocateJSArray(
       initial_map, GetSmiConstant(arity),
       BuildElementsArray(elements_kind, base::VectorOf(values)),
-      slack_tracking_prediction, allocation_type);
+      slack_tracking_prediction);
 }
 
 MaybeReduceResult MaglevGraphBuilder::TryReduceConstructBuiltin(
@@ -13225,8 +13095,7 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceConstructBuiltin(
       // constructor.
       if (args.count() == 0) {
         return reducer_.BuildInlinedAllocation(
-            reducer_.CreateJSConstructor(target_function),
-            AllocationType::kYoung);
+            reducer_.CreateJSConstructor(target_function));
       }
       break;
     }
@@ -13245,7 +13114,7 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceConstructBuiltin(
                            BuildToString(args[0], ToString::kThrowOnSymbol));
       }
       return reducer_.BuildInlinedAllocation(
-          reducer_.CreateJSStringWrapper(value), AllocationType::kYoung);
+          reducer_.CreateJSStringWrapper(value));
     }
     case Builtin::kPromiseConstructor:
       // TODO(victorgomes): specialize more known constants builtin targets.
@@ -13323,8 +13192,7 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceJSConstructStub(
         GET_VALUE_OR_ABORT(
             implicit_receiver,
             reducer_.BuildInlinedAllocation(
-                reducer_.CreateJSConstructor(new_target_function.value()),
-                AllocationType::kYoung));
+                reducer_.CreateJSConstructor(new_target_function.value())));
       }
     }
     if (implicit_receiver == nullptr) {
@@ -13450,8 +13318,8 @@ ReduceResult MaglevGraphBuilder::BuildConstruct(
   if (new_target_feedback.has_value() &&
       new_target_feedback->IsAllocationSite()) {
     // The feedback is an AllocationSite, which means we have called the
-    // Array function and collected transition (and pretenuring) feedback
-    // for the resulting arrays.
+    // Array function and collected transition feedback for the resulting
+    // arrays.
     compiler::JSFunctionRef array_function =
         broker()->target_native_context().array_function(broker());
     RETURN_IF_ABORT(BuildCheckValueByReference(
@@ -13724,8 +13592,7 @@ ReduceResult MaglevGraphBuilder::VisitCreateRegExpLiteral() {
     compiler::MapRef map =
         native_context.regexp_function(broker()).initial_map(broker());
     return SetAccumulator(reducer_.BuildInlinedAllocation(
-        reducer_.CreateRegExpLiteralObject(map, literal),
-        AllocationType::kYoung));
+        reducer_.CreateRegExpLiteralObject(map, literal)));
   }
   // Fallback.
   return SetAccumulator(
@@ -13839,63 +13706,63 @@ ReduceResult MaglevGraphBuilder::VisitArrayDestructure() {
 
   for (uint32_t i = 0; i < count; ++i) {
     ValueNode* index_node = GetSmiConstant(i);
-    subgraph.set(var_element, undefined);
     ValueNode* current_is_done = subgraph.get(var_iterator_is_done);
 
-    Subgraph<MaglevGraphBuilder>::Label iterator_is_done(
-        &subgraph, i == 0 ? 1 : 2, {&var_iterator_is_done, &var_element});
-    Subgraph<MaglevGraphBuilder>::Label next(
-        &subgraph, 2, {&var_iterator_is_done, &var_element});
+    ReduceResult result = subgraph.WithFallback(
+        {&var_iterator_is_done, &var_element},
+        [&](Subgraph<MaglevGraphBuilder>::Label* iterator_is_done)
+            -> ReduceResult {
+          if (i == 0) {
+            // On the first iteration we know the iterator isn't already done.
+            DCHECK_EQ(current_is_done->Cast<RootConstant>()->index(),
+                      RootIndex::kFalseValue);
+          } else {
+            CHECK(subgraph
+                      .GotoIfTrue<BranchIfRootConstant>(iterator_is_done,
+                                                        {current_is_done},
+                                                        RootIndex::kTrueValue)
+                      .IsDoneWithoutAbort());
+          }
 
-    if (i == 0) {
-      // On the first iteration we know the iterator isn't already done.
-      DCHECK_EQ(current_is_done->Cast<RootConstant>()->index(),
-                RootIndex::kFalseValue);
-    } else {
-      CHECK(subgraph
-                .GotoIfTrue<BranchIfRootConstant>(
-                    &iterator_is_done, {current_is_done}, RootIndex::kTrueValue)
-                .IsDoneWithoutAbort());
-    }
-
-    ValueNode* step_result;
-    {
-      LazyDeoptFrameScope lazy_deopt_scope(
-          &reducer_, GetContext(),
-          Builtin::kArrayDestructureLazyDeoptContinuation, {},
-          base::VectorOf<ValueNode*>(
-              {iterator, next_method, index_node, first_reg_node, count_node}));
-      // The lazy deopt continuation will write only from `i` up to count, so
-      // change the lazy deopt result location to only include those registers.
-      // This ensures that the `i` register values already written with
-      // StoreRegister into the DeoptFrame are considered "live" by the
-      // compiler.
-      LazyDeoptResultLocationScope result_location_scope(this, outputs[i],
-                                                         count - i);
-      // This is not allowed to return DoneWithAbort (i.e. unconditionally eager
-      // deopt) without an eager continuation, since we have to populate the
-      // remaining registers if it does. It can, however, lazy deopt, since the
-      // continuation handles populating the interpreter registers.
-      GET_VALUE(step_result,
+          ValueNode* step_result;
+          {
+            LazyDeoptFrameScope lazy_deopt_scope(
+                &reducer_, GetContext(),
+                Builtin::kArrayDestructureLazyDeoptContinuation, {},
+                base::VectorOf<ValueNode*>({iterator, next_method, index_node,
+                                            first_reg_node, count_node}));
+            // The lazy deopt continuation will write only from `i` up to count,
+            // so change the lazy deopt result location to only include those
+            // registers. This ensures that the `i` register values already
+            // written with StoreRegister into the DeoptFrame are considered
+            // "live" by the compiler.
+            LazyDeoptResultLocationScope result_location_scope(this, outputs[i],
+                                                               count - i);
+            // This is not allowed to return DoneWithAbort (i.e. unconditionally
+            // eager deopt) without an eager continuation, since we have to
+            // populate the remaining registers if it does. It can, however,
+            // lazy deopt, since the continuation handles populating the
+            // interpreter registers.
+            GET_VALUE(
+                step_result,
                 BuildCallBuiltinWithTaggedInputs<Builtin::kForOfNext>(
                     {iterator, next_method, undefined, GetSmiConstant(0)}));
-    }
-    CHECK(subgraph
-              .GotoIfTrue<BranchIfRootConstant>(
-                  &iterator_is_done, {step_result}, RootIndex::kTheHoleValue)
-              .IsDoneWithoutAbort());
-    subgraph.set(var_iterator_is_done, false_node);
-    subgraph.set(var_element, step_result);
-    subgraph.Goto(&next);
-
-    subgraph.Bind(&iterator_is_done);
-    {
-      subgraph.set(var_iterator_is_done, true_node);
-      subgraph.set(var_element, undefined);
-      subgraph.Goto(&next);
-    }
-
-    subgraph.Bind(&next);
+          }
+          CHECK(subgraph
+                    .GotoIfTrue<BranchIfRootConstant>(iterator_is_done,
+                                                      {step_result},
+                                                      RootIndex::kTheHoleValue)
+                    .IsDoneWithoutAbort());
+          subgraph.set(var_iterator_is_done, false_node);
+          subgraph.set(var_element, step_result);
+          return ReduceResult::Done();
+        },
+        [&]() -> ReduceResult {
+          subgraph.set(var_iterator_is_done, true_node);
+          subgraph.set(var_element, undefined);
+          return ReduceResult::Done();
+        });
+    CHECK(result.IsDoneWithoutAbort());
     StoreRegister(outputs[i], subgraph.get(var_element));
   }
 
@@ -13936,14 +13803,12 @@ ReduceResult MaglevGraphBuilder::VisitCreateEmptyArrayLiteral() {
   VirtualObject* array;
   GET_VALUE_OR_ABORT(array, reducer_.CreateJSArray(map, map.instance_size(),
                                                    GetSmiConstant(0)));
-  return SetAccumulator(
-      reducer_.BuildInlinedAllocation(array, AllocationType::kYoung));
+  return SetAccumulator(reducer_.BuildInlinedAllocation(array));
 }
 
 std::optional<VirtualObject*>
 MaglevGraphBuilder::TryReadBoilerplateForFastLiteral(
-    compiler::JSObjectRef boilerplate, AllocationType allocation, int max_depth,
-    int* max_properties) {
+    compiler::JSObjectRef boilerplate, int max_depth, int* max_properties) {
   DCHECK_GE(max_depth, 0);
   DCHECK_GE(*max_properties, 0);
 
@@ -14065,8 +13930,8 @@ MaglevGraphBuilder::TryReadBoilerplateForFastLiteral(
     } else if (boilerplate_value.IsJSObject()) {
       compiler::JSObjectRef boilerplate_object = boilerplate_value.AsJSObject();
       std::optional<VirtualObject*> maybe_object_value =
-          TryReadBoilerplateForFastLiteral(boilerplate_object, allocation,
-                                           max_depth - 1, max_properties);
+          TryReadBoilerplateForFastLiteral(boilerplate_object, max_depth - 1,
+                                           max_properties);
       if (!maybe_object_value.has_value()) return {};
       fast_literal->set(offset, maybe_object_value.value());
     } else if (property_details.representation().IsDouble()) {
@@ -14102,10 +13967,6 @@ MaglevGraphBuilder::TryReadBoilerplateForFastLiteral(
       boilerplate_elements, offsetof(HeapObject, map_), elements_map);
   if (boilerplate_elements.length() == 0 ||
       elements_map.IsFixedCowArrayMap(broker())) {
-    if (allocation == AllocationType::kOld &&
-        !boilerplate.IsElementsTenured(boilerplate_elements)) {
-      return {};
-    }
     fast_literal->set(offsetof(JSObject, elements_),
                       GetConstant(boilerplate_elements));
   } else {
@@ -14145,8 +14006,7 @@ MaglevGraphBuilder::TryReadBoilerplateForFastLiteral(
         } else if (element_value->IsJSObject()) {
           std::optional<VirtualObject*> object =
               TryReadBoilerplateForFastLiteral(element_value->AsJSObject(),
-                                               allocation, max_depth - 1,
-                                               max_properties);
+                                               max_depth - 1, max_properties);
           if (!object.has_value()) return {};
           values[i] = *object;
         } else {
@@ -14161,13 +14021,6 @@ MaglevGraphBuilder::TryReadBoilerplateForFastLiteral(
   }
 
   return fast_literal;
-}
-
-VirtualObject* MaglevGraphBuilder::DeepCopyVirtualObject(VirtualObject* old) {
-  VirtualObject* vobject = old->Clone(NewObjectId(), zone());
-  current_interpreter_frame_.add_object(vobject);
-  old->allocation()->UpdateObject(vobject);
-  return vobject;
 }
 
 void MaglevGraphBuilder::AddDeoptUse(VirtualObject* vobject) {
@@ -14345,8 +14198,7 @@ template <CreateArgumentsType type>
 ReduceResult MaglevGraphBuilder::BuildAndAllocateArgumentsObject() {
   auto arguments = BuildVirtualArgumentsObject<type>();
   ValueNode* allocation;
-  GET_VALUE_OR_ABORT(allocation, reducer_.BuildInlinedAllocation(
-                                     arguments, AllocationType::kYoung));
+  GET_VALUE_OR_ABORT(allocation, reducer_.BuildInlinedAllocation(arguments));
   return allocation;
 }
 
@@ -14354,22 +14206,20 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildFastCreateObjectOrArrayLiteral(
     const compiler::LiteralFeedback& feedback) {
   compiler::AllocationSiteRef site = feedback.value();
   if (!site.boilerplate(broker()).has_value()) return {};
-  AllocationType allocation_type =
-      broker()->dependencies()->DependOnPretenureMode(site);
 
   // First try to extract out the shape and values of the boilerplate, bailing
   // out on complex boilerplates.
   int max_properties = compiler::kMaxFastLiteralProperties;
   std::optional<VirtualObject*> maybe_value = TryReadBoilerplateForFastLiteral(
-      *site.boilerplate(broker()), allocation_type,
-      compiler::kMaxFastLiteralDepth, &max_properties);
+      *site.boilerplate(broker()), compiler::kMaxFastLiteralDepth,
+      &max_properties);
   if (!maybe_value.has_value()) return {};
 
   // Then, use the collected information to actually create nodes in the graph.
   // TODO(leszeks): Add support for unwinding graph modifications, so that we
   // can get rid of this two pass approach.
   broker()->dependencies()->DependOnElementsKinds(site);
-  return reducer_.BuildInlinedAllocation(*maybe_value, allocation_type);
+  return reducer_.BuildInlinedAllocation(*maybe_value);
 }
 
 ReduceResult MaglevGraphBuilder::VisitCreateObjectLiteral() {
@@ -14411,8 +14261,8 @@ ReduceResult MaglevGraphBuilder::VisitCreateEmptyObjectLiteral() {
       native_context.object_function(broker()).initial_map(broker());
   DCHECK(!map.is_dictionary_map());
   DCHECK(!map.IsInobjectSlackTrackingInProgress());
-  return SetAccumulator(reducer_.BuildInlinedAllocation(
-      reducer_.CreateJSObject(map), AllocationType::kYoung));
+  return SetAccumulator(
+      reducer_.BuildInlinedAllocation(reducer_.CreateJSObject(map)));
 }
 
 ReduceResult MaglevGraphBuilder::VisitCloneObject() {
@@ -14474,8 +14324,7 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildInlinedAllocatedContext(
   VirtualObject* context = reducer_.CreateContext(map, context_length, scope,
                                                   GetContext(), extension);
   InlinedAllocation* allocation;
-  GET_VALUE_OR_ABORT(allocation, reducer_.BuildInlinedAllocation(
-                                     context, AllocationType::kYoung));
+  GET_VALUE_OR_ABORT(allocation, reducer_.BuildInlinedAllocation(context));
   reducer_.RecordTypeNoAbort(allocation, NodeType::kContext);
   return allocation;
 }
@@ -15287,6 +15136,9 @@ MaglevGraphBuilder::BranchResult MaglevGraphBuilder::BuildBranchIfToBooleanTrue(
   bool known_to_boolean_value = false;
   bool direction_is_true = true;
   if (IsConstantNode(node->opcode())) {
+    if (node->IsAnyHoleConstant()) {
+      return builder.BuildAbort(AbortReason::kUnreachable);
+    }
     known_to_boolean_value = true;
     direction_is_true = FromConstantToBool(local_isolate(), node);
   } else {
@@ -15294,7 +15146,7 @@ MaglevGraphBuilder::BranchResult MaglevGraphBuilder::BuildBranchIfToBooleanTrue(
     // JSReceivers are true iff they are not marked as undetectable. Check if
     // all maps have the same detectability, and if yes, the boolean value is
     // known.
-    if (NodeInfo* node_info = known_node_aspects().TryGetInfoFor(node)) {
+    if (const NodeInfo* node_info = known_node_aspects().TryGetInfoFor(node)) {
       if (node_info->type() == NodeType::kNone) {
         // `node` is dead, it doesn't matter what we return.
         // TODO(428667907): Ideally we would BuildAbort here.
@@ -15354,7 +15206,7 @@ MaglevGraphBuilder::BranchResult MaglevGraphBuilder::BuildBranchIfToBooleanTrue(
       UNREACHABLE();
   }
 
-  NodeInfo* node_info = known_node_aspects().TryGetInfoFor(node);
+  const NodeInfo* node_info = known_node_aspects().TryGetInfoFor(node);
   if (node_info) {
     if (ValueNode* as_int32 = node_info->alternative().int32()) {
       return reducer_.BuildBranchIfInt32ToBooleanTrue(builder, as_int32);
@@ -15391,13 +15243,11 @@ MaglevGraphBuilder::BranchResult MaglevGraphBuilder::BuildBranchIfToBooleanTrue(
 
 ReduceResult MaglevGraphBuilder::VisitJumpIfToBooleanTrue() {
   auto branch_builder = CreateBranchBuilder(BranchType::kBranchIfTrue);
-  BuildBranchIfToBooleanTrue(branch_builder, GetAccumulator());
-  return ReduceResult::Done();
+  return BuildBranchIfToBooleanTrue(branch_builder, GetAccumulator());
 }
 ReduceResult MaglevGraphBuilder::VisitJumpIfToBooleanFalse() {
   auto branch_builder = CreateBranchBuilder(BranchType::kBranchIfFalse);
-  BuildBranchIfToBooleanTrue(branch_builder, GetAccumulator());
-  return ReduceResult::Done();
+  return BuildBranchIfToBooleanTrue(branch_builder, GetAccumulator());
 }
 ReduceResult MaglevGraphBuilder::VisitJumpIfTrue() {
   auto branch_builder = CreateBranchBuilder(BranchType::kBranchIfTrue);
@@ -15757,20 +15607,22 @@ ReduceResult MaglevGraphBuilder::VisitThrowReferenceErrorIfTdzHole() {
       // TODO(verwaest): Look into making loaded_context_constants_ monotonic,
       // e.g. by folding the hole check into the context load rather than
       // temporarily clearing the cached constant here.
-      ValueNode** cached_slot = nullptr;
+      LoadContextSlotNoCells* cached_load = nullptr;
       if (auto* load = value->TryCast<LoadContextSlotNoCells>();
           load && load->maybe_assigned() == kNotAssigned) {
         ValueNode*& slot = known_node_aspects().GetContextCachedValue(
             load->input(0).node(), load->offset(), kNotAssigned);
         if (slot == value) {
-          cached_slot = &slot;
-          *cached_slot = nullptr;
+          cached_load = load;
+          slot = nullptr;
         }
       }
       ReduceResult res =
           AddNewNode<ThrowReferenceErrorIfTdzHole>({value}, name);
-      if (cached_slot) {
-        *cached_slot = value;
+      if (cached_load) {
+        known_node_aspects().GetContextCachedValue(
+            cached_load->input(0).node(), cached_load->offset(), kNotAssigned) =
+            value;
       }
       return res;
     }
@@ -16282,113 +16134,111 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceArrayIteratorForOfNext(
             MaglevSubGraphBuilder::Variable ret_value(0);
             MaglevSubGraphBuilder::Variable loaded_element(1);
 
-            MaglevSubGraphBuilder::Label done(&subgraph, 2, {&ret_value});
-            MaglevSubGraphBuilder::Label out_of_bounds(&subgraph, 1);
+            RETURN_IF_ABORT(subgraph.WithFallback(
+                {&ret_value},
+                [&](MaglevSubGraphBuilder::Label* out_of_bounds)
+                    -> ReduceResult {
+                  // Branch: index < length. The index is coming from the array
+                  // iterator object, so we can be sure it's not negative.
+                  RETURN_IF_ABORT(subgraph.GotoIfFalse<BranchIfInt32Compare>(
+                      out_of_bounds, {int32_index, int32_length},
+                      Operation::kLessThan));
 
-            // Branch: index < length. The index is coming from the array
-            // iterator object, so we can be sure it's not negative.
-            MaybeReduceResult branch_res =
-                subgraph.GotoIfFalse<BranchIfInt32Compare>(
-                    &out_of_bounds, {int32_index, int32_length},
-                    Operation::kLessThan);
-            DCHECK(branch_res.IsDone());
-            USE(branch_res);
+                  // In-bounds branch:
+                  ValueNode* elem = nullptr;
+                  if (double_maps.empty()) {
+                    // Only tagged maps (already checked via global
+                    // BuildCheckMaps)
+                    GET_VALUE_OR_ABORT(
+                        elem, BuildElementLoadOnJSArrayOrJSObject(
+                                  iterated_object, int32_index,
+                                  base::VectorOf(tagged_maps), *tagged_kind,
+                                  KeyedAccessLoadMode::kHandleHoles));
+                  } else if (tagged_maps.empty()) {
+                    // Only double maps (already checked via global
+                    // BuildCheckMaps)
+                    GET_VALUE_OR_ABORT(
+                        elem, BuildElementLoadOnJSArrayOrJSObject(
+                                  iterated_object, int32_index,
+                                  base::VectorOf(double_maps), *double_kind,
+                                  KeyedAccessLoadMode::kHandleHoles));
+                  } else {
+                    // Both tagged and double maps (already checked via global
+                    // BuildCheckMaps)
+                    ValueNode* iterated_object_map;
+                    GET_VALUE_OR_ABORT(iterated_object_map,
+                                       BuildLoadMap(iterated_object));
 
-            // In-bounds branch:
-            ReduceResult load_result = ReduceResult::DoneWithAbort();
+                    RETURN_IF_ABORT(subgraph.WithFallback(
+                        {&loaded_element},
+                        [&](MaglevSubGraphBuilder::Label* double_branch)
+                            -> ReduceResult {
+                          for (compiler::MapRef map : double_maps) {
+                            RETURN_IF_ABORT(
+                                subgraph.GotoIfTrue<BranchIfReferenceEqual>(
+                                    double_branch,
+                                    {iterated_object_map, GetConstant(map)}));
+                          }
 
-            if (double_maps.empty()) {
-              // Only tagged maps (already checked via global BuildCheckMaps)
-              load_result = BuildElementLoadOnJSArrayOrJSObject(
-                  iterated_object, int32_index, base::VectorOf(tagged_maps),
-                  *tagged_kind, KeyedAccessLoadMode::kHandleHoles);
-            } else if (tagged_maps.empty()) {
-              // Only double maps (already checked via global BuildCheckMaps)
-              load_result = BuildElementLoadOnJSArrayOrJSObject(
-                  iterated_object, int32_index, base::VectorOf(double_maps),
-                  *double_kind, KeyedAccessLoadMode::kHandleHoles);
-            } else {
-              // Both tagged and double maps (already checked via global
-              // BuildCheckMaps)
-              MaglevSubGraphBuilder::Label double_branch(
-                  &subgraph, static_cast<int>(double_maps.size()));
-              MaglevSubGraphBuilder::Label done_loading(&subgraph, 2,
-                                                        {&loaded_element});
+                          // Tagged path (fallthrough)
+                          // Since it didn't match double_maps, and it must be
+                          // one of named_feedback.maps(), it is guaranteed to
+                          // be one of tagged_maps.
+                          // TODO(marja): BuildElementLoadOnJSArrayOrJSObject
+                          // does another bounds check -> refactor that out.
+                          ValueNode* tagged_elem;
+                          GET_VALUE_OR_ABORT(
+                              tagged_elem,
+                              BuildElementLoadOnJSArrayOrJSObject(
+                                  iterated_object, int32_index,
+                                  base::VectorOf(tagged_maps), *tagged_kind,
+                                  KeyedAccessLoadMode::kHandleHoles));
+                          subgraph.set(loaded_element, tagged_elem);
+                          return ReduceResult::Done();
+                        },
+                        [&]() -> ReduceResult {
+                          // Double path
+                          // TODO(marja): BuildElementLoadOnJSArrayOrJSObject
+                          // does another bounds check -> refactor that out.
+                          ValueNode* double_elem;
+                          GET_VALUE_OR_ABORT(
+                              double_elem,
+                              BuildElementLoadOnJSArrayOrJSObject(
+                                  iterated_object, int32_index,
+                                  base::VectorOf(double_maps), *double_kind,
+                                  KeyedAccessLoadMode::kHandleHoles));
+                          subgraph.set(loaded_element, double_elem);
+                          return ReduceResult::Done();
+                        },
+                        static_cast<int>(double_maps.size())));
+                    elem = subgraph.get(loaded_element);
+                  }
 
-              ValueNode* iterated_object_map;
-              GET_VALUE_OR_ABORT(iterated_object_map,
-                                 BuildLoadMap(iterated_object));
+                  subgraph.set(ret_value, elem);
 
-              for (compiler::MapRef map : double_maps) {
-                RETURN_IF_ABORT(subgraph.GotoIfTrue<BranchIfReferenceEqual>(
-                    &double_branch, {iterated_object_map, GetConstant(map)}));
-              }
+                  // Add 1 to index (cannot overflow since the max JSArray
+                  // length is below the Smi limit).
+                  ValueNode* next_index;
+                  GET_VALUE_OR_ABORT(
+                      next_index,
+                      AddNewNode<Int32Add>({int32_index, GetInt32Constant(1)}));
+                  RETURN_IF_ABORT(
+                      reducer_.RecordType(next_index, NodeType::kSmi));
 
-              // Tagged path (fallthrough)
-              // Since it didn't match double_maps, and it must be one of
-              // named_feedback.maps(), it is guaranteed to be one of
-              // tagged_maps.
-
-              // TODO(marja): BuildElementLoadOnJSArrayOrJSObject does another
-              // bounds check -> refactor that out.
-              ReduceResult tagged_load_result =
-                  BuildElementLoadOnJSArrayOrJSObject(
-                      iterated_object, int32_index, base::VectorOf(tagged_maps),
-                      *tagged_kind, KeyedAccessLoadMode::kHandleHoles);
-              if (!tagged_load_result.IsDoneWithAbort()) {
-                subgraph.set(loaded_element, tagged_load_result.value());
-                subgraph.Goto(&done_loading);
-              }
-
-              // Double path
-              subgraph.Bind(&double_branch);
-              // TODO(marja): BuildElementLoadOnJSArrayOrJSObject does another
-              // bounds check -> refactor that out.
-              ReduceResult double_load_result =
-                  BuildElementLoadOnJSArrayOrJSObject(
-                      iterated_object, int32_index, base::VectorOf(double_maps),
-                      *double_kind, KeyedAccessLoadMode::kHandleHoles);
-              if (!double_load_result.IsDoneWithAbort()) {
-                subgraph.set(loaded_element, double_load_result.value());
-                subgraph.Goto(&done_loading);
-              }
-
-              // Get the loaded element
-              ReduceResult bind_res =
-                  subgraph.TrimPredecessorsAndBind(&done_loading);
-              if (!bind_res.IsDoneWithAbort()) {
-                load_result = ReduceResult::Done(subgraph.get(loaded_element));
-              }
-            }
-
-            if (load_result.HasValue()) {
-              subgraph.set(ret_value, load_result.value());
-
-              // Add 1 to index (cannot overflow since the max JSArray length is
-              // below the Smi limit).
-              ValueNode* next_index;
-              ReduceResult add_result =
-                  AddNewNode<Int32Add>({int32_index, GetInt32Constant(1)});
-              CHECK(add_result.IsDone());
-              next_index = add_result.value();
-              RETURN_IF_ABORT(reducer_.RecordType(next_index, NodeType::kSmi));
-
-              // Update [[NextIndex]] (store cannot abort).
-              ReduceResult store_result = BuildStoreTaggedFieldNoWriteBarrier(
-                  iterator, next_index, offsetof(JSArrayIterator, next_index_),
-                  StoreTaggedMode::kDefault);
-              CHECK(store_result.IsDone());
-
-              subgraph.Goto(&done);
-            }
-
-            // Out-of-bounds branch:
-            subgraph.Bind(&out_of_bounds);
-            subgraph.set(ret_value, GetRootConstant(RootIndex::kTheHoleValue));
-
-            subgraph.Goto(&done);
-
-            RETURN_IF_ABORT(subgraph.TrimPredecessorsAndBind(&done));
+                  // Update [[NextIndex]] (store cannot abort).
+                  CHECK(BuildStoreTaggedFieldNoWriteBarrier(
+                            iterator, next_index,
+                            offsetof(JSArrayIterator, next_index_),
+                            StoreTaggedMode::kDefault)
+                            .IsDoneWithoutAbort());
+                  return ReduceResult::Done();
+                },
+                [&]() -> ReduceResult {
+                  // Out-of-bounds branch:
+                  subgraph.set(ret_value,
+                               GetRootConstant(RootIndex::kTheHoleValue));
+                  return ReduceResult::Done();
+                }));
             return subgraph.get(ret_value);
           },
           [&]() -> ReduceResult {
@@ -17045,7 +16895,7 @@ void MaglevGraphBuilder::ProcessMergePoint(int offset,
       iterator_.current_bytecode() == interpreter::Bytecode::kResumeGenerator,
       merge_state.context_scope_info() == GetCurrentScopeInfo());
   current_interpreter_frame_.CopyFrom(*compilation_unit_, merge_state,
-                                      preserve_known_node_aspects, zone());
+                                      preserve_known_node_aspects);
   SetCurrentScopeInfo(merge_state.context_scope_info());
 
   ProcessMergePointPredecessors(merge_state, jump_targets_[offset]);
@@ -17084,6 +16934,7 @@ void MaglevGraphBuilder::ProcessMergePointPredecessors(
   }
   BasicBlockRef* old_jump_targets = jump_targets.Reset();
   while (old_jump_targets != nullptr) {
+    SBXCHECK_GE(predecessor_index, 0);
     BasicBlock* predecessor = merge_state.predecessor_at(predecessor_index);
     CHECK(predecessor);
     ControlNode* control = predecessor->control_node();
@@ -17119,7 +16970,6 @@ void MaglevGraphBuilder::RegisterPhisWithGraphLabeller(
 void MaglevGraphBuilder::OnAbruptBlockEnd(BasicBlock* block) {
   unobserved_context_slot_stores_.clear();
   reducer_.ClearCurrentAllocationBlock();
-  current_interpreter_frame_.virtual_objects().Snapshot();
   graph()->Add(block);
 }
 
@@ -17739,7 +17589,6 @@ std::optional<BasicBlock*> MaglevGraphBuilder::FinishBlock(
 
   // TODO(olivf): Support allocation folding across control flow.
   reducer_.ClearCurrentAllocationBlock();
-  current_interpreter_frame_.virtual_objects().Snapshot();
 
   BasicBlock* block = current_block();
   reducer_.FlushNodesToBlock();
@@ -17928,6 +17777,17 @@ int MaglevGraphBuilder::GetLoopDepth() const {
 ReduceResult MaglevGraphBuilder::BuildSmiUntag(ValueNode* node) {
   return reducer_.BuildSmiUntag(node);
 }
+
+VirtualObject* MaglevGraphBuilder::CreateJSObject(compiler::MapRef map) {
+  return reducer_.CreateJSObject(map);
+}
+
+ReduceResult MaglevGraphBuilder::BuildInlinedAllocation(
+    VirtualObject* object, AllocationType allocation_type) {
+  return reducer_.BuildInlinedAllocation(object, allocation_type);
+}
+
+void MaglevGraphBuilder::FlushNodesToBlock() { reducer_.FlushNodesToBlock(); }
 
 #undef TRACE
 #undef MAGLEV_FAIL

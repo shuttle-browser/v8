@@ -123,6 +123,7 @@ class Stack;
 }  // namespace regexp
 
 class AddressToIndexHashMap;
+class AllocationSiteCache;
 class AstStringConstants;
 class Bootstrapper;
 class BuiltinsConstantsTableBuilder;
@@ -158,7 +159,6 @@ class PersistentHandlesList;
 class ReadOnlyArtifacts;
 class RootVisitor;
 class SetupIsolateDelegate;
-class SharedStructTypeRegistry;
 class Simulator;
 class SnapshotData;
 class StackFrame;
@@ -586,7 +586,7 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   // and reused on subsequent entries.
   class PerIsolateThreadData {
    public:
-    PerIsolateThreadData(Isolate* isolate, ThreadId thread_id)
+    PerIsolateThreadData(Isolate* isolate, base::ThreadId thread_id)
         : isolate_(isolate),
           thread_id_(thread_id),
           stack_limit_(0),
@@ -601,7 +601,7 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
     PerIsolateThreadData(const PerIsolateThreadData&) = delete;
     PerIsolateThreadData& operator=(const PerIsolateThreadData&) = delete;
     Isolate* isolate() const { return isolate_; }
-    ThreadId thread_id() const { return thread_id_; }
+    base::ThreadId thread_id() const { return thread_id_; }
 
     FIELD_ACCESSOR(uintptr_t, stack_limit)
     FIELD_ACCESSOR(ThreadState*, thread_state)
@@ -609,13 +609,13 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
     FIELD_ACCESSOR(Simulator*, simulator)
 #endif
 
-    bool Matches(Isolate* isolate, ThreadId thread_id) const {
+    bool Matches(Isolate* isolate, base::ThreadId thread_id) const {
       return isolate_ == isolate && thread_id_ == thread_id;
     }
 
    private:
     Isolate* isolate_;
-    ThreadId thread_id_;
+    base::ThreadId thread_id_;
     uintptr_t stack_limit_;
     ThreadState* thread_state_;
 
@@ -720,7 +720,7 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
 
   // Find the PerThread for given (isolate, thread) combination
   // If one does not yet exist, return null.
-  PerIsolateThreadData* FindPerThreadDataForThread(ThreadId thread_id);
+  PerIsolateThreadData* FindPerThreadDataForThread(base::ThreadId thread_id);
 
   // Discard the PerThread for this particular (isolate, thread) combination
   // If one does not yet exist, no-op.
@@ -788,12 +788,6 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
                : shared_space_isolate()->string_forwarding_table_.get();
   }
 
-  SharedStructTypeRegistry* shared_struct_type_registry() const {
-    return is_shared_space_isolate()
-               ? shared_struct_type_registry_.get()
-               : shared_space_isolate()->shared_struct_type_registry_.get();
-  }
-
   // Access to top context (where the current function object was created).
   Tagged<Context> context() const { return thread_local_top()->context_; }
   inline void set_context(Tagged<Context> context);
@@ -826,10 +820,10 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   }
 
   // Access to current thread id.
-  inline void set_thread_id(ThreadId id) {
+  inline void set_thread_id(base::ThreadId id) {
     thread_local_top()->thread_id_.store(id, std::memory_order_relaxed);
   }
-  inline ThreadId thread_id() const {
+  inline base::ThreadId thread_id() const {
     return thread_local_top()->thread_id_.load(std::memory_order_relaxed);
   }
 
@@ -1139,11 +1133,33 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   Tagged<Object> StackOverflow();
   Tagged<Object> TerminateExecution();
   void CancelTerminateExecution();
+  V8_WARN_UNUSED_RESULT bool CheckTerminationAfterCallback();
 
   void RequestInterrupt(InterruptCallback callback, void* data);
   void InvokeApiInterruptCallbacks();
 
   bool is_executing_api_interrupt() const { return api_interrupt_depth_ > 0; }
+
+  class V8_NODISCARD PauseApiInterruptScopeForTesting final {
+   public:
+    explicit PauseApiInterruptScopeForTesting(Isolate* isolate)
+        : isolate_(isolate), saved_depth_(isolate->api_interrupt_depth_) {
+      DCHECK_LT(0, saved_depth_);
+      isolate_->api_interrupt_depth_ = 0;
+    }
+    ~PauseApiInterruptScopeForTesting() {
+      DCHECK_EQ(0, isolate_->api_interrupt_depth_);
+      isolate_->api_interrupt_depth_ = saved_depth_;
+    }
+    PauseApiInterruptScopeForTesting(const PauseApiInterruptScopeForTesting&) =
+        delete;
+    PauseApiInterruptScopeForTesting& operator=(
+        const PauseApiInterruptScopeForTesting&) = delete;
+
+   private:
+    Isolate* const isolate_;
+    const int saved_depth_;
+  };
 
   void RequestInvalidateNoProfilingProtector();
 
@@ -1367,6 +1383,7 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   StubCache* load_stub_cache() const { return load_stub_cache_; }
   StubCache* store_stub_cache() const { return store_stub_cache_; }
   StubCache* define_own_stub_cache() const { return define_own_stub_cache_; }
+  StubCache* has_stub_cache() const { return has_stub_cache_; }
   Deoptimizer* GetAndClearCurrentDeoptimizer() {
     Deoptimizer* result = current_deoptimizer_;
     CHECK_NOT_NULL(result);
@@ -1400,6 +1417,10 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
 
   DescriptorLookupCache* descriptor_lookup_cache() const {
     return descriptor_lookup_cache_;
+  }
+
+  AllocationSiteCache* allocation_site_cache() const {
+    return isolate_data_.allocation_site_cache();
   }
 
   V8_INLINE HandleScopeData* handle_scope_data() {
@@ -1606,6 +1627,10 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
     return code_coverage_mode() == debug::CoverageMode::kBestEffort;
   }
 
+  bool requires_bytecode_for_code_coverage() const {
+    return !is_best_effort_code_coverage();
+  }
+
   bool is_precise_count_code_coverage() const {
     return code_coverage_mode() == debug::CoverageMode::kPreciseCount;
   }
@@ -1684,8 +1709,10 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
       kDefaultSimpleDateFormatForTime, kDefaultSimpleDateFormatForDate};
   static constexpr int kICUObjectCacheTypeCount = 5;
 
-  icu::UMemory* get_cached_icu_object(ICUObjectCacheType cache_type,
-                                      DirectHandle<Object> locales);
+  // Returns a shared_ptr, not a raw pointer, so that the object stays alive
+  // while the caller uses it, even if the cache entry is replaced.
+  std::shared_ptr<icu::UMemory> get_cached_icu_object(
+      ICUObjectCacheType cache_type, DirectHandle<Object> locales);
   void set_icu_object_in_cache(ICUObjectCacheType cache_type,
                                DirectHandle<Object> locales,
                                std::shared_ptr<icu::UMemory> obj);
@@ -2092,18 +2119,13 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
       DirectHandle<JSArray> sites);
   bool HasPrepareStackTraceCallback() const;
 
-  void SetAddCrashKeyCallback(AddCrashKeyCallback callback);
-  void AddCrashKey(CrashKeyId id, const std::string& value) {
-    if (add_crash_key_callback_) {
-      add_crash_key_callback_(id, value);
-    }
-  }
-
   v8::CrashKey AllocateCrashKeyString(const char key[], CrashKeySize size);
   v8::CrashKey AddCrashKeyString(const char key[], CrashKeySize size,
                                  std::string_view value);
   void SetCrashKeyString(CrashKey crash_key, std::string_view value);
 
+  // Deprecated - to be deleted once embedders migrate to
+  // v8::V8::SetCrashKeyCallbacks.
   void SetCrashKeyStringCallbacks(
       AllocateCrashKeyStringCallback allocate_callback,
       SetCrashKeyStringCallback set_callback);
@@ -2537,19 +2559,19 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
    public:
     ThreadDataTable() = default;
 
-    PerIsolateThreadData* Lookup(ThreadId thread_id);
+    PerIsolateThreadData* Lookup(base::ThreadId thread_id);
     void Insert(PerIsolateThreadData* data);
     void Remove(PerIsolateThreadData* data);
     void RemoveAllThreads();
 
    private:
     struct Hasher {
-      std::size_t operator()(const ThreadId& t) const {
+      std::size_t operator()(const base::ThreadId& t) const {
         return std::hash<int>()(t.ToInteger());
       }
     };
 
-    std::unordered_map<ThreadId, PerIsolateThreadData*, Hasher> table_;
+    std::unordered_map<base::ThreadId, PerIsolateThreadData*, Hasher> table_;
   };
 
   // These items form a stack synchronously with threads Enter'ing and Exit'ing
@@ -2649,6 +2671,7 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   StubCache* load_stub_cache_ = nullptr;
   StubCache* store_stub_cache_ = nullptr;
   StubCache* define_own_stub_cache_ = nullptr;
+  StubCache* has_stub_cache_ = nullptr;
   Deoptimizer* current_deoptimizer_ = nullptr;
   bool deoptimizer_lazy_throw_ = false;
   MaterializedObjectStore* materialized_object_store_ = nullptr;
@@ -2948,11 +2971,6 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   // Stores the isolate containing the shared space.
   std::optional<Isolate*> shared_space_isolate_;
 
-  // Used to deduplicate registered SharedStructType shapes.
-  //
-  // This is guaranteed empty when !is_shared_space_isolate().
-  std::unique_ptr<SharedStructTypeRegistry> shared_struct_type_registry_;
-
 #ifdef V8_COMPRESS_POINTERS
   // Stores the external pointer table space for the shared external pointer
   // table.
@@ -2991,11 +3009,6 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   wasm::StackPool stack_pool_;
 #endif  // V8_ENABLE_WEBASSEMBLY
 
-  // Enables the host application to provide a mechanism for recording a
-  // predefined set of data as crash keys to be used in postmortem debugging
-  // in case of a crash.
-  AddCrashKeyCallback add_crash_key_callback_ = nullptr;
-
   AllocateCrashKeyStringCallback allocate_crash_key_string_callback_;
   SetCrashKeyStringCallback set_crash_key_string_callback_;
 
@@ -3017,7 +3030,7 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
 #endif
 
 #ifdef V8_ENABLE_CHECKS
-  ThreadId current_thread_id_;
+  base::ThreadId current_thread_id_ = base::ThreadId::Invalid();
   int current_thread_counter_ = 0;
 #endif
 
@@ -3211,7 +3224,7 @@ class V8_NODISCARD MutexGuardIfOffThread<Isolate> final {
   MutexGuardIfOffThread(base::Mutex* mutex, Isolate* isolate) {
     DCHECK_NOT_NULL(mutex);
     DCHECK_NOT_NULL(isolate);
-    DCHECK_EQ(ThreadId::Current(), isolate->thread_id());
+    DCHECK_EQ(base::ThreadId::Current(), isolate->thread_id());
   }
 
   MutexGuardIfOffThread(const MutexGuardIfOffThread&) = delete;

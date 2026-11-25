@@ -17,7 +17,6 @@
 #include "src/heap/marking-state-inl.h"
 #include "src/heap/marking-worklist-inl.h"
 #include "src/heap/marking.h"
-#include "src/heap/pretenuring-handler-inl.h"
 #include "src/heap/spaces.h"
 #include "src/objects/casting.h"
 #include "src/objects/compressed-slots.h"
@@ -237,9 +236,6 @@ void MarkingVisitorBase<ConcreteVisitor>::VisitExternalPointer(
     Tagged<HeapObject> host, ExternalPointerSlot slot) {
 #ifdef V8_COMPRESS_POINTERS
   DCHECK(!slot.tag_range().IsEmpty());
-  if (!slot.HasExternalPointerHandle()) {
-    return;
-  }
   const ExternalPointerHandle handle = slot.Relaxed_LoadHandle();
   ExternalPointerTable* table;
   ExternalPointerTable::Space* space;

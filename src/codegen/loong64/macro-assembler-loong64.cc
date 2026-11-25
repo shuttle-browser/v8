@@ -401,7 +401,7 @@ void MacroAssembler::LoadExternalPointerField(Register destination,
                                               Register isolate_root) {
   DCHECK(!AreAliased(destination, isolate_root));
   ASM_CODE_COMMENT(this);
-#ifdef V8_ENABLE_SANDBOX
+#ifdef V8_COMPRESS_POINTERS
   DCHECK(!tag_range.IsEmpty());
   DCHECK(!IsSharedExternalPointerType(tag_range));
   UseScratchRegisterScope temps(this);
@@ -447,7 +447,7 @@ void MacroAssembler::LoadExternalPointerField(Register destination,
   }
 #else
   Ld_d(destination, field_operand);
-#endif  // V8_ENABLE_SANDBOX
+#endif  // V8_COMPRESS_POINTERS
 }
 
 void MacroAssembler::LoadTrustedPointerField(Register destination,
@@ -626,6 +626,7 @@ void MacroAssembler::PushDispatchHandle(Register dispatch_handle,
   DCHECK(!AreAliased(dispatch_handle, scratch1, scratch2));
 #ifdef V8_ENABLE_SANDBOX
   AssertZeroExtended(dispatch_handle);
+  bstrins_d(dispatch_handle, zero_reg, kJSDispatchHandleShift - 1, 0);
   LoadParameterCountFromJSDispatchTable(scratch1, dispatch_handle, scratch2);
   bstrins_d(dispatch_handle, scratch1, 63, 32);
 #endif
@@ -1486,7 +1487,7 @@ void MacroAssembler::Ld_b(Register rd, const MemOperand& rj, int* trap_pc) {
   AdjustBaseAndOffset(&source);
   if (trap_pc != NULL) *trap_pc = pc_offset();
   if (source.hasIndexReg()) {
-    ldx_b(rd, source.base(), source.index());
+    ldx_b(rd, source.index(), source.base());
   } else {
     ld_b(rd, source.base(), source.offset());
   }
@@ -1497,7 +1498,7 @@ void MacroAssembler::Ld_bu(Register rd, const MemOperand& rj, int* trap_pc) {
   AdjustBaseAndOffset(&source);
   if (trap_pc != NULL) *trap_pc = pc_offset();
   if (source.hasIndexReg()) {
-    ldx_bu(rd, source.base(), source.index());
+    ldx_bu(rd, source.index(), source.base());
   } else {
     ld_bu(rd, source.base(), source.offset());
   }
@@ -1508,7 +1509,7 @@ void MacroAssembler::St_b(Register rd, const MemOperand& rj, int* trap_pc) {
   AdjustBaseAndOffset(&source);
   if (trap_pc != NULL) *trap_pc = pc_offset();
   if (source.hasIndexReg()) {
-    stx_b(rd, source.base(), source.index());
+    stx_b(rd, source.index(), source.base());
   } else {
     st_b(rd, source.base(), source.offset());
   }
@@ -1519,7 +1520,7 @@ void MacroAssembler::Ld_h(Register rd, const MemOperand& rj, int* trap_pc) {
   AdjustBaseAndOffset(&source);
   if (trap_pc != NULL) *trap_pc = pc_offset();
   if (source.hasIndexReg()) {
-    ldx_h(rd, source.base(), source.index());
+    ldx_h(rd, source.index(), source.base());
   } else {
     ld_h(rd, source.base(), source.offset());
   }
@@ -1530,7 +1531,7 @@ void MacroAssembler::Ld_hu(Register rd, const MemOperand& rj, int* trap_pc) {
   AdjustBaseAndOffset(&source);
   if (trap_pc != NULL) *trap_pc = pc_offset();
   if (source.hasIndexReg()) {
-    ldx_hu(rd, source.base(), source.index());
+    ldx_hu(rd, source.index(), source.base());
   } else {
     ld_hu(rd, source.base(), source.offset());
   }
@@ -1541,7 +1542,7 @@ void MacroAssembler::St_h(Register rd, const MemOperand& rj, int* trap_pc) {
   AdjustBaseAndOffset(&source);
   if (trap_pc != NULL) *trap_pc = pc_offset();
   if (source.hasIndexReg()) {
-    stx_h(rd, source.base(), source.index());
+    stx_h(rd, source.index(), source.base());
   } else {
     st_h(rd, source.base(), source.offset());
   }
@@ -1560,7 +1561,7 @@ void MacroAssembler::Ld_w(Register rd, const MemOperand& rj, int* trap_pc) {
   AdjustBaseAndOffset(&source);
   if (trap_pc != NULL) *trap_pc = pc_offset();
   if (source.hasIndexReg()) {
-    ldx_w(rd, source.base(), source.index());
+    ldx_w(rd, source.index(), source.base());
   } else {
     ld_w(rd, source.base(), source.offset());
   }
@@ -1572,7 +1573,7 @@ void MacroAssembler::Ld_wu(Register rd, const MemOperand& rj, int* trap_pc) {
 
   if (trap_pc != NULL) *trap_pc = pc_offset();
   if (source.hasIndexReg()) {
-    ldx_wu(rd, source.base(), source.index());
+    ldx_wu(rd, source.index(), source.base());
   } else {
     ld_wu(rd, source.base(), source.offset());
   }
@@ -1591,7 +1592,7 @@ void MacroAssembler::St_w(Register rd, const MemOperand& rj, int* trap_pc) {
   AdjustBaseAndOffset(&source);
   if (trap_pc != NULL) *trap_pc = pc_offset();
   if (source.hasIndexReg()) {
-    stx_w(rd, source.base(), source.index());
+    stx_w(rd, source.index(), source.base());
   } else {
     st_w(rd, source.base(), source.offset());
   }
@@ -1610,7 +1611,7 @@ void MacroAssembler::Ld_d(Register rd, const MemOperand& rj, int* trap_pc) {
   AdjustBaseAndOffset(&source);
   if (trap_pc != NULL) *trap_pc = pc_offset();
   if (source.hasIndexReg()) {
-    ldx_d(rd, source.base(), source.index());
+    ldx_d(rd, source.index(), source.base());
   } else {
     ld_d(rd, source.base(), source.offset());
   }
@@ -1629,7 +1630,7 @@ void MacroAssembler::St_d(Register rd, const MemOperand& rj, int* trap_pc) {
   AdjustBaseAndOffset(&source);
   if (trap_pc != NULL) *trap_pc = pc_offset();
   if (source.hasIndexReg()) {
-    stx_d(rd, source.base(), source.index());
+    stx_d(rd, source.index(), source.base());
   } else {
     st_d(rd, source.base(), source.offset());
   }
@@ -1641,7 +1642,7 @@ void MacroAssembler::Fld_s(FPURegister fd, const MemOperand& src,
   AdjustBaseAndOffset(&tmp);
   if (trap_pc != NULL) *trap_pc = pc_offset();
   if (tmp.hasIndexReg()) {
-    fldx_s(fd, tmp.base(), tmp.index());
+    fldx_s(fd, tmp.index(), tmp.base());
   } else {
     fld_s(fd, tmp.base(), tmp.offset());
   }
@@ -1653,7 +1654,7 @@ void MacroAssembler::Fst_s(FPURegister fs, const MemOperand& src,
   AdjustBaseAndOffset(&tmp);
   if (trap_pc != NULL) *trap_pc = pc_offset();
   if (tmp.hasIndexReg()) {
-    fstx_s(fs, tmp.base(), tmp.index());
+    fstx_s(fs, tmp.index(), tmp.base());
   } else {
     fst_s(fs, tmp.base(), tmp.offset());
   }
@@ -1665,7 +1666,7 @@ void MacroAssembler::Fld_d(FPURegister fd, const MemOperand& src,
   AdjustBaseAndOffset(&tmp);
   if (trap_pc != NULL) *trap_pc = pc_offset();
   if (tmp.hasIndexReg()) {
-    fldx_d(fd, tmp.base(), tmp.index());
+    fldx_d(fd, tmp.index(), tmp.base());
   } else {
     fld_d(fd, tmp.base(), tmp.offset());
   }
@@ -1677,7 +1678,7 @@ void MacroAssembler::Fst_d(FPURegister fs, const MemOperand& src,
   AdjustBaseAndOffset(&tmp);
   if (trap_pc != NULL) *trap_pc = pc_offset();
   if (tmp.hasIndexReg()) {
-    fstx_d(fs, tmp.base(), tmp.index());
+    fstx_d(fs, tmp.index(), tmp.base());
   } else {
     fst_d(fs, tmp.base(), tmp.offset());
   }
@@ -1752,7 +1753,7 @@ void MacroAssembler::Vst(VRegister vd, const MemOperand& vj, int* trap_pc) {
   AdjustBaseAndOffset(&source);
   if (trap_pc != NULL) *trap_pc = pc_offset();
   if (source.hasIndexReg()) {
-    vstx(vd, source.base(), source.index());
+    vstx(vd, source.index(), source.base());
   } else {
     vst(vd, source.base(), source.offset());
   }
@@ -1763,7 +1764,7 @@ void MacroAssembler::Vld(VRegister vd, const MemOperand& vj, int* trap_pc) {
   AdjustBaseAndOffset(&source);
   if (trap_pc != NULL) *trap_pc = pc_offset();
   if (source.hasIndexReg()) {
-    vldx(vd, source.base(), source.index());
+    vldx(vd, source.index(), source.base());
   } else {
     vld(vd, source.base(), source.offset());
   }
@@ -3117,9 +3118,18 @@ void MacroAssembler::Ctz_w(Register rd, Register rj) { ctz_w(rd, rj); }
 
 void MacroAssembler::Ctz_d(Register rd, Register rj) { ctz_d(rd, rj); }
 
-// TODO(LOONG_dev): Optimize like arm64, use simd instruction
 void MacroAssembler::Popcnt_w(Register rd, Register rj) {
   ASM_CODE_COMMENT(this);
+
+  if (CpuFeatures::SupportsSimd128()) {
+    UseScratchRegisterScope temps(this);
+    DoubleRegister scratch = temps.AcquireFp();
+    vreplgr2vr_w(scratch.toV(), rj);
+    vpcnt_w(scratch.toV(), scratch.toV());
+    movfr2gr_s(rd, scratch);
+    return;
+  }
+
   // https://graphics.stanford.edu/~seander/bithacks.html#CountBitsSetParallel
   //
   // A generalization of the best bit counting method to integers of
@@ -3164,6 +3174,16 @@ void MacroAssembler::Popcnt_w(Register rd, Register rj) {
 
 void MacroAssembler::Popcnt_d(Register rd, Register rj) {
   ASM_CODE_COMMENT(this);
+
+  if (CpuFeatures::SupportsSimd128()) {
+    UseScratchRegisterScope temps(this);
+    DoubleRegister scratch = temps.AcquireFp();
+    vreplgr2vr_d(scratch.toV(), rj);
+    vpcnt_d(scratch.toV(), scratch.toV());
+    movfr2gr_d(rd, scratch);
+    return;
+  }
+
   int64_t B0 = 0x5555555555555555l;     // (T)~(T)0/3
   int64_t B1 = 0x3333333333333333l;     // (T)~(T)0/15*3
   int64_t B2 = 0x0F0F0F0F0F0F0F0Fl;     // (T)~(T)0/255*15

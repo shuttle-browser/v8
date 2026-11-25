@@ -5,8 +5,8 @@
 #include "src/regexp/regexp.h"
 
 #include "src/base/strings.h"
+#include "src/base/synchronization-point-support.h"
 #include "src/codegen/compilation-cache.h"
-#include "src/common/synchronization-point-support.h"
 #include "src/diagnostics/code-tracer.h"
 #include "src/execution/interrupts-scope.h"
 #include "src/handles/global-handles-inl.h"
@@ -472,9 +472,9 @@ MaybeDirectHandle<Object> RegExp::Compile(Isolate* isolate,
   if (!has_been_compiled) {
     const bool can_be_zero_length = parse_result.tree->min_match() == 0;
     using Bits = IrRegExpData::Bits;
-    const uint32_t bit_field =
-        Bits::CanBeZeroLengthBit::encode(can_be_zero_length) |
-        Bits::IsLinearExecutableBit::encode(is_linear_executable);
+    const auto bit_field = Bits()
+                               .with_can_be_zero_length(can_be_zero_length)
+                               .with_is_linear_executable(is_linear_executable);
     regexp::RegExpImpl::IrregexpInitialize(
         isolate, re, original_source, escaped_source, flags,
         parse_result.capture_count, backtrack_limit, bit_field);

@@ -56,8 +56,11 @@ class V8_EXPORT_PRIVATE MaglevGraphOptimizer {
   KnownNodeAspects& known_node_aspects() {
     return kna_processor_.known_node_aspects();
   }
-  void set_known_node_aspects(KnownNodeAspects* known_node_aspects) {
-    kna_processor_.set_known_node_aspects(known_node_aspects);
+  KnownNodeAspects::Ptr TakeKnownNodeAspects() {
+    return kna_processor_.TakeKnownNodeAspects();
+  }
+  void set_known_node_aspects(KnownNodeAspects::Ptr known_node_aspects) {
+    kna_processor_.set_known_node_aspects(std::move(known_node_aspects));
   }
 
   // GetDeoptFrameForEagerDeopt can only clone an existing eager deopt frame, so
@@ -97,6 +100,12 @@ class V8_EXPORT_PRIVATE MaglevGraphOptimizer {
   ProcessResult ThrowAndTruncate(Throw::Function function,
                                  ValueNode* input = nullptr) {
     ReduceResult result = reducer_.EmitThrow(function, input);
+    CHECK(result.IsDoneWithAbort());
+    return ProcessResult::kTruncateBlock;
+  }
+  ProcessResult AbortAndTruncate(
+      AbortReason reason = AbortReason::kUnreachable) {
+    ReduceResult result = reducer_.BuildAbort(reason);
     CHECK(result.IsDoneWithAbort());
     return ProcessResult::kTruncateBlock;
   }
@@ -175,6 +184,8 @@ class V8_EXPORT_PRIVATE MaglevGraphOptimizer {
 
   Jump* FoldBranch(BasicBlock* current, BranchControlNode* branch_node,
                    bool if_true);
+  ProcessResult AbortBlock(BasicBlock* block,
+                           AbortReason reason = AbortReason::kUnreachable);
 
   ProcessResult OverwriteWith(Opcode opcode);
 
@@ -250,7 +261,7 @@ class V8_EXPORT_PRIVATE Subgraph<MaglevGraphOptimizer>
   ZoneVector<BasicBlock*> blocks_;
   BasicBlock* saved_block_;
   BasicBlockPosition saved_position_;
-  KnownNodeAspects* saved_kna_;
+  KnownNodeAspects::Ptr saved_kna_;
   // Enclosing subgraph, or nullptr if this is a top-level subgraph.
   Subgraph<MaglevGraphOptimizer>* parent_;
 

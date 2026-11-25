@@ -84,6 +84,7 @@
 #include "src/parsing/scanner-character-streams.h"
 #include "src/profiler/profile-generator.h"
 #include "src/sandbox/trap-fuzzer.h"
+#include "src/snapshot/code-serializer.h"
 #include "src/snapshot/snapshot.h"
 #include "src/strings/owning-external-string-resource.h"
 #include "src/tasks/cancelable-task.h"
@@ -110,12 +111,15 @@
 #include <signal.h>
 #endif  // V8_OS_POSIX
 
-#ifdef V8_FUZZILLI
-// gn check complains when not using the v8_fuzzilli arg since the public dep.
-// is added conditionally
+// gn check complains when not using the v8_fuzzilli or v8_redline arg since the
+// public dep. is added conditionally
+#if defined(V8_REDLINE)
+#include "experimental/redline/d8/cov.h"      // nogncheck
+#include "experimental/redline/d8/redline.h"  // nogncheck
+#elif defined(V8_FUZZILLI)
 #include "src/fuzzilli/cov.h"  // nogncheck
 #include "src/fuzzilli/fuzzilli.h"
-#endif  // V8_FUZZILLI
+#endif  // defined(V8_REDLINE)
 
 #ifdef V8_INTL_SUPPORT
 #include "unicode/locid.h"
@@ -166,11 +170,11 @@ std::unordered_map<std::string, std::string> bundle_module_files;
 // Used for naming anonymous bundle entrypoints. Only accessed on the main
 // thread.
 int bundle_anon_module_counter = 0;
-#ifdef V8_FUZZILLI
+#if defined(V8_FUZZILLI) || defined(V8_REDLINE)
 bool fuzzilli_reprl = true;
 #else
 bool fuzzilli_reprl = false;
-#endif  // V8_FUZZILLI
+#endif  // defined(V8_FUZZILLI) || defined(V8_REDLINE)
 
 Isolate::CreateParams GetDefaultIsolateCreateParams() {
   Isolate::CreateParams create_params;
@@ -453,11 +457,14 @@ class PAInSandboxAllocator final : public v8::Allocator {
     // out-of-line metadata.
     partition_alloc::internal::PartitionAddressSpace::Init();
     partition_alloc::internal::PartitionAddressSpace::InitConfigurablePool(
-        pool_base, pool_size);
+        pool_base, pool_size,
+        sandbox->address_space()->ActiveMemoryProtectionKey().value_or(
+            partition_alloc::internal::kInvalidPkey));
 
     partition_alloc::PartitionOptions opts;
     opts.backup_ref_ptr = partition_alloc::PartitionOptions::kDisabled;
     opts.use_configurable_pool = partition_alloc::PartitionOptions::kAllowed;
+    opts.allow_giga_allocations = partition_alloc::PartitionOptions::kAllowed;
     partition_.init(std::move(opts));
 
     // Also adjust the limits for dirty bytes and slot span ring size in the
@@ -511,7 +518,8 @@ class PAInSandboxAllocator final : public v8::Allocator {
     // memory tool (e.g. ASan) overrides malloc, so disable both.
     constexpr auto new_flags =
         flags | partition_alloc::AllocFlags::kNoOverrideHooks |
-        partition_alloc::AllocFlags::kNoMemoryToolOverride;
+        partition_alloc::AllocFlags::kNoMemoryToolOverride |
+        partition_alloc::AllocFlags::kAllowGigaAllocations;
     return partition_.root()->Alloc<new_flags>(length, "PAInSandboxAllocator");
   }
 
@@ -752,7 +760,7 @@ class FileSourceStream : public CompileSourceStream {
     file_ = base::Fopen(filename, "rb");
     if (file_ == nullptr) {
       std::ostringstream oss;
-      oss << "Error loading file for streaming: " << filename;
+      oss << "Error loading file for streaming: " << TruncateForError(filename);
       ThrowError(isolate, oss.view());
     }
   }
@@ -936,6 +944,18 @@ MaybeLocal<T> Shell::CompileSource(Isolate* isolate, Local<Context> context,
           LookupCodeCache(isolate, source_string, ScriptType::kModule);
     }
   }
+#ifdef V8_ENABLE_MEMORY_CORRUPTION_API
+  // For fuzzer cleanliness place the cache right before a guard page, ignoring
+  // small OOB reads.
+  std::optional<i::GuardedCodeCacheForTesting> guarded_code;
+  if (cached_code) {
+    guarded_code.emplace(cached_code->data, cached_code->length);
+    delete cached_code;
+    cached_code = new ScriptCompiler::CachedData(
+        guarded_code->data(), guarded_code->length(),
+        ScriptCompiler::CachedData::BufferNotOwned);
+  }
+#endif  // V8_ENABLE_MEMORY_CORRUPTION_API
   ScriptCompiler::Source script_source(source_string, origin, cached_code);
   MaybeLocal<T> result =
       Compile<T>(context, &script_source,
@@ -1163,6 +1183,23 @@ void D8WasmAsyncResolvePromiseCallback(
           isolate, context, resolver, result, success));
 }
 
+class V8_NODISCARD RethrowIfNotReportingScope {
+ public:
+  RethrowIfNotReportingScope(TryCatch* try_catch,
+                             Shell::ReportExceptions report_exceptions)
+      : try_catch_(try_catch), report_exceptions_(report_exceptions) {}
+  ~RethrowIfNotReportingScope() {
+    if (report_exceptions_ == Shell::kNoReportExceptions &&
+        try_catch_->HasCaught() && !try_catch_->HasTerminated()) {
+      try_catch_->ReThrow();
+    }
+  }
+
+ private:
+  TryCatch* try_catch_;
+  Shell::ReportExceptions report_exceptions_;
+};
+
 }  // namespace
 
 // Executes a source within the current v8 context.
@@ -1176,6 +1213,7 @@ bool Shell::ExecuteSource(Isolate* isolate, const Source& source,
   HandleScope handle_scope(isolate);
   TryCatch try_catch(isolate);
   try_catch.SetVerbose(report_exceptions == kReportExceptions);
+  RethrowIfNotReportingScope rethrow_scope(&try_catch, report_exceptions);
 
   Local<String> source_str;
   if (i::v8_flags.parse_only ||
@@ -1226,6 +1264,9 @@ bool Shell::ExecuteSource(Isolate* isolate, const Source& source,
   // frames, the stack check in the called frame might be too late.
   if (i::StackLimitCheck{i_isolate}.HasOverflowed()) {
     i_isolate->StackOverflow();
+    if (report_exceptions == kReportExceptions) {
+      i_isolate->ReportPendingMessages();
+    }
     return false;
   }
 
@@ -1235,10 +1276,6 @@ bool Shell::ExecuteSource(Isolate* isolate, const Source& source,
   Context::Scope context_scope(realm);
   Local<Context> context(isolate->GetCurrentContext());
   ScriptOrigin origin = CreateScriptOrigin(isolate, name, ScriptType::kClassic);
-
-  i::CppGCManaged<ModuleEmbedderData>::Ptr module_data =
-      GetModuleDataFromContext(realm);
-  module_data->origin = ToSTLString(isolate, name);
 
   for (int i = 1; i < options.repeat_compile; ++i) {
     HandleScope handle_scope_for_compiling(isolate);
@@ -1251,6 +1288,10 @@ bool Shell::ExecuteSource(Isolate* isolate, const Source& source,
            .ToLocal(&script)) {
     return false;
   }
+
+  i::CppGCManaged<ModuleEmbedderData>::Ptr module_data =
+      GetModuleDataFromContext(realm);
+  module_data->origin = ToSTLString(isolate, name);
 
   if (options.code_cache_options ==
       ShellOptions::CodeCacheOptions::kProduceCache) {
@@ -1472,7 +1513,7 @@ MaybeLocal<Object> Shell::FetchModuleSource(Local<Module> referrer,
   // Loading modules is only allowed for local absolute paths.
   if (!IsAbsolutePath(module_specifier)) {
     std::ostringstream msg;
-    msg << "d8: Reading module from " << module_specifier
+    msg << "d8: Reading module from " << TruncateForError(module_specifier)
         << " is not supported.";
     if (!referrer.IsEmpty()) {
       std::string referrer_specifier =
@@ -1486,7 +1527,8 @@ MaybeLocal<Object> Shell::FetchModuleSource(Local<Module> referrer,
   auto file = ReadFileData(isolate, module_specifier.c_str());
   if (!file) {
     std::ostringstream msg;
-    msg << "d8: Error reading module from " << module_specifier;
+    msg << "d8: Error reading module from "
+        << TruncateForError(module_specifier);
     if (!referrer.IsEmpty()) {
       std::string referrer_specifier =
           module_data->GetModuleSpecifier(referrer);
@@ -1533,6 +1575,12 @@ MaybeLocal<Module> Shell::FetchModuleTree(Local<Module> referrer,
                                           const std::string& module_specifier,
                                           ModuleType module_type) {
   Isolate* isolate = Isolate::GetCurrent();
+  if (module_type == ModuleType::kWebAssembly) {
+    ThrowError(
+        isolate,
+        "d8: WebAssembly modules are only supported in source phase imports");
+    return MaybeLocal<Module>();
+  }
   i::CppGCManaged<ModuleEmbedderData>::Ptr module_data =
       GetModuleDataFromContext(context);
   DCHECK_IMPLIES(referrer.IsEmpty(), module_data->inserted_modules.empty());
@@ -1553,8 +1601,10 @@ MaybeLocal<Module> Shell::FetchModuleTree(Local<Module> referrer,
 
   if (!found_in_bundle) {
     if (module_specifier.starts_with(kDataURLPrefix)) {
-      source_text = String::NewFromUtf8(
-          isolate, module_specifier.c_str() + strlen(kDataURLPrefix));
+      if (module_specifier.length() <= String::kMaxLength) {
+        source_text = String::NewFromUtf8(
+            isolate, module_specifier.c_str() + strlen(kDataURLPrefix));
+      }
     } else if (IsAbsolutePath(module_specifier)) {
       if (module_type == ModuleType::kBytes) {
         raw_file = ReadFileData(isolate, module_specifier.c_str(), false);
@@ -1572,7 +1622,7 @@ MaybeLocal<Module> Shell::FetchModuleTree(Local<Module> referrer,
     } else {
       // Loading modules is only allowed for local absolute paths.
       std::ostringstream msg;
-      msg << "d8: Reading module from " << module_specifier
+      msg << "d8: Reading module from " << TruncateForError(module_specifier)
           << " is not supported.";
       if (!referrer.IsEmpty()) {
         std::string referrer_specifier =
@@ -1584,10 +1634,14 @@ MaybeLocal<Module> Shell::FetchModuleTree(Local<Module> referrer,
     }
   }
 
+  Local<String> resource_name;
   if ((module_type == ModuleType::kBytes && !raw_file) ||
-      (module_type != ModuleType::kBytes && source_text.IsEmpty())) {
+      (module_type != ModuleType::kBytes && source_text.IsEmpty()) ||
+      !String::NewFromUtf8(isolate, module_specifier.c_str())
+           .ToLocal(&resource_name)) {
     std::ostringstream msg;
-    msg << "d8: Error reading module from " << module_specifier;
+    msg << "d8: Error reading module from "
+        << TruncateForError(module_specifier);
     if (!referrer.IsEmpty()) {
       std::string referrer_specifier =
           module_data->GetModuleSpecifier(referrer);
@@ -1597,8 +1651,6 @@ MaybeLocal<Module> Shell::FetchModuleTree(Local<Module> referrer,
     return MaybeLocal<Module>();
   }
 
-  Local<String> resource_name =
-      String::NewFromUtf8(isolate, module_specifier.c_str()).ToLocalChecked();
   ScriptOrigin origin =
       CreateScriptOrigin(isolate, resource_name, ScriptType::kModule);
 
@@ -1635,17 +1687,14 @@ MaybeLocal<Module> Shell::FetchModuleTree(Local<Module> referrer,
         {String::NewFromUtf8(isolate, "default").ToLocalChecked()});
 
     module = v8::Module::CreateSyntheticModule(
-        isolate,
-        String::NewFromUtf8(isolate, module_specifier.c_str()).ToLocalChecked(),
-        export_names, Shell::JSONModuleEvaluationSteps, parsed_json);
+        isolate, resource_name, export_names, Shell::JSONModuleEvaluationSteps,
+        parsed_json);
   } else if (module_type == ModuleType::kText) {
     auto export_names = std::to_array<Local<String>>(
         {String::NewFromUtf8(isolate, "default").ToLocalChecked()});
 
     module = v8::Module::CreateSyntheticModule(
-        isolate,
-        String::NewFromUtf8(isolate, module_specifier.c_str()).ToLocalChecked(),
-        export_names, Shell::TextModuleEvaluationSteps,
+        isolate, resource_name, export_names, Shell::TextModuleEvaluationSteps,
         source_text.ToLocalChecked());
   } else if (module_type == ModuleType::kBytes) {
     CHECK(raw_file);
@@ -1665,9 +1714,8 @@ MaybeLocal<Module> Shell::FetchModuleTree(Local<Module> referrer,
         {String::NewFromUtf8(isolate, "default").ToLocalChecked()});
 
     module = v8::Module::CreateSyntheticModule(
-        isolate,
-        String::NewFromUtf8(isolate, module_specifier.c_str()).ToLocalChecked(),
-        export_names, Shell::BytesModuleEvaluationSteps, uint8_array);
+        isolate, resource_name, export_names, Shell::BytesModuleEvaluationSteps,
+        uint8_array);
   } else {
     UNREACHABLE();
   }
@@ -2716,7 +2764,7 @@ bool Shell::LookupPerformanceMark(Isolate* isolate, v8::Local<String> name,
   }
   std::ostringstream msg;
   msg << "Invalid performance.mark \"";
-  msg << (*utf8_name) << "\" does not exist";
+  msg << TruncateForError(*utf8_name) << "\" does not exist";
   ThrowError(isolate, msg.str());
   return false;
 }
@@ -3656,6 +3704,30 @@ void Shell::ResetOnProfileEndListener(Isolate* isolate) {
   }
 }
 
+void Shell::ResetIsolateStateForReprl(Isolate* isolate) {
+  // A testcase can terminate itself, for example with %TerminateExecution().
+  // Shell::ExecuteSource then keeps the termination requested, which would
+  // stop the next testcase at once.
+  isolate->CancelTerminateExecution();
+  i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(isolate);
+  i_isolate->descriptor_lookup_cache()->Clear();
+  i_isolate->compilation_cache()->Clear();
+  i_isolate->set_force_slow_path(i::v8_flags.force_slow_path);
+
+#ifdef V8_ENABLE_ALLOCATION_TIMEOUT
+  i_isolate->heap()->ResetAllocationTimeouts();
+#endif  // V8_ENABLE_ALLOCATION_TIMEOUT
+#ifdef DEBUG
+  if (i::v8_flags.inline_new) {
+    i_isolate->heap()->EnableInlineAllocation();
+  } else {
+    i_isolate->heap()->DisableInlineAllocation();
+  }
+#endif  // DEBUG
+
+  ResetOnProfileEndListener(isolate);
+}
+
 void Shell::ProfilerTriggerSample(
     const v8::FunctionCallbackInfo<v8::Value>& info) {
   // If the inspector is enabled, then the installed console is not the
@@ -3880,13 +3952,8 @@ void Shell::ExecuteFile(const v8::FunctionCallbackInfo<v8::Value>& info) {
     HandleScope handle_scope(isolate);
     SafeUtf8Value file_name(isolate, info[i]);
     if (!file_name) return;
-    if (!ExecuteSource(
-            isolate, Source::FromFile(*file_name),
-            String::NewFromUtf8(isolate, *file_name).ToLocalChecked(),
-            options.quiet_load ? kNoReportExceptions : kReportExceptions)) {
-      std::ostringstream oss;
-      oss << "Error executing file: \"" << *file_name << '"';
-      ThrowError(isolate, oss.view());
+    if (!ExecuteSource(isolate, Source::FromFile(*file_name),
+                       file_name.string(), kNoReportExceptions)) {
       return;
     }
   }
@@ -4144,7 +4211,7 @@ void Shell::WorkerNew(const v8::FunctionCallbackInfo<v8::Value>& info) {
     if (!allow_new_workers_) return;
 
     String::Utf8Value script(isolate, source);
-    if (!*script) {
+    if (!*script || script.length() > String::kMaxLength) {
       ThrowError(isolate, "Can't get worker script");
       return;
     }
@@ -4438,6 +4505,9 @@ bool SkipTerminationForFuzzing() {
   // being processed. This will in turn desynchronize the communication
   // between d8 and Fuzzilli, leading to a crash.
   if (fuzzilli_reprl) return true;
+  // --bundle-reprl runs the parts of a bundle in the same way as REPRL runs
+  // testcases, so it skips termination too.
+  if (Shell::options.bundle_reprl) return true;
   return false;
 }
 
@@ -5350,6 +5420,7 @@ MaybeLocal<Context> Shell::CreateEvaluationContext(Isolate* isolate) {
   }
 #ifdef V8_ENABLE_HARDWARE_WATCHPOINT_SUPPORT
   if (options.memory_corruption_via_watchpoints) {
+    DCHECK(i::v8_flags.expose_memory_corruption_api);
     // The global "Sandbox" object is installed in src/sandbox/testing.cc via
     // `SandboxTesting::InstallMemoryCorruptionApi`. We add another method to
     // it with a callback implemented in hardware-watchpoints.cc.
@@ -5876,7 +5947,7 @@ std::unique_ptr<base::OS::MemoryMappedFile> Shell::ReadFileData(
   if (!file) {
     if (should_throw) {
       std::ostringstream oss;
-      oss << "Error loading file: " << name;
+      oss << "Error loading file: " << TruncateForError(name);
       ThrowError(isolate, oss.view());
     }
     return nullptr;
@@ -5899,6 +5970,16 @@ MaybeLocal<String> Shell::ReadFile(Isolate* isolate, const char* name,
   int size = static_cast<int>(full_file_size);
   char* chars = static_cast<char*>(file->memory());
   return CreateStringFromExternalData(isolate, std::string_view(chars, size));
+}
+
+// Reads a file into a std::string.
+std::optional<std::string> Shell::ReadFileToString(const char* name) {
+  std::unique_ptr<base::OS::MemoryMappedFile> file(
+      base::OS::MemoryMappedFile::open(
+          name, base::OS::MemoryMappedFile::FileMode::kReadOnly));
+  if (!file) return std::nullopt;
+  if (file->size() == 0) return std::string();
+  return std::string(static_cast<const char*>(file->memory()), file->size());
 }
 
 void Shell::WriteChars(const char* name, uint8_t* buffer, size_t buffer_size) {
@@ -6185,21 +6266,24 @@ bool AddBundleModule(Isolate* isolate, const std::string& name,
   return false;
 }
 
-bool TryExecuteBundle(Isolate* isolate, const std::string& content,
-                      Local<String> file_name, bool* out_success) {
+constexpr char kBundleMarkerPrefix[] = "// JS_BUNDLE_";
+constexpr char kBundleScriptMarker[] = "// JS_BUNDLE_SCRIPT";
+
+// One part of a bundle: the marker line (without the line break) and the
+// content up to the next marker.
+struct BundlePart {
+  std::string header;
+  std::string content;
+};
+
+// Splits a bundle into its parts. Returns false if the content is not a bundle.
+bool SplitBundle(const std::string& content, std::vector<BundlePart>* parts) {
   // Find the first // JS_BUNDLE_ comment. It's either
   // "// JS_BUNDLE_SCRIPT", "// JS_BUNDLE_MODULE:filename.mjs", or "//
   // JS_BUNDLE_MODULE_ENTRYPOINT". Then find either the end of the file, or the
   // next // JS_BUNDLE_ comment. Between those locations, we have our file (or
   // module).
-
-  // We first gather all scripts and modules, and then execute the scripts and
-  // the module entrypoints in order.
-
-  std::string script_marker = "// JS_BUNDLE_SCRIPT";
-  std::string module_marker_prefix = "// JS_BUNDLE_MODULE:";
-  std::string entrypoint_marker_prefix = "// JS_BUNDLE_MODULE_ENTRYPOINT";
-  std::string marker_prefix = "// JS_BUNDLE_";
+  std::string marker_prefix = kBundleMarkerPrefix;
 
   size_t pos = 0;
   // Skip whitespace and comments before the first marker.
@@ -6233,13 +6317,6 @@ bool TryExecuteBundle(Isolate* isolate, const std::string& content,
 
   if (pos >= content.length()) return false;
 
-  struct ExecutionItem {
-    enum Type { kScript, kModuleEntrypoint };
-    Type type;
-    std::string content_or_name;
-  };
-  std::vector<ExecutionItem> execution_order;
-
   while (pos < content.length()) {
     // We expect a marker at pos.
     if (content.compare(pos, marker_prefix.length(), marker_prefix) != 0) {
@@ -6262,8 +6339,33 @@ bool TryExecuteBundle(Isolate* isolate, const std::string& content,
     size_t part_end =
         (next_marker == std::string::npos) ? content.length() : next_marker;
 
-    std::string part_content = content.substr(pos, part_end - pos);
+    parts->push_back({std::move(header), content.substr(pos, part_end - pos)});
     pos = part_end;
+  }
+  return true;
+}
+
+bool TryExecuteBundle(Isolate* isolate, const std::string& content,
+                      Local<String> file_name, bool* out_success) {
+  // We first gather all scripts and modules, and then execute the scripts and
+  // the module entrypoints in order.
+  std::vector<BundlePart> parts;
+  if (!SplitBundle(content, &parts)) return false;
+
+  std::string script_marker = kBundleScriptMarker;
+  std::string module_marker_prefix = "// JS_BUNDLE_MODULE:";
+  std::string entrypoint_marker_prefix = "// JS_BUNDLE_MODULE_ENTRYPOINT";
+
+  struct ExecutionItem {
+    enum Type { kScript, kModuleEntrypoint };
+    Type type;
+    std::string content_or_name;
+  };
+  std::vector<ExecutionItem> execution_order;
+
+  for (const BundlePart& part : parts) {
+    const std::string& header = part.header;
+    const std::string& part_content = part.content;
 
     if (header == script_marker) {
       execution_order.push_back({ExecutionItem::kScript, part_content});
@@ -6318,9 +6420,52 @@ bool TryExecuteBundle(Isolate* isolate, const std::string& content,
   return true;  // Bundle handled successfully (even if execution failed)
 }
 
+bool SourceGroup::ReadBundleReprlScripts(std::vector<std::string>* scripts) {
+  const char* file_name = nullptr;
+  for (int i = begin_offset_; i < end_offset_; ++i) {
+    const char* arg = argv_[i];
+    if (arg == nullptr) continue;
+    if (strcmp(arg, "-e") == 0 || strcmp(arg, "--module") == 0 ||
+        strcmp(arg, "--json") == 0) {
+      printf("Error: --bundle-reprl does not support %s\n", arg);
+      return false;
+    }
+    // Ignore other options. They have been parsed already.
+    if (arg[0] == '-') continue;
+    if (file_name != nullptr) {
+      printf("Error: --bundle-reprl needs exactly one bundle file\n");
+      return false;
+    }
+    file_name = arg;
+  }
+  if (file_name == nullptr) {
+    printf("Error: --bundle-reprl needs exactly one bundle file\n");
+    return false;
+  }
+  std::optional<std::string> content = Shell::ReadFileToString(file_name);
+  if (!content) {
+    printf("Error reading '%s'\n", file_name);
+    return false;
+  }
+  std::vector<BundlePart> parts;
+  if (!SplitBundle(*content, &parts)) {
+    printf("Error: '%s' is not a bundle\n", file_name);
+    return false;
+  }
+  for (BundlePart& part : parts) {
+    if (part.header != kBundleScriptMarker) {
+      printf("Error: --bundle-reprl supports only %s parts, not: %s\n",
+             kBundleScriptMarker, part.header.c_str());
+      return false;
+    }
+    scripts->push_back(std::move(part.content));
+  }
+  return true;
+}
+
 bool SourceGroup::Execute(Isolate* isolate) {
   bool success = true;
-#ifdef V8_FUZZILLI
+#if defined(V8_FUZZILLI) || defined(V8_REDLINE)
   if (fuzzilli_reprl) {
     HandleScope handle_scope(isolate);
     Local<String> file_name =
@@ -6364,7 +6509,7 @@ bool SourceGroup::Execute(Isolate* isolate) {
       return true;  // Bundle execution failed
     }
   }
-#endif  // V8_FUZZILLI
+#endif  // defined(V8_FUZZILLI) || defined(V8_REDLINE)
   for (int i = begin_offset_; i < end_offset_; ++i) {
     const char* arg = argv_[i];
     if (arg == nullptr) continue;
@@ -6611,7 +6756,11 @@ void Worker::WorkerThread::Run() {
   auto worker = std::move(worker_);
   worker_ = nullptr;
   worker->ExecuteInThread();
-  Shell::RemoveRunningWorker(worker);
+  // Hand over our reference, so that it is dropped while holding the
+  // workers_mutex_ (see Shell::RemoveRunningWorker). The Worker (and
+  // therefore this WorkerThread) may be deleted by this call, so `this` must
+  // not be accessed afterwards.
+  Shell::RemoveRunningWorker(std::move(worker));
 }
 
 class ProcessMessageTask : public i::CancelableTask {
@@ -7068,7 +7217,7 @@ void ReportFlagWarning(const char* format, ...) {
 }  // namespace
 
 bool Shell::SetOptions(int argc, char* argv[]) {
-  i::v8_flags.flag_processing_mode = "abort-on-error";
+  i::v8_flags.flag_processing_mode.Overwrite("abort-on-error");
   options.d8_path = argv[0];
   bool disallow_unsafe_flags = false;
   bool disallow_developer_only_features = false;
@@ -7112,7 +7261,7 @@ bool Shell::SetOptions(int argc, char* argv[]) {
       // implications are only processed later in V8::Initialize(), so we need
       // to manually mirror those implications (including --fuzzing implying
       // --disallow-unsafe-flags) here for d8 option processing.
-      i::v8_flags.fuzzing = true;
+      i::v8_flags.fuzzing.Set(true);
       disallow_unsafe_flags = true;
       if (!flag_processing_mode_explicitly_set) {
         check_d8_flag_contradictions = false;
@@ -7239,6 +7388,10 @@ bool Shell::SetOptions(int argc, char* argv[]) {
                                   &i)) {
       options.trace_config = flag_value;
     } else if (FlagMatches("--enable-inspector", &argv[i])) {
+      fprintf(stderr,
+              "Warning: --enable-inspector is deprecated "
+              "(see http://crbug.com/573042262).\n"
+              "Please use inspector tests (test/inspector/) instead.\n");
       options.enable_inspector = true;
     } else if (FlagWithArgMatches("--lcov", &flag_value, argc, argv, &i)) {
       options.lcov_file = flag_value;
@@ -7253,17 +7406,11 @@ bool Shell::SetOptions(int argc, char* argv[]) {
       options.perf_ack_fd = atoi(flag_value);
 #endif  // V8_OS_LINUX
 #ifdef V8_ENABLE_HARDWARE_WATCHPOINT_SUPPORT
-    } else if (bool enable_tracing = FlagMatches(
-                   "--trace-memory-corruption-via-watchpoints", &argv[i]);
-               enable_tracing ||
-               FlagMatches("--memory-corruption-via-watchpoints", &argv[i])) {
-      // The tracing flag also implies enabling the API.
+    } else if (FlagMatches("--trace-memory-corruption-via-watchpoints",
+                           &argv[i])) {
+      options.trace_memory_corruption_via_watchpoints = true;
+    } else if (FlagMatches("--memory-corruption-via-watchpoints", &argv[i])) {
       options.memory_corruption_via_watchpoints = true;
-      if (enable_tracing) {
-        options.trace_memory_corruption_via_watchpoints = true;
-      }
-      // Imply --expose-memory-corruption-api.
-      i::v8_flags.expose_memory_corruption_api = true;
 #endif  // V8_ENABLE_HARDWARE_WATCHPOINT_SUPPORT
     } else if (FlagMatches("--disable-in-process-stack-traces", &argv[i])) {
       options.disable_in_process_stack_traces = true;
@@ -7276,8 +7423,6 @@ bool Shell::SetOptions(int argc, char* argv[]) {
       options.enable_os_system = true;
     } else if (FlagMatches("--no-apply-priority", &argv[i])) {
       options.apply_priority = false;
-    } else if (FlagMatches("--quiet-load", &argv[i])) {
-      options.quiet_load = true;
     } else if (FlagWithArgMatches("--thread-pool-size", &flag_value, argc, argv,
                                   &i)) {
       int requested_size = atoi(flag_value);
@@ -7310,7 +7455,9 @@ bool Shell::SetOptions(int argc, char* argv[]) {
       options.max_serializer_memory = atoi(flag_value) * i::MB;
     } else if (FlagMatches("--bundle", &argv[i])) {
       options.bundle = true;
-#ifdef V8_FUZZILLI
+    } else if (FlagMatches("--bundle-reprl", &argv[i])) {
+      options.bundle_reprl = true;
+#if defined(V8_FUZZILLI) || defined(V8_REDLINE)
     } else if (FlagMatches("--fuzzilli-enable-builtins-coverage", &argv[i])) {
       options.fuzzilli_enable_builtins_coverage = true;
     } else if (FlagMatches("--no-fuzzilli-enable-builtins-coverage",
@@ -7326,7 +7473,7 @@ bool Shell::SetOptions(int argc, char* argv[]) {
     } else if (FlagMatches("--enable-etw-stack-walking", &argv[i])) {
       options.enable_etw_stack_walking = true;
       // This needs to be manually triggered for JIT ETW events to work.
-      i::v8_flags.enable_etw_stack_walking = true;
+      i::v8_flags.enable_etw_stack_walking.Set(true);
 #if defined(V8_ENABLE_SYSTEM_INSTRUMENTATION)
     } else if (FlagMatches("--enable-system-instrumentation", &argv[i])) {
       options.enable_system_instrumentation = true;
@@ -7335,7 +7482,7 @@ bool Shell::SetOptions(int argc, char* argv[]) {
 #if defined(V8_OS_WIN)
       // Guard this bc the flag has a lot of overhead and is not currently used
       // by macos
-      i::v8_flags.interpreted_frames_native_stack = true;
+      i::v8_flags.interpreted_frames_native_stack.Set(true);
 #endif
 #endif
 #if V8_ENABLE_WEBASSEMBLY
@@ -7354,6 +7501,23 @@ bool Shell::SetOptions(int argc, char* argv[]) {
   }
 
   DCHECK(options.num_isolates);
+
+  const char* usage =
+      "Synopsis:\n"
+      "  shell [options] [--shell] [<file>...]\n"
+      "  d8 [options] [-e <string>] [--shell] [--module|]"
+      " <file>...]\n\n"
+      "  -e        execute a string in V8\n"
+      "  --shell   run an interactive JavaScript shell\n"
+      "  --module  execute a file as a JavaScript module\n"
+      "  --version print V8 version and exit\n"
+      "  -C        set the current working directory before executing "
+      "subsequent files\n";
+  using HelpOptions = i::FlagList::HelpOptions;
+  i::v8_flags.is_standalone_d8_shell.Set(true);
+  i::FlagList::SetFlagsFromCommandLine(&argc, argv, true,
+                                       HelpOptions(HelpOptions::kExit, usage));
+  i::FlagList::ResolveContradictionsWhenFuzzing();
 
   const auto handle_unsafe_d8_flag = [&](auto& flag) {
     if (!flag.WasSpecified()) return;
@@ -7392,6 +7556,20 @@ bool Shell::SetOptions(int argc, char* argv[]) {
   handle_unsafe_d8_flag(options.perf_ack_fd);
   handle_unsafe_d8_flag(options.scope_linux_perf_to_mark_measure);
 #endif
+#ifdef V8_ENABLE_HARDWARE_WATCHPOINT_SUPPORT
+  // Mirror DISALLOW_UNSAFE_FLAG_IF(!sandbox_testing && !sandbox_fuzzing,
+  // expose_memory_corruption_api), including flags that imply sandbox_testing
+  // or sandbox_fuzzing.
+  // LINT.IfChange(MemoryCorruptionApiImplications)
+  const bool sandbox_testing_or_fuzzing =
+      i::v8_flags.sandbox_testing || i::v8_flags.run_as_sandbox_security_poc ||
+      i::v8_flags.sandbox_fuzzing || i::v8_flags.sandbox_trap_fuzzing;
+  // LINT.ThenChange(/src/flags/flag-definitions.h:MemoryCorruptionApiImplications)
+  if (!sandbox_testing_or_fuzzing) {
+    handle_unsafe_d8_flag(options.memory_corruption_via_watchpoints);
+    handle_unsafe_d8_flag(options.trace_memory_corruption_via_watchpoints);
+  }
+#endif  // V8_ENABLE_HARDWARE_WATCHPOINT_SUPPORT
 
   const auto handle_developer_only_d8_flag = [&](auto& flag) {
     if (!flag.WasSpecified()) return;
@@ -7416,6 +7594,16 @@ bool Shell::SetOptions(int argc, char* argv[]) {
   handle_developer_only_d8_flag(options.dump_counters_nvp);
   handle_developer_only_d8_flag(options.dump_system_memory_stats);
   handle_developer_only_d8_flag(options.simulate_errors);
+#ifdef V8_ENABLE_HARDWARE_WATCHPOINT_SUPPORT
+  handle_developer_only_d8_flag(
+      options.trace_memory_corruption_via_watchpoints);
+  if (options.trace_memory_corruption_via_watchpoints) {
+    options.memory_corruption_via_watchpoints = true;
+  }
+  if (options.memory_corruption_via_watchpoints) {
+    i::v8_flags.expose_memory_corruption_api.Set(true);
+  }
+#endif  // V8_ENABLE_HARDWARE_WATCHPOINT_SUPPORT
 
 #ifdef V8_OS_LINUX
   if (options.scope_linux_perf_to_mark_measure) {
@@ -7443,23 +7631,6 @@ bool Shell::SetOptions(int argc, char* argv[]) {
     return false;
   }
 
-  const char* usage =
-      "Synopsis:\n"
-      "  shell [options] [--shell] [<file>...]\n"
-      "  d8 [options] [-e <string>] [--shell] [--module|]"
-      " <file>...]\n\n"
-      "  -e        execute a string in V8\n"
-      "  --shell   run an interactive JavaScript shell\n"
-      "  --module  execute a file as a JavaScript module\n"
-      "  --version print V8 version and exit\n"
-      "  -C        set the current working directory before executing "
-      "subsequent files\n";
-  using HelpOptions = i::FlagList::HelpOptions;
-  i::v8_flags.is_standalone_d8_shell.Set(true);
-  i::FlagList::SetFlagsFromCommandLine(&argc, argv, true,
-                                       HelpOptions(HelpOptions::kExit, usage));
-  i::FlagList::ResolveContradictionsWhenFuzzing();
-
   if (i::v8_flags.stress_snapshot && options.expose_fast_api &&
       check_d8_flag_contradictions) {
     FATAL("Flag --expose-fast-api is incompatible with --stress-snapshot.");
@@ -7481,6 +7652,10 @@ bool Shell::SetOptions(int argc, char* argv[]) {
     if (argv[i] != nullptr && strcmp(argv[i], "--isolate") == 0) {
       options.num_isolates++;
     }
+  }
+  if (options.bundle_reprl && options.num_isolates > 1) {
+    printf("Error: --bundle-reprl does not support --isolate\n");
+    return false;
   }
   options.isolate_sources = new SourceGroup[options.num_isolates];
   internal::g_num_isolates_for_testing = options.num_isolates;
@@ -7543,7 +7718,8 @@ void JoinAllWorkerAndIsolateThreads(Isolate* isolate) {
 
 }  // namespace
 
-int Shell::RunMain(v8::Isolate* isolate, bool last_run) {
+int Shell::RunMain(v8::Isolate* isolate, bool last_run,
+                   std::optional<std::string_view> reprl_script) {
   i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(isolate);
 
   for (int i = 1; i < options.num_isolates; ++i) {
@@ -7556,7 +7732,7 @@ int Shell::RunMain(v8::Isolate* isolate, bool last_run) {
   // returns in some situations:
   const bool keep_context_alive =
       last_run && (use_interactive_shell() || i::v8_flags.stress_snapshot);
-  bool success = RunMainIsolate(isolate, keep_context_alive);
+  bool success = RunMainIsolate(isolate, keep_context_alive, reprl_script);
   CollectGarbage(isolate);
 
   // Park the main thread here to prevent deadlocks in shared GCs when
@@ -7621,7 +7797,44 @@ int Shell::RunMain(v8::Isolate* isolate, bool last_run) {
   return (success == Shell::options.expected_to_throw ? 1 : 0);
 }
 
-bool Shell::RunMainIsolate(v8::Isolate* isolate, bool keep_context_alive) {
+// Runs each script part of a bundle in the same way as the REPRL loop of a
+// fuzzer runs one testcase: reset the isolate state, then run the part in a new
+// context. Thus a crash that occurs only after the earlier testcases of a REPRL
+// session can be reproduced from one file. Returns the result of the last part.
+int Shell::RunBundleReprl(v8::Isolate* isolate) {
+  std::vector<std::string> scripts;
+  bool read_ok = options.isolate_sources[0].ReadBundleReprlScripts(&scripts);
+  // Do not start the interactive shell, also when the bundle cannot be read.
+  set_script_executed();
+  if (!read_ok) return 1;
+  int result = 0;
+  for (const std::string& script : scripts) {
+    ResetIsolateStateForReprl(isolate);
+    result = RunMain(isolate, /*last_run=*/true, script);
+  }
+  return result;
+}
+
+// Runs one script part of a --bundle-reprl bundle in the same way as the REPRL
+// branch of SourceGroup::Execute runs one testcase.
+bool Shell::ExecuteReprlScript(Isolate* isolate, std::string_view script) {
+  HandleScope handle_scope(isolate);
+  if (script.size() > size_t{String::kMaxLength}) {
+    printf("Error: bundle part too large (%zu bytes)\n", script.size());
+    return false;
+  }
+  Local<String> file_name = String::NewFromUtf8Literal(isolate, "fuzzcode.js");
+  Local<String> source =
+      String::NewFromUtf8(isolate, script.data(), NewStringType::kNormal,
+                          static_cast<int>(script.size()))
+          .ToLocalChecked();
+  set_script_executed();
+  return ExecuteSource(isolate, Source::FromString(source), file_name,
+                       kReportExceptions);
+}
+
+bool Shell::RunMainIsolate(v8::Isolate* isolate, bool keep_context_alive,
+                           std::optional<std::string_view> reprl_script) {
   if (options.lcov_file) {
     debug::Coverage::SelectMode(isolate, debug::CoverageMode::kBlockCount);
   }
@@ -7651,7 +7864,11 @@ bool Shell::RunMainIsolate(v8::Isolate* isolate, bool keep_context_alive) {
     // context and SourceGroup::Execute may execute a non-nestable task, e.g. a
     // stackless GC.
     global_context.Get(isolate)->Enter();
-    if (!options.isolate_sources[0].Execute(isolate)) success = false;
+    if (reprl_script.has_value()) {
+      if (!ExecuteReprlScript(isolate, *reprl_script)) success = false;
+    } else {
+      if (!options.isolate_sources[0].Execute(isolate)) success = false;
+    }
     global_context.Get(isolate)->Exit();
   }
   if (!FinishExecuting(isolate, global_context)) success = false;
@@ -8104,10 +8321,18 @@ void Shell::AddRunningWorker(std::shared_ptr<Worker> worker) {
   running_workers_.insert(worker);
 }
 
-void Shell::RemoveRunningWorker(const std::shared_ptr<Worker>& worker) {
+void Shell::RemoveRunningWorker(std::shared_ptr<Worker> worker) {
   base::MutexGuard lock_guard(workers_mutex_.Pointer());
-  auto it = running_workers_.find(worker);
-  if (it != running_workers_.end()) running_workers_.erase(it);
+  running_workers_.erase(worker);
+  // Drop the caller's reference while still holding the workers_mutex_. If this
+  // was the last reference, the Worker is destroyed here on the worker thread.
+  // Doing this under the mutex ensures that the destruction (including freeing
+  // any ArrayBuffer backing stores still held in its message queues) happens
+  // before WaitForRunningWorkers() acquires the mutex on the main thread, and
+  // therefore before V8 is disposed. Otherwise, the worker would no longer be
+  // in running_workers_, so the main thread would not join its thread, and the
+  // destruction could race with V8::Dispose().
+  worker.reset();
 }
 
 void Shell::WaitForRunningWorkers(const i::ParkedScope& parked) {
@@ -8185,14 +8410,17 @@ int Shell::Main(int argc, char* argv[]) {
   ConfigurePartitionAllocIfEnabled();
   v8::base::EnsureConsoleOutput();
 
-  // TODO(40925855): Enable this more broadly outside of d8. Android is
-  // disabled for now as test bots run OS versions <17 that do not support the
-  // user space zero segment.
+  // TODO(40925855): Enable this more broadly outside of d8.
+  // - Android is disabled for now as test bots run OS versions <17 that do not
+  //   support the user space zero segment.
+  // - Windows is disabled because 64-bit bottom-up ASLR can place early OS
+  //   mappings in [2GB, 4GB) before PartitionAlloc initializes.
 #if defined(V8_ENABLE_PARTITION_ALLOC)
-#if PA_BUILDFLAG(ENABLE_USER_SPACE_ZERO_SEGMENT) && !defined(V8_OS_ANDROID)
-  i::v8_flags.sandbox_prohibit_insecure_mode = true;
+#if PA_BUILDFLAG(ENABLE_USER_SPACE_ZERO_SEGMENT) && !defined(V8_OS_ANDROID) && \
+    !defined(V8_OS_WIN)
+  i::v8_flags.sandbox_prohibit_insecure_mode.Set(true);
 #endif  // PA_BUILDFLAG(ENABLE_USER_SPACE_ZERO_SEGMENT) &&
-        // !defined(V8_OS_ANDROID)
+        // !defined(V8_OS_ANDROID) && !defined(V8_OS_WIN)
 #endif  // defined(V8_ENABLE_PARTITION_ALLOC)
 
   if (!v8::Shell::SetOptions(argc, argv)) return 1;
@@ -8321,10 +8549,10 @@ int Shell::Main(int argc, char* argv[]) {
   // Disable flag freezing if we are producing a code cache, because for that we
   // modify v8_flags.hash_seed (below).
   if (options.code_cache_options != ShellOptions::kNoProduceCache) {
-    i::v8_flags.freeze_flags_after_init = false;
+    i::v8_flags.freeze_flags_after_init.Set(false);
   }
 
-#ifdef V8_FUZZILLI
+#if defined(V8_FUZZILLI) || defined(V8_REDLINE)
   // IMPORTANT: order-sensitive, see cov.cc. With inline-bool-flag coverage,
   // the coverage of crashing executions has to be flushed from signal handlers.
   // They must be installed after the in-process stack dumping handlers
@@ -8334,7 +8562,7 @@ int Shell::Main(int argc, char* argv[]) {
   // handler (installed below), which forwards non-Wasm faults to the previous
   // handler.
   sanitizer_cov_install_crash_flush_handlers();
-#endif  // V8_FUZZILLI
+#endif  // defined(V8_FUZZILLI) || defined(V8_REDLINE)
 
   v8::V8::Initialize();
   if (options.snapshot_blob) {
@@ -8434,7 +8662,7 @@ int Shell::Main(int argc, char* argv[]) {
 
   Isolate* isolate = Isolate::New(create_params);
 
-#ifdef V8_FUZZILLI
+#if defined(V8_FUZZILLI) || defined(V8_REDLINE)
 
   if (options.fuzzilli_enable_builtins_coverage) {
     uint32_t count = i::BasicBlockProfiler::Get()->GetBuiltinsBlockCount(
@@ -8445,7 +8673,11 @@ int Shell::Main(int argc, char* argv[]) {
   }
 
   if (i::v8_flags.fuzzilli_enable_optimized_code_coverage) {
+#if defined(V8_REDLINE)
+    cov_init_optimized_code_edges(kRedlineNumOptimizedCodeEdges);
+#else
     cov_init_optimized_code_edges(kFuzzilliNumOptimizedCodeEdges);
+#endif  // defined(V8_REDLINE)
   }
 
   // Let the parent process (Fuzzilli) know we are ready.
@@ -8457,7 +8689,7 @@ int Shell::Main(int argc, char* argv[]) {
   if (memcmp(helo, "HELO", 4) != 0) {
     FATAL("REPRL: Invalid response from parent");
   }
-#endif  // V8_FUZZILLI
+#endif  // defined(V8_FUZZILLI) || defined(V8_REDLINE)
 
   {
     Isolate::Scope scope(isolate);
@@ -8477,13 +8709,12 @@ int Shell::Main(int argc, char* argv[]) {
 
     // Fuzzilli REPRL = read-eval-print-loop
     do {
-#if defined(V8_FUZZILLI) || defined(V8_DUMPLING)
+#ifdef V8_DUMPLING
       v8::internal::Isolate* internal_isolate =
           reinterpret_cast<v8::internal::Isolate*>(isolate);
-#endif  // defined(V8_FUZZILLI) || defined(V8_DUMPLING)
-#ifdef V8_FUZZILLI
-      internal_isolate->descriptor_lookup_cache()->Clear();
-      internal_isolate->compilation_cache()->Clear();
+#endif  // V8_DUMPLING
+#if defined(V8_FUZZILLI) || defined(V8_REDLINE)
+      ResetIsolateStateForReprl(isolate);
       if (fuzzilli_reprl) {
         unsigned action = 0;
         ssize_t nread = read(REPRL_CRFD, &action, 4);
@@ -8497,7 +8728,7 @@ int Shell::Main(int argc, char* argv[]) {
         // every execution.)
         sanitizer_cov_discard_bool_flags();
       }
-#endif  // V8_FUZZILLI
+#endif  // defined(V8_FUZZILLI) || defined(V8_REDLINE)
 #ifdef V8_DUMPLING
       // TODO(mdanylo): ideally this should be a part of fd-based protocol
       // between Fuzzilli and V8.
@@ -8563,10 +8794,10 @@ int Shell::Main(int argc, char* argv[]) {
               Isolate::CreateParams create_params2 =
                   GetDefaultIsolateCreateParams();
               // Use a different hash seed.
-              i::v8_flags.hash_seed = i::v8_flags.hash_seed ^ 1337;
+              i::v8_flags.hash_seed.Overwrite(i::v8_flags.hash_seed ^ 1337);
               Isolate* isolate2 = Isolate::New(create_params2);
               // Restore old hash seed.
-              i::v8_flags.hash_seed = i::v8_flags.hash_seed ^ 1337;
+              i::v8_flags.hash_seed.Overwrite(i::v8_flags.hash_seed ^ 1337);
               {
                 Isolate::Scope isolate_scope(isolate2);
                 D8Console* console2 = cppgc::MakeGarbageCollected<D8Console>(
@@ -8603,6 +8834,8 @@ int Shell::Main(int argc, char* argv[]) {
         result = RunMain(isolate, /*last_run=*/true);
         options.compile_options.Overwrite(
             v8::ScriptCompiler::kNoCompileOptions);
+      } else if (options.bundle_reprl && !fuzzilli_reprl) {
+        result = RunBundleReprl(isolate);
       } else {
         result = RunMain(isolate, /*last_run=*/true);
       }
@@ -8635,7 +8868,7 @@ int Shell::Main(int argc, char* argv[]) {
       }
 #endif  // V8_DUMPLING
 
-#ifdef V8_FUZZILLI
+#if defined(V8_FUZZILLI) || defined(V8_REDLINE)
       if (Shell::fuzzilli_reprl_failed_) {
         result = 1;
         Shell::fuzzilli_reprl_failed_ = false;
@@ -8687,7 +8920,7 @@ int Shell::Main(int argc, char* argv[]) {
         CHECK_EQ(write(REPRL_CWFD, &status, 4), 4);
         sanitizer_cov_reset_edgeguards();
       }
-#endif  // V8_FUZZILLI
+#endif  // defined(V8_FUZZILLI) || defined(V8_REDLINE)
     } while (fuzzilli_reprl);
 
     // Shut down contexts and collect garbage.

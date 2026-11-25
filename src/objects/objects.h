@@ -424,9 +424,14 @@ class Object : public AllStatic {
 
   V8_WARN_UNUSED_RESULT static MaybeHandle<JSAny> GetPropertyWithAccessor(
       LookupIterator* it);
+  V8_WARN_UNUSED_RESULT static MaybeHandle<JSAny> GetPropertyWithAccessor(
+      LookupIterator* it, DirectHandle<AccessorInfo> info);
   V8_WARN_UNUSED_RESULT static Maybe<bool> SetPropertyWithAccessor(
-      LookupIterator* it, DirectHandle<Object> value,
-      Maybe<ShouldThrow> should_throw);
+      LookupIterator* it, DirectHandle<Object> structure,
+      DirectHandle<Object> value, Maybe<ShouldThrow> should_throw);
+  V8_WARN_UNUSED_RESULT static Maybe<bool> SetPropertyWithAccessor(
+      LookupIterator* it, DirectHandle<AccessorInfo> info,
+      DirectHandle<Object> value, Maybe<ShouldThrow> should_throw);
 
   V8_WARN_UNUSED_RESULT static MaybeHandle<JSAny> GetPropertyWithDefinedGetter(
       DirectHandle<JSAny> receiver, DirectHandle<JSReceiver> getter);
@@ -740,23 +745,6 @@ class Relocatable {
  private:
   Isolate* isolate_;
   Relocatable* prev_;
-};
-
-// BooleanBit is a helper class for setting and getting a bit in an integer.
-class BooleanBit : public AllStatic {
- public:
-  static inline bool get(int value, int bit_position) {
-    return (value & (1 << bit_position)) != 0;
-  }
-
-  static inline int set(int value, int bit_position, bool v) {
-    if (v) {
-      value |= (1 << bit_position);
-    } else {
-      value &= ~(1 << bit_position);
-    }
-    return value;
-  }
 };
 
 // This is an RAII helper class to emit a store-store memory barrier when

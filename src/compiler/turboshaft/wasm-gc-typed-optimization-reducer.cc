@@ -433,25 +433,8 @@ void WasmGCTypeAnalyzer::ProcessAllocateStruct(
 
 wasm::ValueType WasmGCTypeAnalyzer::GetTypeForPhiInput(const PhiOp& phi,
                                                        int input_index) {
-  OpIndex phi_id = graph_.Index(phi);
-  OpIndex raw_input = phi.input(input_index);
-  // If the un-aliased input of the phi is in the same block as the phi and
-  // appears before the phi, don't use the predecessor value. Note that we must
-  // check the un-aliased input, as resolving aliases first could incorrectly
-  // map a backedge input (e.g. a cast in the loop body) to an operation in the
-  // loop header.
-  if (current_block_->begin().id() <= raw_input.id() &&
-      raw_input.id() < phi_id.id()) {
-    // Phi instructions have to be at the beginning of the block, so this can
-    // only happen for inputs that are also phis. Furthermore, this is only
-    // possible in loop headers of loops and only for the backedge-input.
-    DCHECK(graph_.Get(raw_input).Is<PhiOp>());
-    DCHECK(current_block_->IsLoop());
-    DCHECK_EQ(input_index, 1);
-    return types_table_.Get(raw_input);
-  }
-  OpIndex input = ResolveAliases(raw_input);
-  return types_table_.GetPredecessorValue(input, input_index);
+  return types_table_.GetPredecessorValue(
+      ResolveAliases(phi.input(input_index)), input_index);
 }
 
 void WasmGCTypeAnalyzer::ProcessPhi(const PhiOp& phi) {
@@ -513,11 +496,11 @@ void WasmGCTypeAnalyzer::ProcessBranchOnTarget(const BranchOp& branch,
         RefineTypeKnowledge(check.object(), check.config.to, branch);
       } else {
         DCHECK_EQ(branch.if_false, &target);
-        if (wasm::IsSubtypeOf(GetResolvedType(check.object()), check.config.to,
-                              module_) &&
+        wasm::ValueType type = GetResolvedType(check.object());
+        if (wasm::IsSubtypeOf(type, check.config.to, module_) &&
             // When checking for a particular custom descriptor, static types
             // cannot predict the outcome.
-            !(IsCastToCustomDescriptor(module_, check.config))) {
+            !IsCastToCustomDescriptor(module_, check.config)) {
           // The type check always succeeds, the target is impossible to be
           // reached.
           DCHECK_EQ(target.PredecessorCount(), 1);
@@ -529,8 +512,23 @@ void WasmGCTypeAnalyzer::ProcessBranchOnTarget(const BranchOp& branch,
               OpcodeName(condition.opcode), graph_.Index(branch).id(),
               OpcodeName(branch.opcode));
           RefineTypeKnowledge(check.object(), wasm::kWasmBottom, branch);
-        } else if (check.config.to.is_nullable()) {
-          RefineTypeKnowledgeNotNull(check.object(), branch);
+          return;
+        }
+        if (type != wasm::ValueType() && !type.is_uninhabited()) {
+          if (check.config.to.is_nullable()) {
+            type = type.AsNonNull();
+          }
+          if (check.config.to.can_be_i31()) {
+            type = type.AsNonI31();
+          }
+          if (!IsCastToCustomDescriptor(module_, check.config) &&
+              wasm::IsHeapSubtypeOf(type.AsNonI31().heap_type(),
+                                    check.config.to.heap_type(), module_)) {
+            type = wasm::ToNullSentinel({type, module_})
+                       .AsNullable(type.nullability())
+                       .AsCanBeI31(type.can_be_i31());
+          }
+          RefineTypeKnowledge(check.object(), type, branch);
         }
       }
     } break;

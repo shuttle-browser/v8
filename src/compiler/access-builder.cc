@@ -254,7 +254,7 @@ FieldAccess AccessBuilder::ForJSExternalObjectValue() {
   return access;
 }
 
-#ifdef V8_ENABLE_SANDBOX
+#ifdef V8_COMPRESS_POINTERS
 // static
 FieldAccess AccessBuilder::ForJSExternalObjectPointerHandle() {
   FieldAccess access = {kTaggedBase,
@@ -437,16 +437,6 @@ FieldAccess AccessBuilder::ForJSGeneratorObjectResumeMode() {
       Handle<Name>(),      OptionalMapRef(),
       Type::SignedSmall(), MachineType::TaggedSigned(),
       kNoWriteBarrier,     "JSGeneratorObjectResumeMode"};
-  return access;
-}
-
-// static
-FieldAccess AccessBuilder::ForJSGeneratorObjectYieldedValue() {
-  FieldAccess access = {
-      kTaggedBase,       offsetof(JSGeneratorObject, yielded_value_),
-      Handle<Name>(),    OptionalMapRef(),
-      Type::Any(),       MachineType::AnyTagged(),
-      kFullWriteBarrier, "JSGeneratorObjectYieldedValue"};
   return access;
 }
 

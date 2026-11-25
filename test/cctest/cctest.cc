@@ -56,7 +56,6 @@
 #include "test/cctest/heap/heap-utils.h"
 #include "test/cctest/print-extension.h"
 #include "test/cctest/profiler-extension.h"
-#include "test/cctest/trace-extension.h"
 
 #ifdef V8_USE_PERFETTO
 #include "src/tracing/trace-event.h"
@@ -138,7 +137,7 @@ void CcTest::Run(const char* snapshot_directory) {
                                custom_v8_flags_.length());
   }
   // TODO(12887): Fix tests to avoid changing flag values after initialization.
-  i::v8_flags.freeze_flags_after_init = false;
+  i::v8_flags.freeze_flags_after_init.Set(false);
 
   v8::V8::Initialize();
   v8::V8::InitializeExternalStartupData(snapshot_directory);
@@ -155,7 +154,6 @@ void CcTest::Run(const char* snapshot_directory) {
 
   v8::RegisterExtension(std::make_unique<i::PrintExtension>());
   v8::RegisterExtension(std::make_unique<i::ProfilerExtension>());
-  v8::RegisterExtension(std::make_unique<i::TraceExtension>());
 
   if (!initialize_) {
     CHECK_NE(initialization_state_, kInitialized);

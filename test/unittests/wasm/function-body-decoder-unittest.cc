@@ -3177,7 +3177,8 @@ TEST_F(FunctionBodyDecoderTest, MultiValLoop1) {
                               kExprI32Add});
   ExpectFailure(
       sigs.i_ii(),
-      {WASM_LOOP_X(sig0, WASM_LOCAL_GET(0), WASM_LOCAL_GET(1)), kExprF32Add});
+      {WASM_LOOP_X(sig0, WASM_LOCAL_GET(0), WASM_LOCAL_GET(1)), kExprF32Add},
+      kAppendEnd, "f32.add[0] expected type f32, found loop of type i32");
 }
 
 TEST_F(FunctionBodyDecoderTest, MultiValIf) {
@@ -4042,6 +4043,11 @@ TEST_F(FunctionBodyDecoderTest, BrOnNonNull) {
     // br_on_non_null does not leave a value on the stack.
     ExpectFailure(&sig, {WASM_BR_ON_NON_NULL(0, WASM_LOCAL_GET(0))}, kAppendEnd,
                   "expected 1 elements on the stack for fallthru, found 0");
+
+    // Target branch must have arity >= 1.
+    ExpectFailure(FunctionSig::Build(this->zone(), {}, {reps[1]}),
+                  {WASM_BR_ON_NON_NULL(0, WASM_LOCAL_GET(0))}, kAppendEnd,
+                  "br_on_non_null must target a branch of arity at least 1");
   }
 }
 
@@ -4579,6 +4585,20 @@ TEST_F(FunctionBodyDecoderTest, BrOnCastOrCastFail) {
       {WASM_LOCAL_GET(0), WASM_BR_ON_CAST(0, super_struct, sub_struct)},
       kAppendEnd,
       "type error in fallthru[0] (expected (ref null 1), got (ref null 0))");
+  ExpectFailure(
+      FunctionSig::Build(this->zone(), {subtype}, {subtype}),
+      {WASM_BLOCK_R(supertype, WASM_LOCAL_GET(0),
+                    WASM_BR_ON_CAST_FAIL_NULL(0, super_struct, super_struct),
+                    WASM_RETURN0)},
+      kAppendEnd,
+      "type error in return[0] (expected (ref null 1), got (ref null 0))");
+  ExpectFailure(
+      FunctionSig::Build(this->zone(), {subtype}, {subtype.AsNonNull()}),
+      {WASM_BLOCK_R(supertype, WASM_LOCAL_GET(0),
+                    WASM_BR_ON_CAST_FAIL(0, super_struct, super_struct),
+                    WASM_RETURN0)},
+      kAppendEnd,
+      "type error in return[0] (expected (ref null 1), got (ref 0))");
   ExpectFailure(
       FunctionSig::Build(this->zone(), {supertype}, {supertype}),
       {WASM_BLOCK_I(WASM_LOCAL_GET(0),

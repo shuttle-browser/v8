@@ -2673,14 +2673,16 @@ bool ParserBase<Impl>::ParseAccessorPropertyOrAutoAccessors(
   // Initializer[~In, ?Yield, ?Await]opt ;
   Consume(Token::kAccessor);
   *name_token_position = scanner()->peek_location().beg_pos;
+  // Ordinary fields and methods named "accessor" allow a line terminator.
+  if (ParseCurrentSymbolAsClassFieldOrMethod(prop_info, name_expression)) {
+    return true;
+  }
   // If there is a line terminator here, it cannot be an auto-accessor.
-  if (scanner()->HasLineTerminatorBeforeNext()) {
+  if (scanner()->HasLineTerminatorBeforeNext() ||
+      V8_UNLIKELY(scanner()->literal_contains_escapes())) {
     prop_info->kind = ParsePropertyKind::kClassField;
     prop_info->name = impl()->GetIdentifier();
     *name_expression = factory()->NewStringLiteral(prop_info->name, position());
-    return true;
-  }
-  if (ParseCurrentSymbolAsClassFieldOrMethod(prop_info, name_expression)) {
     return true;
   }
   *name_expression = ParseProperty(prop_info);
@@ -6469,9 +6471,14 @@ typename ParserBase<Impl>::StatementT ParserBase<Impl>::ParseSwitchStatement(
     Scope* switch_scope = scope()->FinalizeBlockScope();
     if (switch_scope != nullptr) {
       // Switch scopes are nonlinear, so we need to set the initializer position
-      // to kMaxInt to prevent hole checks from being elided.
+      // to kMaxInt and force hole initialization for lexical variables to
+      // prevent hole checks and TDZ hole initialization from being elided.
       for (Variable* var : *switch_scope->locals()) {
         var->set_initializer_position(kMaxInt);
+        if (var->initialization_flag() == kNeedsInitialization) {
+          var->ForceHoleInitialization(
+              Variable::kHasHoleCheckUseInSameClosureScope);
+        }
       }
       return impl()->RewriteSwitchStatement(switch_statement, switch_scope);
     }

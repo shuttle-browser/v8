@@ -683,7 +683,6 @@ class JSObjectRef : public JSReceiverRef {
   // background-serialized) elements.
   OptionalFixedArrayBaseRef elements(JSHeapBroker* broker,
                                      RelaxedLoadTag) const;
-  bool IsElementsTenured(FixedArrayBaseRef elements);
 
   OptionalMapRef GetObjectCreateMap(JSHeapBroker* broker) const;
 
@@ -809,7 +808,7 @@ class ContextCellRef : public HeapObjectRef {
   OptionalObjectRef tagged_value(JSHeapBroker* broker) const;
 };
 
-class ContextRef : public HeapObjectRef {
+class V8_EXPORT_PRIVATE ContextRef : public HeapObjectRef {
  public:
   DEFINE_REF_CONSTRUCTOR(Context, HeapObjectRef)
 
@@ -873,7 +872,7 @@ class ContextRef : public HeapObjectRef {
   V(Map, with_context_map)                       \
   V(ScriptContextTable, script_context_table)
 
-class NativeContextRef : public ContextRef {
+class V8_EXPORT_PRIVATE NativeContextRef : public ContextRef {
  public:
   DEFINE_REF_CONSTRUCTOR(NativeContext, ContextRef)
 
@@ -941,8 +940,6 @@ class FeedbackVectorRef : public HeapObjectRef {
 
   FeedbackCellRef GetClosureFeedbackCell(JSHeapBroker* broker, int index) const;
 
-  bool was_once_deoptimized() const;
-
   HeapObjectRef GetClosureFeedbackCellArrayRef(JSHeapBroker* broker);
 };
 
@@ -960,7 +957,6 @@ class AllocationSiteRef : public HeapObjectRef {
   IndirectHandle<AllocationSite> object() const;
 
   bool PointsToLiteral() const;
-  AllocationType GetAllocationType() const;
   ObjectRef nested_site(JSHeapBroker* broker) const;
 
   OptionalJSObjectRef boilerplate(JSHeapBroker* broker) const;
@@ -1011,6 +1007,7 @@ class V8_EXPORT_PRIVATE MapRef : public HeapObjectRef {
   int construction_counter() const;
   bool is_migration_target() const;
   bool is_extensible() const;
+  bool is_prototype_map() const;
   bool supports_fast_array_iteration(JSHeapBroker* broker) const;
   bool supports_fast_array_resize(JSHeapBroker* broker) const;
   bool is_abandoned_prototype_map() const;
@@ -1057,6 +1054,8 @@ class V8_EXPORT_PRIVATE MapRef : public HeapObjectRef {
   MapRef FindRootMap(JSHeapBroker* broker) const;
   OptionalObjectRef GetConstructor(JSHeapBroker* broker) const;
   NativeContextRef native_context(JSHeapBroker* broker) const;
+  bool BelongsToSameNativeContextAs(JSHeapBroker* broker,
+                                    ContextRef context) const;
 };
 
 struct HolderLookupResult {
@@ -1287,7 +1286,7 @@ class V8_EXPORT_PRIVATE SharedFunctionInfoRef : public HeapObjectRef {
   }
 };
 
-class StringRef : public NameRef {
+class V8_EXPORT_PRIVATE StringRef : public NameRef {
  public:
   DEFINE_REF_CONSTRUCTOR(String, NameRef)
 
@@ -1310,11 +1309,11 @@ class StringRef : public NameRef {
   std::optional<double> ToNumber(JSHeapBroker* broker);
   std::optional<double> ToInt(JSHeapBroker* broker, int radix);
 
-  V8_EXPORT_PRIVATE bool IsSeqString() const;
+  bool IsSeqString() const;
   bool IsExternalString() const;
 
   bool IsContentAccessible() const;
-  V8_EXPORT_PRIVATE bool IsOneByteRepresentation() const;
+  bool IsOneByteRepresentation() const;
 
  private:
   // With concurrent inlining on, we currently support reading directly
@@ -1401,8 +1400,8 @@ class JSGlobalObjectRef : public JSObjectRef {
   bool IsDetachedFrom(JSGlobalProxyRef proxy) const;
 
   // Can be called even when there is no property cell for the given name.
-  OptionalPropertyCellRef GetPropertyCell(JSHeapBroker* broker,
-                                          NameRef name) const;
+  OptionalPropertyCellRef GetPropertyCell(JSHeapBroker* broker, NameRef name,
+                                          AccessMode access_mode) const;
 };
 
 class JSGlobalProxyRef : public JSObjectRef {

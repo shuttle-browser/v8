@@ -1602,10 +1602,15 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
       }
 
       DCHECK(v8_flags.verify_write_barriers);
-      auto ool = zone()->New<OutOfLineVerifySkippedWriteBarrier>(
-          this, object, value, kScratchReg, &unwinding_info_writer_);
-      __ JumpIfNotSmi(value, ool->entry());
-      __ bind(ool->exit());
+      if (CheckSmiField::decode(instr->opcode())) {
+        Condition is_smi = __ CheckSmi(value);
+        __ Check(is_smi, AbortReason::kTaggedSignedNotSmi);
+      } else {
+        auto ool = zone()->New<OutOfLineVerifySkippedWriteBarrier>(
+            this, object, value, kScratchReg, &unwinding_info_writer_);
+        __ JumpIfNotSmi(value, ool->entry());
+        __ bind(ool->exit());
+      }
 
       __ StoreTaggedField(value, operand, r0);
       break;
@@ -2433,6 +2438,26 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
     case kS390_StoreWord64:
       ASSEMBLE_STORE_INTEGER(StoreU64);
       break;
+    case kS390_AtomicStoreCompressTagged: {
+      AddressingMode addressing_mode = kMode_None;
+      size_t index = 0;
+      MemOperand operand = i.MemoryOperand(&addressing_mode, &index);
+      Register value = i.InputRegister(index);
+      Register old_value = i.TempRegister(0);
+      __ lay(r1, operand);
+      Label do_cs;
+      if constexpr (COMPRESS_POINTERS_BOOL) {
+        __ LoadU32(old_value, MemOperand(r1));
+        __ bind(&do_cs);
+        __ cs(old_value, value, MemOperand(r1));
+      } else {
+        __ lg(old_value, MemOperand(r1));
+        __ bind(&do_cs);
+        __ csg(old_value, value, MemOperand(r1));
+      }
+      __ bne(&do_cs, Label::kNear);
+      break;
+    }
     case kS390_StoreReverse16:
       ASSEMBLE_STORE_INTEGER(strvh);
       break;
@@ -3811,7 +3836,8 @@ AllocatedOperand CodeGenerator::Push(InstructionOperand* source) {
 void CodeGenerator::Pop(InstructionOperand* dest, MachineRepresentation rep) {
   int dropped_slots = ElementSizeInPointers(rep);
   S390OperandConverter g(this, nullptr);
-  if (dest->IsFloatStackSlot() || dest->IsDoubleStackSlot()) {
+  if ((dest->IsFloatStackSlot() || dest->IsDoubleStackSlot()) &&
+      dropped_slots == 1) {
     frame_access_state()->IncreaseSPDelta(-dropped_slots);
     __ Pop(r1);
     __ StoreU64(r1, g.ToMemOperand(dest));
@@ -3823,6 +3849,7 @@ void CodeGenerator::Pop(InstructionOperand* dest, MachineRepresentation rep) {
     __ lay(sp, MemOperand(sp, dropped_slots * kSystemPointerSize));
   }
   temp_slots_ -= dropped_slots;
+  DCHECK_GE(temp_slots_, 0);
 }
 
 void CodeGenerator::PopTempStackSlots() {

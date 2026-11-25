@@ -17,6 +17,7 @@
 #include "experimental/redline/base/json.h"
 #include "experimental/redline/core/program.h"
 #include "experimental/redline/corpus/corpus.h"
+#include "experimental/redline/corpus/feature_weights.h"
 #include "experimental/redline/engine/amplifier.h"
 #include "experimental/redline/engine/config.h"
 #include "experimental/redline/engine/crash.h"
@@ -51,12 +52,17 @@ struct FuzzerStats {
   std::atomic<uint64_t> imports_redundant{0};  // ran fine, no new edges
   std::atomic<uint64_t> unique_crashes{0};  // crashes reaching new crash edges
   std::atomic<uint64_t> duplicate_crashes{0};
+  // Crashes of minimizer probes and determinism reruns (--harvest-crashes).
+  std::atomic<uint64_t> harvested_crashes{0};
   std::atomic<uint64_t> crash_signatures{0};    // distinct signatures so far
   std::atomic<uint64_t> crashes_reproduced{0};  // reproduced in a fresh target
   std::atomic<uint64_t> crashes_state_dependent{0};  // only with history
   std::atomic<uint64_t> crashes_amplified{0};  // reproduced by the amplify step
   std::atomic<uint64_t> amplify_processes{
       0};  // plain d8 runs of the amplify step
+  // State-dependent crashes whose NAME.bundle.js crashed in a plain d8 run.
+  std::atomic<uint64_t> crashes_bundled{0};
+  std::atomic<uint64_t> bundle_processes{0};  // plain d8 runs of the bundles
   std::atomic<uint64_t> crash_replay_executions{0};  // spent on history replays
   std::atomic<uint64_t> minimizer_tests{0};
   std::atomic<uint64_t> minimizer_time_us{0};
@@ -113,6 +119,20 @@ class Fuzzer {
   // The per-component tables (mutators, reducers, scheduler, generators).
   std::string ComponentTables(bool include_generators) const;
 
+  // Target-guided `d8` flag state for change-based fuzzing.
+  void SetTargetsForTest(std::vector<std::pair<uint32_t, double>> targets) {
+    targets_ = std::move(targets);
+  }
+  void RecordTargetFlags(const std::vector<std::string>& args, double score);
+  void RecordTargetChild(bool hit);
+  std::vector<std::string> DrawD8Flags(Random& rng);
+  uint64_t target_children_completed() const {
+    return target_children_completed_.load(std::memory_order_acquire);
+  }
+  uint64_t target_children_hit() const {
+    return target_children_hit_.load(std::memory_order_acquire);
+  }
+
  private:
   friend class Worker;
 
@@ -120,6 +140,10 @@ class Fuzzer {
   void WriteStatsEvent();
   bool ShouldStop() const;
   void CollectImports();
+  // Builds the feature weights after the workers started (coverage counters
+  // only). `targets_code_edges` is the code edge count of the targets file.
+  bool InitializeFeatureWeights(uint32_t targets_code_edges,
+                                std::string* error);
   bool SaveCorpusProgram(const Program& program);
   // Saves the programs of a stage that matched its capture rule (see
   // engine/stages.h) under out_dir/captures/<stage>/. Returns false once
@@ -141,6 +165,45 @@ class Fuzzer {
   std::mutex failure_mutex_;
 
   SharedCoverage coverage_;
+  // Coverage counters and change-based fuzzing (exec/coverage.h): the targets
+  // of --targets, the weight table that the rarity strategy reads, and the
+  // feature ranges for the statistics. Empty without coverage counters.
+  std::vector<std::pair<uint32_t, double>> targets_;
+  FeatureWeights::EdgeRanges focus_;
+  std::unique_ptr<FeatureWeights> feature_weights_;
+  // Change-based fuzzing with a focus: removes the features outside the focus
+  // from the new features of a program. They stay claimed, so they do not
+  // count again. Returns false if no feature is left (the program is not kept).
+  bool KeepFocused(std::vector<uint32_t>* claimed);
+  // Programs and features that KeepFocused() removed.
+  std::atomic<uint64_t> unfocused_programs_{0};
+  std::atomic<uint64_t> unfocused_features_{0};
+  struct CoverageGeometry {
+    bool counters = false;
+    uint32_t optimized_first = 0;
+    uint32_t optimized_count = 0;
+    uint32_t bucket_first = 0;
+    uint32_t features = 0;
+    uint32_t watched = 0;
+  } geometry_;
+  // " | focus x/y | target x/y | opt n | buckets n" for the status line.
+  // Empty without coverage counters and without optimized code features.
+  // AddCoverageStats() adds the same numbers to an event.
+  std::string CoverageStatus() const;
+  void AddCoverageStats(JsonObject* event) const;
+  // Number of focus edges that the session reached.
+  uint32_t FocusSeen() const;
+  // Target-guided d8 flag pool for change-based fuzzing with
+  // randomize_d8_flags.
+  struct TargetFlagEntry {
+    std::vector<std::string> args;
+    double score = 0;
+  };
+  std::mutex target_flags_mutex_;
+  std::vector<TargetFlagEntry> target_flags_;
+  std::atomic<bool> has_target_flags_{false};
+  std::atomic<uint64_t> target_children_completed_{0};
+  std::atomic<uint64_t> target_children_hit_{0};
   std::unique_ptr<Corpus> corpus_;
   std::unique_ptr<MutatorSet> mutators_;
   std::unique_ptr<GeneratorSet> generators_;

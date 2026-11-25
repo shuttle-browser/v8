@@ -82,7 +82,7 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   enum class AllocationFlag : uint8_t {
     kNone = 0,
     kDoubleAlignment = 1,
-    kPretenured = 1 << 1
+    kOld = 1 << 1
   };
 
   enum SlackTrackingMode {
@@ -338,10 +338,32 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
     // This node makes the graph platform-specific. To make sure that the graph
     // structure is still platform independent, UniqueIntPtrConstants are used
     // here.
-#if V8_TARGET_ARCH_ARM64
+#if V8_TARGET_ARCH_ARM64 || V8_X64_16BYTE_STACK_ALIGNMENT
     return UniqueIntPtrConstant(16);
 #else
     return UniqueIntPtrConstant(kSystemPointerSize);
+#endif
+  }
+
+  // Number of fixed slots that Builtins::Generate_WasmToJsWrapperAsm pushes
+  // between the caller's return address and the spilled GP parameter
+  // registers. The first fixed slot is the signature slot
+  // (WasmToJSWrapperConstants::kSignatureOffset).
+  //  - arm64 pushes one extra padding slot to keep sp 16-byte aligned (all
+  //    pushes there come in pairs).
+  //  - x64 never needs a padding slot, not even with
+  //    V8_X64_16BYTE_STACK_ALIGNMENT: the area it pushes (1 signature slot +
+  //    5 GP param registers + 6 FP param registers = 12 slots) is already an
+  //    even number of slots, so the return address stays at the same
+  //    alignment as on entry and the callee's rbp stays 16-byte aligned.
+  // This must stay in sync with the asm builtins and with {size_of_sig} in
+  // TypedFrame::IterateParamsOfGenericWasmToJSWrapper (frames.cc).
+  TNode<IntPtrT> WasmToJSWrapperFixedSlotCount() {
+    // See StackAlignmentInBytes for why UniqueIntPtrConstant is used.
+#if V8_TARGET_ARCH_ARM64
+    return UniqueIntPtrConstant(2);
+#else
+    return UniqueIntPtrConstant(1);
 #endif
   }
 
@@ -780,6 +802,51 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
     return value.value();
   }
 
+  TNode<BoolT> LogicalOr(TNode<BoolT> left, TNode<BoolT> right) {
+    return Word32Or(left, right);
+  }
+
+  TNode<BoolT> LogicalOr(TNode<BoolT> left, const NodeGenerator<BoolT>& right) {
+    return Select<BoolT>(left, [this] { return Int32TrueConstant(); }, right);
+  }
+
+  TNode<BoolT> LogicalAnd(TNode<BoolT> left, TNode<BoolT> right) {
+    return Word32And(left, right);
+  }
+
+  TNode<BoolT> LogicalAnd(TNode<BoolT> left,
+                          const NodeGenerator<BoolT>& right) {
+    return Select<BoolT>(left, right, [this] { return Int32FalseConstant(); });
+  }
+
+  // Variadic version of LogicalOr. Callable arguments are short-circuited.
+  template <typename First, typename Second, typename... Rest>
+  TNode<BoolT> LogicalAny(First&& first, Second&& second, Rest&&... rest) {
+    TNode<BoolT> first_node;
+    if constexpr (std::invocable<First>) {
+      first_node = std::forward<First>(first)();
+    } else {
+      first_node = first;
+    }
+    if constexpr (!std::invocable<Second>) {
+      if constexpr (sizeof...(Rest) == 0) {
+        return LogicalOr(first_node, second);
+      } else {
+        return LogicalAny(LogicalOr(first_node, second),
+                          std::forward<Rest>(rest)...);
+      }
+    } else {
+      return LogicalOr(first_node, [&]() {
+        if constexpr (sizeof...(Rest) == 0) {
+          return std::forward<Second>(second)();
+        } else {
+          return LogicalAny(std::forward<Second>(second)(),
+                            std::forward<Rest>(rest)...);
+        }
+      });
+    }
+  }
+
   template <class A>
   TNode<A> SelectConstant(TNode<BoolT> condition, TNode<A> true_value,
                           TNode<A> false_value) {
@@ -1110,9 +1177,15 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   }
 
   TNode<RawPtrT> LoadExternalStringResourcePtr(TNode<ExternalString> object) {
-    return LoadExternalPointerFromObject(object,
-                                         offsetof(ExternalString, resource_),
-                                         kExternalStringResourceTag);
+    TNode<RawPtrT> wrapper = LoadCppHeapPointerFromObject(
+        object, offsetof(ExternalString, resource_),
+        kExternalStringResourceTag);
+    // The wrapper is only null while the string is being constructed, before
+    // it is visible to generated code.
+    CSA_DCHECK(this, WordNotEqual(wrapper, IntPtrConstant(kNullAddress)));
+    return Load<RawPtrT>(
+        wrapper, IntPtrConstant(
+                     Internals::kExternalStringResourceWrapperResourceOffset));
   }
 
   TNode<RawPtrT> LoadExternalStringResourceDataPtr(
@@ -1481,10 +1554,6 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   // is guaranteed to be computed, otherwise use LoadNameHash and handle the
   // non-computed case manually.
   TNode<Uint32T> LoadNameHashAssumeComputed(TNode<Name> name);
-
-  // Load the Name::RawHash() value of a name as an uint32 value. Follows
-  // through the forwarding table.
-  TNode<Uint32T> LoadNameRawHash(TNode<Name> name);
 
   // Load length field of a String object as Smi value.
   TNode<Smi> LoadStringLengthAsSmi(TNode<String> string);
@@ -2024,15 +2093,6 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
       WriteBarrierMode barrier_mode = UPDATE_WRITE_BARRIER,
       int additional_offset = 0);
 
-  void StoreSharedObjectField(TNode<HeapObject> object, TNode<IntPtrT> offset,
-                              TNode<Object> value);
-
-  void StoreJSSharedStructPropertyArrayElement(TNode<PropertyArray> array,
-                                               TNode<IntPtrT> index,
-                                               TNode<Object> value) {
-    StoreFixedArrayOrPropertyArrayElement(array, index, value);
-  }
-
   void StoreWeakFixedArrayElement(TNode<WeakFixedArray> array,
                                   TNode<IntPtrT> index,
                                   TNode<MaybeObject> value,
@@ -2290,6 +2350,8 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
                                   const Function& materialize_target,
                                   bool target_is_new);
 
+  TNode<BoolT> BelongsToSameNativeContextAs(TNode<Map> map,
+                                            TNode<Context> context);
   TNode<NativeContext> GetCreationContextFromMap(TNode<Map> map,
                                                  Label* if_bailout);
   TNode<NativeContext> GetCreationContext(TNode<JSReceiver> receiver,
@@ -2720,11 +2782,6 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
                                     TVariable<FixedArrayBase>* var_elements,
                                     TNode<BInt> growth, Label* bailout);
 
-  // Allocation site manipulation
-  void InitializeAllocationMemento(TNode<HeapObject> base,
-                                   TNode<IntPtrT> base_allocation_size,
-                                   TNode<AllocationSite> allocation_site);
-
   TNode<IntPtrT> TryTaggedToInt32AsIntPtr(TNode<Object> value,
                                           Label* if_not_possible);
   TNode<Float64T> TryTaggedToFloat64(TNode<Object> value,
@@ -2799,11 +2856,6 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
                       Label* if_not_bigint, Label* if_bigint,
                       Label* if_bigint64, TVariable<BigInt>* var_bigint,
                       TVariable<Smi>* var_feedback);
-
-  // Ensures that {var_shared_value} is shareable across Isolates, and throws if
-  // not.
-  void SharedValueBarrier(TNode<Context> context,
-                          TVariable<Object>* var_shared_value);
 
   TNode<WordT> TimesSystemPointerSize(TNode<WordT> value);
   TNode<IntPtrT> TimesSystemPointerSize(TNode<IntPtrT> value) {
@@ -2887,8 +2939,6 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   TNode<BoolT> InstanceTypeEqual(TNode<Int32T> instance_type, int type);
   TNode<BoolT> IsNoElementsProtectorCellInvalid();
   TNode<BoolT> IsMegaDOMProtectorCellInvalid();
-  TNode<BoolT> IsAlwaysSharedSpaceJSObjectInstanceType(
-      TNode<Int32T> instance_type);
   TNode<BoolT> IsArrayIteratorProtectorCellInvalid();
   TNode<BoolT> IsBigIntInstanceType(TNode<Int32T> instance_type);
   TNode<BoolT> IsBigInt(TNode<HeapObject> object);
@@ -2988,14 +3038,6 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   TNode<BoolT> IsJSPrimitiveWrapperInstanceType(TNode<Int32T> instance_type);
   TNode<BoolT> IsJSPrimitiveWrapperMap(TNode<Map> map);
   TNode<BoolT> IsJSPrimitiveWrapper(TNode<HeapObject> object);
-  TNode<BoolT> IsJSSharedArrayInstanceType(TNode<Int32T> instance_type);
-  TNode<BoolT> IsJSSharedArrayMap(TNode<Map> map);
-  TNode<BoolT> IsJSSharedArray(TNode<HeapObject> object);
-  TNode<BoolT> IsJSSharedArray(TNode<Object> object);
-  TNode<BoolT> IsJSSharedStructInstanceType(TNode<Int32T> instance_type);
-  TNode<BoolT> IsJSSharedStructMap(TNode<Map> map);
-  TNode<BoolT> IsJSSharedStruct(TNode<HeapObject> object);
-  TNode<BoolT> IsJSSharedStruct(TNode<Object> object);
   TNode<BoolT> IsJSWrappedFunction(TNode<HeapObject> object);
   TNode<BoolT> IsMapMap(TNode<Map> map);
   TNode<BoolT> IsMap(TNode<HeapObject> object);
@@ -3653,15 +3695,6 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
                             TVariable<IntPtrT>* var_name_index,
                             Label* if_not_found,
                             LookupMode mode = kFindExisting);
-  // Slow lookup for unique_names with forwarding index.
-  // Both resolving the actual hash and the lookup are handled via runtime.
-  template <typename Dictionary>
-  void NameDictionaryLookupWithForwardIndex(TNode<Dictionary> dictionary,
-                                            TNode<Name> unique_name,
-                                            Label* if_found,
-                                            TVariable<IntPtrT>* var_name_index,
-                                            Label* if_not_found,
-                                            LookupMode mode = kFindExisting);
 
   TNode<Word32T> ComputeSeededHash(TNode<IntPtrT> key);
 
@@ -4035,7 +4068,11 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
                               ElementsKind from_kind, ElementsKind to_kind,
                               Label* bailout);
 
-  void TrapAllocationMemento(TNode<JSObject> object, Label* memento_found);
+  // AllocationSiteCache manipulation.
+  TNode<RawPtrT> GetAllocationSiteCacheEntry(TNode<HeapObject> object);
+  void RecordAllocationSiteInCache(TNode<JSArray> object,
+                                   TNode<AllocationSite> allocation_site);
+  void TrapAllocationSiteInCache(TNode<JSObject> object, Label* site_found);
 
   // Helpers to look up Page metadata for a given address.
   // Equivalent to MemoryChunk::FromAddress().
@@ -4467,9 +4504,9 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   TNode<BoolT> IsJSArrayBufferViewDetachedOrOutOfBoundsBoolean(
       TNode<JSArrayBufferView> array_buffer_view);
 
-  void CheckJSTypedArrayIndex(TNode<JSTypedArray> typed_array,
-                              TNode<UintPtrT> index,
-                              Label* detached_or_out_of_bounds);
+  void CheckIsValidIntegerIndex(TNode<JSTypedArray> typed_array,
+                                TNode<UintPtrT> index,
+                                Label* detached_or_out_of_bounds);
 
   TNode<Uint8T> ElementsKindToElementByteShift(TNode<Int32T> elementsKind);
   TNode<RawPtrT> LoadJSTypedArrayDataPtr(TNode<JSTypedArray> typed_array);
@@ -4827,6 +4864,12 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   void LookupBinary(TNode<Name> unique_name, TNode<Array> array,
                     TNode<Uint32T> number_of_valid_entries, Label* if_found,
                     TVariable<IntPtrT>* var_name_index, Label* if_not_found);
+
+#ifdef V8_ENABLE_DESCRIPTOR_ARRAY_LOOKUP_TABLE
+  void LookupTable(TNode<Name> unique_name, TNode<DescriptorArray> descriptors,
+                   TNode<Uint32T> number_of_valid_entries, Label* if_found,
+                   TVariable<IntPtrT>* var_name_index, Label* if_not_found);
+#endif  // V8_ENABLE_DESCRIPTOR_ARRAY_LOOKUP_TABLE
 
   // Converts [Descriptor/Transition]Array entry number to a fixed array index.
   template <typename Array>

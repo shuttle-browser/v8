@@ -270,6 +270,12 @@ const size_t kShortBuiltinCallsOldSpaceSizeThreshold = size_t{2} * GB;
 #define V8_ENABLE_SWISS_NAME_DICTIONARY_BOOL false
 #endif
 
+#ifdef V8_ENABLE_DESCRIPTOR_ARRAY_LOOKUP_TABLE
+#define V8_ENABLE_DESCRIPTOR_ARRAY_LOOKUP_TABLE_BOOL true
+#else
+#define V8_ENABLE_DESCRIPTOR_ARRAY_LOOKUP_TABLE_BOOL false
+#endif  // V8_ENABLE_DESCRIPTOR_ARRAY_LOOKUP_TABLE
+
 // Determine whether dict property constness tracking feature is enabled.
 #ifdef V8_DICT_PROPERTY_CONST_TRACKING
 #define V8_DICT_PROPERTY_CONST_TRACKING_BOOL true
@@ -697,7 +703,7 @@ static_assert(kPointerSize == (1 << kPointerSizeLog2));
 // This type defines the raw storage type for external (or off-V8 heap) pointers
 // stored on V8 heap.
 constexpr int kExternalPointerSlotSize = sizeof(ExternalPointer_t);
-#ifdef V8_ENABLE_SANDBOX
+#ifdef V8_COMPRESS_POINTERS
 static_assert(kExternalPointerSlotSize == kTaggedSize);
 #else
 static_assert(kExternalPointerSlotSize == kSystemPointerSize);
@@ -2900,6 +2906,15 @@ enum class IsolateExecutionModeFlag : uint8_t {
   kCheckSideEffects = 1 << 1,
 };
 
+enum class IsolateMarkingFlag : uint8_t {
+  kNoMarking = 0,
+  kLocalMajorMarking = 1 << 0,
+  kLocalMinorMarking = 1 << 1,
+  kSharedMarking = 1 << 2,
+};
+using IsolateMarkingFlags = base::Flags<IsolateMarkingFlag>;
+DEFINE_OPERATORS_FOR_FLAGS(IsolateMarkingFlags)
+
 // Flags for the runtime function kDefineKeyedOwnPropertyInLiteral.
 // - Whether the function name should be set or not.
 enum class DefineKeyedOwnPropertyInLiteralFlag {
@@ -3406,12 +3421,10 @@ struct AcquireLoadTag {};
 struct RelaxedLoadTag {};
 struct ReleaseStoreTag {};
 struct RelaxedStoreTag {};
-struct SeqCstAccessTag {};
 static constexpr AcquireLoadTag kAcquireLoad;
 static constexpr RelaxedLoadTag kRelaxedLoad;
 static constexpr ReleaseStoreTag kReleaseStore;
 static constexpr RelaxedStoreTag kRelaxedStore;
-static constexpr SeqCstAccessTag kSeqCstAccess;
 
 static constexpr int kAdd_StringConstant_Internalize_CacheSlotOffset = 1;
 

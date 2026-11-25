@@ -103,19 +103,7 @@ inline MapCompare::MapCompare(MaglevAssembler* masm, Register object,
 
 void MapCompare::Generate(Handle<Map> map, Condition cond, Label* if_true,
                           Label::Distance distance) {
-  // A root map is compared through its root index, which under static roots
-  // makes a read-only map's compressed pointer an immediate, as
-  // CompareMapWithRoot does. Any other map is loaded from the constant pool.
-  RootIndex root_index;
-  if (masm_->isolate()->roots_table().IsRootHandle(map, &root_index)) {
-    masm_->CompareTaggedRoot(map_, root_index);
-  } else {
-    MaglevAssembler::TemporaryRegisterScope temps(masm_);
-    Register temp = temps.AcquireScratch();
-    masm_->Move(temp, map);
-    masm_->CmpTagged(map_, temp);
-  }
-  masm_->JumpIf(cond, if_true, distance);
+  masm_->CompareTaggedAndJumpIf(map_, map, cond, if_true, distance);
 }
 
 Register MapCompare::GetMap() {
@@ -440,13 +428,13 @@ inline void MaglevAssembler::MoveHeapNumber(Register dst, double value) {
 inline Condition MaglevAssembler::IsRootConstant(Input input,
                                                  RootIndex root_index) {
   if (input.operand().IsRegister()) {
-    CompareRoot(ToRegister(input), root_index);
+    CompareRoot(ToRegister(input), root_index, ComparisonMode::kEqualityOnly);
   } else {
     DCHECK(input.operand().IsStackSlot());
     TemporaryRegisterScope temps(this);
     Register scratch = temps.AcquireScratch();
     Ldr(scratch, ToMemOperand(input.operand()));
-    CompareRoot(scratch, root_index);
+    CompareRoot(scratch, root_index, ComparisonMode::kEqualityOnly);
   }
   return eq;
 }
@@ -602,9 +590,9 @@ inline void MaglevAssembler::StoreFixedDoubleArrayElement(
 inline void MaglevAssembler::LoadSignedField(Register result,
                                              MemOperand operand, int size) {
   if (size == 1) {
-    Ldrsb(result, operand);
+    Ldrsb(result.W(), operand);
   } else if (size == 2) {
-    Ldrsh(result, operand);
+    Ldrsh(result.W(), operand);
   } else {
     DCHECK_EQ(size, 4);
     Ldr(result.W(), operand);
@@ -717,8 +705,8 @@ inline void MaglevAssembler::StoreTrustedPointerFieldNoWriteBarrier(
 
 inline void MaglevAssembler::ReverseByteOrder(Register value, int size) {
   if (size == 2) {
-    Rev16(value, value);
-    Sxth(value, value);
+    Rev16(value.W(), value.W());
+    Sxth(value.W(), value.W());
   } else if (size == 4) {
     Rev32(value, value);
   } else {
@@ -729,8 +717,8 @@ inline void MaglevAssembler::ReverseByteOrder(Register value, int size) {
 inline void MaglevAssembler::ReverseByteOrderUnsigned(Register value,
                                                       int size) {
   if (size == 2) {
-    Rev16(value, value);
-    Uxth(value, value);
+    Rev16(value.W(), value.W());
+    Uxth(value.W(), value.W());
   } else if (size == 4) {
     Rev32(value, value);
   } else {
@@ -853,6 +841,7 @@ inline void MaglevAssembler::Move(DoubleRegister dst, Float64 n) {
   Fmov(dst, n.get_scalar());
 }
 inline void MaglevAssembler::Move(Register dst, Handle<HeapObject> obj) {
+  if (TryLoadRoot(dst, obj)) return;
   Mov(dst, Operand(obj));
 }
 void MaglevAssembler::MoveTagged(Register dst, Handle<HeapObject> obj) {
@@ -1548,7 +1537,10 @@ inline void MaglevAssembler::CompareTaggedAndJumpIf(Register r1,
   // never changes. Any other object is loaded from the constant pool.
   RootIndex root_index;
   if (isolate()->roots_table().IsRootHandle(obj, &root_index)) {
-    CompareTaggedRoot(r1, root_index);
+    CompareTaggedRoot(r1, root_index,
+                      cond == kEqual || cond == kNotEqual
+                          ? ComparisonMode::kEqualityOnly
+                          : ComparisonMode::kDefault);
   } else {
     CmpTagged(r1, Operand(obj, COMPRESS_POINTERS_BOOL
                                    ? RelocInfo::COMPRESSED_EMBEDDED_OBJECT
@@ -1629,13 +1621,13 @@ inline void MaglevAssembler::TestUint8AndJumpIfAllClear(
 
 inline void MaglevAssembler::LoadContextCellState(Register state,
                                                   Register cell) {
-  Ldr(state, FieldMemOperand(cell, offsetof(ContextCell, state_)));
+  Ldr(state.W(), FieldMemOperand(cell, offsetof(ContextCell, state_)));
 }
 
 inline void MaglevAssembler::LoadContextCellInt32Value(Register value,
                                                        Register cell) {
   AssertContextCellState(cell, ContextCell::kInt32);
-  Ldr(value, FieldMemOperand(cell, offsetof(ContextCell, double_value_)));
+  Ldr(value.W(), FieldMemOperand(cell, offsetof(ContextCell, double_value_)));
 }
 
 inline void MaglevAssembler::LoadContextCellFloat64Value(DoubleRegister value,
@@ -1646,7 +1638,7 @@ inline void MaglevAssembler::LoadContextCellFloat64Value(DoubleRegister value,
 
 inline void MaglevAssembler::StoreContextCellInt32Value(Register cell,
                                                         Register value) {
-  Str(value, FieldMemOperand(cell, offsetof(ContextCell, double_value_)));
+  Str(value.W(), FieldMemOperand(cell, offsetof(ContextCell, double_value_)));
 }
 
 inline void MaglevAssembler::StoreContextCellFloat64Value(

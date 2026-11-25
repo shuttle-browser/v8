@@ -51,7 +51,7 @@ namespace internal {
 
 #ifdef CAN_USE_RVA23U64_INSTRUCTIONS
 static const CpuFeatureSet kRVA23U64 =
-    CpuFeatureSet{} | RVC | ZFA | ZBB | ZBS | ZBA | ZICOND | ZCB;
+    CpuFeatureSet{} | RVC | ZFA | ZBB | ZBS | ZBA | ZICOND | ZCB | RVV;
 #endif
 // Get the CPU features enabled by the build. For cross compilation the
 // preprocessor symbols __riscv_f and __riscv_d
@@ -59,11 +59,12 @@ static const CpuFeatureSet kRVA23U64 =
 // snapshot.
 constexpr CpuFeatureSet CpuFeaturesImpliedByCompiler() {
   CpuFeatureSet features;
+
 #if defined(__riscv_f) && defined(__riscv_d)
   features.Add(FPU);
 #endif  // def __riscv_f
 
-#if (defined __riscv_vector) && (__riscv_v >= 1000000)
+#if ((defined __riscv_vector) && (__riscv_v >= 1000000))
   features.Add(RVV);
 #endif  // def __riscv_vector && __riscv_v >= 1000000
 
@@ -96,19 +97,17 @@ constexpr CpuFeatureSet CpuFeaturesImpliedByCompiler() {
 
 #ifdef RISCV_TARGET_SIMULATOR
 static CpuFeatureSet SimulatorFeatures() {
+  // The base ISA (F, D, C) and the extensions selected by the build
+  // configuration (see BUILD.gn, e.g. the rv64gc / rva23u64 profiles and the
+  // riscv_use_* switches) are contributed by CpuFeaturesImpliedByCompiler().
+  // This function only exposes the extra features the RISC-V simulator always
+  // provides and for which there is no GN switch.
   CpuFeatureSet features;
-  features.Add(RVV);
-  features.Add(ZBA);
-  features.Add(ZBB);
-  features.Add(ZBS);
-  features.Add(ZICOND);
-  features.Add(ZICFISS);
   features.Add(FPU);
+  features.Add(RVC);
   features.Add(ZFH);
   features.Add(ZVFH);
-  features.Add(ZFA);
-  features.Add(RVC);
-  features.Add(ZCB);
+  features.Add(ZICFISS);
   return features;
 }
 #endif
@@ -215,15 +214,15 @@ uint32_t RelocInfo::wasm_call_tag() const {
 Operand::Operand(Handle<HeapObject> handle, RelocInfo::Mode rmode)
     : rm_(no_reg), rmode_(rmode) {
   DCHECK(RelocInfo::IsEmbeddedObjectMode(rmode) || RelocInfo::IsNoInfo(rmode));
-  value_.immediate = static_cast<intptr_t>(handle.address());
+  immediate_ = static_cast<intptr_t>(handle.address());
 }
 
 Operand Operand::EmbeddedNumber(double value) {
   int32_t smi;
   if (DoubleToSmiInteger(value, &smi)) return Operand(Smi::FromInt(smi));
   Operand result(0, RelocInfo::FULL_EMBEDDED_OBJECT);
-  result.is_heap_number_request_ = true;
-  result.value_.heap_number_request = HeapNumberRequest(value);
+  result.heap_number_request_.emplace(value);
+  DCHECK(result.IsHeapNumberRequest());
   return result;
 }
 
@@ -1154,7 +1153,10 @@ void Assembler::stop(uint32_t code) {
   DCHECK_GT(code, kMaxWatchpointCode);
   DCHECK_LE(code, kMaxStopCode);
 #if defined(V8_HOST_ARCH_RISCV64) || defined(V8_HOST_ARCH_RISCV32)
-  break_(0x54321);
+  // break_() follows the ebreak with a lui carrying the code for the
+  // simulator. Running natively there is no simulator to read it, and the
+  // trap ends execution at the ebreak.
+  ebreak();
 #else  // V8_HOST_ARCH_RISCV64 || V8_HOST_ARCH_RISCV32
   break_(code, true);
 #endif
@@ -1654,7 +1656,9 @@ bool Assembler::IsConstantPoolAt(Instruction* instr) {
 
 int Assembler::ConstantPoolSizeAt(Instruction* instr) {
   if (IsConstantPoolAt(instr)) {
-    return instr->Imm20UValue();
+    // The AUIPC immediate is an unsigned metadata field here. The marker is
+    // followed by a guard and is not executed.
+    return static_cast<int>(instr->Imm20UValueUnsigned());
   } else {
     return -1;
   }

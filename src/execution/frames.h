@@ -722,6 +722,7 @@ class TypedFrame : public CommonFrame {
  protected:
   inline explicit TypedFrame(StackFrameIteratorBase* iterator);
 #if V8_ENABLE_WEBASSEMBLY
+  void ComputeCallerState(State* state) const override;
   void UnwindWasmReturnFromSegment(State* state) const;
 #endif
 };
@@ -1432,8 +1433,6 @@ class WasmFrame : public TypedFrame {
  protected:
   inline explicit WasmFrame(StackFrameIteratorBase* iterator);
 
-  void ComputeCallerState(State* state) const override;
-
  private:
   friend class StackFrameIteratorBase;
   Tagged<WasmModuleObject> module_object() const;
@@ -1969,6 +1968,7 @@ class StackFrameIteratorForProfiler : public StackFrameIteratorBase {
   bool IsValidStackAddress(Address addr) const {
     return low_bound_ <= addr && addr <= high_bound_;
   }
+  bool IsValidFramePointer(Address fp) const;
   bool IsValidState(const StackFrame::State& frame) const;
   bool HasValidExitIfEntryFrame(const StackFrame* frame) const;
   bool IsValidExitFrame(Address fp) const;

@@ -851,10 +851,6 @@ bool Map::has_frozen_elements() const {
   return IsFrozenElementsKind(elements_kind());
 }
 
-bool Map::has_shared_array_elements() const {
-  return IsSharedArrayElementsKind(elements_kind());
-}
-
 void Map::set_is_dictionary_map(bool value) {
   set_bit_field3(
       bit_field3().with_is_dictionary_map(value).with_is_unstable(value));
@@ -899,13 +895,8 @@ bool Map::CanTransition() const {
   // read only sapce.
   DCHECK_IMPLIES(InstanceTypeChecker::IsMaybeReadOnlyJSObject(type),
                  HeapLayout::InReadOnlySpace(this));
-  // Shared JS objects have fixed shapes and do not transition. Their maps are
-  // either in shared space or RO space.
-  DCHECK_IMPLIES(InstanceTypeChecker::IsAlwaysSharedSpaceJSObject(type),
-                 HeapLayout::InAnySharedSpace(this));
   return InstanceTypeChecker::IsJSObject(type) &&
-         !InstanceTypeChecker::IsMaybeReadOnlyJSObject(type) &&
-         !InstanceTypeChecker::IsAlwaysSharedSpaceJSObject(type);
+         !InstanceTypeChecker::IsMaybeReadOnlyJSObject(type);
 }
 
 bool IsBooleanMap(Tagged<Map> map) {

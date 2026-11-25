@@ -153,7 +153,7 @@ Address* JSHeapBroker::AllocatePersistentHandle(Tagged<Object> object) {
 
 bool JSHeapBroker::StackHasOverflowed() const {
   DCHECK_IMPLIES(local_isolate_ == nullptr,
-                 ThreadId::Current() == isolate_->thread_id());
+                 base::ThreadId::Current() == isolate_->thread_id());
   return (local_isolate_ != nullptr)
              ? StackLimitCheck::HasOverflowed(local_isolate_)
              : StackLimitCheck(isolate_).HasOverflowed();
@@ -822,7 +822,11 @@ ProcessedFeedback const& JSHeapBroker::ReadFeedbackForCall(
 
   float frequency = nexus.ComputeCallFrequency();
   SpeculationMode mode = nexus.GetSpeculationMode();
-  CallFeedbackContent content = nexus.GetCallFeedbackContent();
+  CallFeedbackContent content = CallFeedbackContent::kTarget;
+  if (target_ref.has_value() && target_ref->map(this).is_callable()) {
+    DCHECK(target_ref->IsJSFunction() || target_ref->IsJSBoundFunction());
+    content = nexus.GetCallFeedbackContent();
+  }
   return *zone()->New<CallFeedback>(target_ref, frequency, mode, content,
                                     nexus.kind());
 }

@@ -5,6 +5,7 @@
 #include "experimental/redline/engine/fuzzer.h"
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cstdio>
 #include <deque>
@@ -17,7 +18,9 @@
 #include "experimental/redline/base/time_util.h"
 #include "experimental/redline/base/v8_runtime.h"
 #include "experimental/redline/core/environment.h"
+#include "experimental/redline/engine/d8_flags.h"
 #include "experimental/redline/engine/importer.h"
+#include "experimental/redline/exec/process_run.h"
 #include "experimental/redline/exec/runner.h"
 #include "experimental/redline/fast/printer.h"
 #include "experimental/redline/mutators/explore.h"
@@ -28,6 +31,23 @@ namespace {
 
 constexpr char kLog[] = "fuzz";
 constexpr size_t kMaxSavedOutput = static_cast<size_t>(64) * 1024;
+
+// Keeps the random d8 flags of a target while it lives: a new target
+// process gets the flags of the last one. The reruns, the minimization and
+// the crash triage of a program run with the flags that ran it.
+class FlagPin {
+ public:
+  explicit FlagPin(ReprlChild& child) : child_(child), was_(child.pinned()) {
+    child_.Pin(true);
+  }
+  ~FlagPin() { child_.Pin(was_); }
+  FlagPin(const FlagPin&) = delete;
+  FlagPin& operator=(const FlagPin&) = delete;
+
+ private:
+  ReprlChild& child_;
+  bool was_;
+};
 
 // Runs a function when the scope ends (all exits of a loop iteration).
 class ScopeExit {
@@ -82,14 +102,30 @@ class Worker {
       : fuzzer_(fuzzer),
         id_(id),
         rng_(fuzzer->config().seed * 0x9E3779B97F4A7C15ull +
-             static_cast<uint64_t>(id) + 1) {}
+             static_cast<uint64_t>(id) + 1),
+        flags_rng_((fuzzer->config().seed * 0x9E3779B97F4A7C15ull +
+                    static_cast<uint64_t>(id) + 1) ^
+                   kFlagsSeedSalt) {}
 
   int id() const { return id_; }
 
   // Starts the target synchronously so that configuration problems are
   // reported before any thread runs.
   bool Start(std::string* error) {
-    runner_ = ScriptRunner::Create(fuzzer_->config().target, id_, error);
+    TargetOptions target = fuzzer_->config().target;
+    if (config().randomize_d8_flags) {
+      // Each new target process gets new random flags (DESIGN.md 5.4).
+      target.random_args = [this] {
+        if (!fuzzer_->targets_.empty() && child_execs_ > 0) {
+          fuzzer_->RecordTargetChild(child_target_hits_ > 0);
+        }
+        child_target_buckets_.assign(fuzzer_->targets_.size(), 0);
+        child_target_hits_ = 0;
+        child_execs_ = 0;
+        return fuzzer_->DrawD8Flags(flags_rng_);
+      };
+    }
+    runner_ = ScriptRunner::Create(target, id_, error);
     if (runner_ == nullptr) {
       return false;
     }
@@ -97,9 +133,12 @@ class Worker {
       return false;
     }
     const CoverageMap& coverage = runner_->coverage();
-    return fuzzer_->coverage_.Initialize(coverage.num_edges(),
-                                         coverage.bitmap_size(), error);
+    return fuzzer_->coverage_.Initialize(
+        coverage.num_edges(), coverage.bitmap_size(), error,
+        coverage.counted_edges(), coverage.real_edges());
   }
+
+  const CoverageMap& coverage() const { return runner_->coverage(); }
 
   void Launch() {
     thread_ = std::thread([this] { Run(); });
@@ -146,11 +185,29 @@ class Worker {
     while (!stopping()) {
       FuzzOne();
     }
+    if (config().randomize_d8_flags && !fuzzer_->targets_.empty() &&
+        child_execs_ > 0) {
+      fuzzer_->RecordTargetChild(child_target_hits_ > 0);
+      child_execs_ = 0;
+    }
     // Let the target go now; the main thread only joins.
     runner_.reset();
   }
 
   // --- execution --------------------------------------------------------
+
+  // The script that the target runs for `source`: the prelude, then the
+  // program.
+  std::string ScriptFor(const std::string& source) const {
+    const std::string& prelude = config().prelude;
+    if (prelude.empty()) {
+      return source;
+    }
+    std::string script;
+    script.reserve(prelude.size() + 1 + source.size());
+    script.append(prelude).append("\n").append(source);
+    return script;
+  }
 
   // Runs `source` behind the prelude without touching per-runner coverage
   // bookkeeping. Returns false on an infrastructure failure.
@@ -159,16 +216,13 @@ class Worker {
     if (timeout_us == 0) {
       timeout_us = config().target.timeout_us;
     }
-    const std::string& prelude = config().prelude;
     std::string error;
     bool ok;
-    if (prelude.empty()) {
+    if (config().prelude.empty()) {
       ok = runner_->RunWithoutEvaluation(source, timeout_us, execution, &error);
     } else {
-      std::string script;
-      script.reserve(prelude.size() + 1 + source.size());
-      script.append(prelude).append("\n").append(source);
-      ok = runner_->RunWithoutEvaluation(script, timeout_us, execution, &error);
+      ok = runner_->RunWithoutEvaluation(ScriptFor(source), timeout_us,
+                                         execution, &error);
     }
     if (!ok) {
       stats().infrastructure_failures++;
@@ -184,10 +238,84 @@ class Worker {
     }
     consecutive_failures_ = 0;
     executions_++;
+    child_execs_++;
     stats().executions++;
     stats().exec_time_us += execution->exec_time_us;
     RememberExecution(source);
+    if (execution->succeeded()) {
+      ObserveTargetCoverage();
+    }
     return true;
+  }
+
+  // The number of target features in `edges` (0 outside change-based fuzzing).
+  static uint64_t TargetFeatures(const std::vector<uint32_t>& edges) {
+    const FeatureWeights* weights = FeatureWeights::Active();
+    if (weights == nullptr) {
+      return 0;
+    }
+    return static_cast<uint64_t>(
+        std::count_if(edges.begin(), edges.end(),
+                      [&](uint32_t edge) { return weights->IsTarget(edge); }));
+  }
+
+  // Tracks per-child target bucket coverage in change-based fuzzing and records
+  // flag combinations that reach target edges or higher hit-count buckets.
+  void ObserveTargetCoverage() {
+    if (fuzzer_->targets_.empty() || !config().randomize_d8_flags) {
+      return;
+    }
+    if (child_target_buckets_.size() != fuzzer_->targets_.size()) {
+      child_target_buckets_.assign(fuzzer_->targets_.size(), 0);
+    }
+    bool hit_any = false;
+    bool new_bucket = false;
+    for (size_t i = 0; i < fuzzer_->targets_.size(); i++) {
+      uint32_t count = runner_->coverage().HitCount(fuzzer_->targets_[i].first);
+      if (count == 0) {
+        continue;
+      }
+      hit_any = true;
+      uint8_t bit =
+          static_cast<uint8_t>(1u << CoverageMap::Bucket(static_cast<uint8_t>(
+                                   std::min<uint32_t>(count, 255))));
+      if ((child_target_buckets_[i] & bit) == 0) {
+        child_target_buckets_[i] |= bit;
+        new_bucket = true;
+      }
+    }
+    if (!hit_any) {
+      return;
+    }
+    child_target_hits_++;
+    if (!new_bucket) {
+      return;
+    }
+    double score = 0;
+    for (size_t i = 0; i < fuzzer_->targets_.size(); i++) {
+      uint8_t bits = child_target_buckets_[i];
+      if (bits != 0) {
+        score += fuzzer_->targets_[i].second *
+                 (4.0 + static_cast<double>(std::popcount(bits)) +
+                  static_cast<double>(std::bit_width(bits)));
+      }
+    }
+    fuzzer_->RecordTargetFlags(runner_->child().random_args(), score);
+  }
+
+  // Respawns an unpinned child in change-based fuzzing when it has run
+  // target_probe_execs executions without reaching a single target edge.
+  void MaybeRespawnForTargets() {
+    if (fuzzer_->targets_.empty() || !config().randomize_d8_flags) {
+      return;
+    }
+    if (runner_->child().pinned() || child_target_hits_ > 0) {
+      return;
+    }
+    const int probe = TargetProbeExecs();
+    if (probe > 0 && runner_->child().execs_since_draw() >= probe) {
+      runner_->child().Kill();
+    }
   }
 
   // The programs the current target process executed, oldest first (bounded
@@ -327,6 +455,7 @@ class Worker {
   }
 
   void ImportFile(const std::string& path, const ImportOptions& options) {
+    MaybeRespawnForTargets();
     stats().imports_total++;
     JsonObject event;
     event.Add("event", "import").Add("file", path).Add("worker", id_);
@@ -388,6 +517,7 @@ class Worker {
     }
     std::vector<uint32_t> claimed =
         fuzzer_->coverage_.ClaimNewEdges(runner_->coverage().bitmap());
+    fuzzer_->KeepFocused(&claimed);
     if (claimed.empty() && !config().import_all) {
       stats().imports_redundant++;
       fuzzer_->LogEvent(event.Add("result", "redundant"));
@@ -424,6 +554,7 @@ class Worker {
   // --- fuzzing ----------------------------------------------------------
 
   void FuzzOne() {
+    MaybeRespawnForTargets();
     Corpus& corpus = fuzzer_->corpus();
     Stopwatch pick_time;
     ProgramPtr parent = corpus.Pick(rng_);
@@ -461,9 +592,10 @@ class Worker {
     // Fresh values at the top of the parent give every mutation of the chain
     // something new to work with (Fuzzilli's buildPrefix()). The prefix is
     // not a mutation of its own: it is only executed as part of the first
-    // child, and the minimizer drops whatever ends up unused.
-    if (!from_empty && config().value_prefix &&
-        fuzzer_->prefix_mutator_ != nullptr) {
+    // child, and the minimizer drops whatever ends up unused. The empty
+    // program gets a prefix too, unless `prefix_from_scratch` is false.
+    if ((!from_empty || config().prefix_from_scratch) &&
+        config().value_prefix && fuzzer_->prefix_mutator_ != nullptr) {
       Stopwatch prefix_time;
       std::string detail;
       std::unique_ptr<fast::Tree> prefixed =
@@ -489,10 +621,14 @@ class Worker {
       }
     }
 
+    // A chain from the empty program uses only CodeGen for its first
+    // `scratch_codegen_links` links that run without an error.
+    int scratch_links = from_empty ? config().scratch_codegen_links : 0;
     for (int round = 0; round < config().consecutive_mutations && !stopping();
          round++) {
-      Mutator* mutator = from_empty ? fuzzer_->codegen_mutator_
-                                    : mutators.Pick(rng_, corpus.size() >= 2);
+      Mutator* mutator = scratch_links > 0
+                             ? fuzzer_->codegen_mutator_
+                             : mutators.Pick(rng_, corpus.size() >= 2);
       if (mutator == nullptr) {
         return;
       }
@@ -617,6 +753,7 @@ class Worker {
         case Outcome::kSucceeded: {
           std::vector<uint32_t> claimed =
               fuzzer_->coverage_.ClaimNewEdges(runner_->coverage().bitmap());
+          fuzzer_->KeepFocused(&claimed);
           std::shared_ptr<Program> child =
               Program::FromTree(std::move(tree), lineage, source);
           ProgramPtr added;
@@ -632,9 +769,11 @@ class Worker {
                            config().minimize, mutator);
             if (added != nullptr) {
               // Each generator the mutant used gets the full credit.
+              const uint64_t targets = TargetFeatures(added->edges);
               for (Generator* g : used_generators) {
                 g->stats().interesting++;
                 g->stats().new_edges += added->edges.size();
+                g->stats().new_targets += targets;
               }
             }
           }
@@ -643,10 +782,11 @@ class Worker {
           if (ancestor->id != 0) {
             corpus.OnResult(*ancestor, added != nullptr);
           }
-          // The chain continues from the child as executed, not from
-          // its minimized form (Fuzzilli's MutationEngine does the
-          // same: minimization happens on the side); the lineage of
-          // what follows refers to the published program.
+          // The chain continues from the child as it ran, not from its
+          // minimized copy. Minimization can remove material that the next
+          // mutations can use (DESIGN.md 4.2). Fuzzilli's MutationEngine also
+          // minimizes on the side. The lineage of the next links has the id
+          // of the published program.
           parent = child;
           if (added != nullptr) {
             ancestor = added;
@@ -654,7 +794,9 @@ class Worker {
           } else {
             chain++;
           }
-          from_empty = false;
+          if (scratch_links > 0) {
+            scratch_links--;
+          }
           break;
         }
         case Outcome::kCrashed: {
@@ -788,6 +930,7 @@ class Worker {
                     std::vector<uint32_t> claimed,
                     const Execution& first_execution, bool minimize,
                     Mutator* mutator) {
+    FlagPin pin(runner_->child());
     SharedCoverage& shared = fuzzer_->coverage_;
     const bool claimed_was_empty = claimed.empty();
     std::vector<uint32_t> edges = std::move(claimed);
@@ -841,6 +984,10 @@ class Worker {
       if (execution.outcome == Outcome::kTimedOut) {
         check_stage.timeouts++;
         rerun_timeout = true;
+      }
+      if (execution.crashed()) {
+        HarvestCrash(program->source(), execution, program->lineage(),
+                     "determinism rerun");
       }
       if (!execution.succeeded()) {
         deterministic = false;
@@ -919,6 +1066,10 @@ class Worker {
       // A reduction can turn a terminating loop into an infinite one; such
       // probes must not pay the full target timeout (plus a child respawn).
       const uint64_t probe_timeout_us = ProbeTimeout(exec_time_us);
+      // The property that the minimizer keeps (see MinimizationProperty).
+      bool fragile_only = false;
+      const std::vector<uint32_t> property =
+          MinimizationProperty(edges, &fragile_only);
       MinimizationOracle oracle = [&](const std::string& candidate) {
         if (stopping()) {
           return false;
@@ -935,10 +1086,18 @@ class Worker {
                   program->lineage().origin, program.get(), candidate,
                   JsonObject());
         }
-        return execution.succeeded() && runner_->coverage().AllEdgesSet(edges);
+        if (execution.crashed()) {
+          HarvestCrash(candidate, execution, program->lineage(),
+                       "minimizer probe");
+          return false;
+        }
+        return execution.succeeded() &&
+               runner_->coverage().AllEdgesSet(property);
       };
-      const MinimizerOptions budget =
-          config().minimizer.ForProgram(exec_time_us);
+      MinimizerOptions budget = config().minimizer.ForProgram(exec_time_us);
+      if (fragile_only) {
+        budget.max_tests = std::min(budget.max_tests, kFragileMinimizerTests);
+      }
       minimization =
           fuzzer_->Minimize(work.get(), oracle, probe_checker(), budget);
       stats().minimizer_tests += static_cast<uint64_t>(minimization.tests);
@@ -960,7 +1119,7 @@ class Worker {
           if (!execution.succeeded()) {
             break;
           }
-          if (!runner_->coverage().AllEdgesSet(edges)) {
+          if (!runner_->coverage().AllEdgesSet(property)) {
             continue;
           }
           stats().minimizer_nodes_removed += static_cast<uint64_t>(
@@ -1037,6 +1196,7 @@ class Worker {
     if (mutator != nullptr) {
       mutator->stats().interesting++;
       mutator->stats().new_edges += added->edges.size();
+      mutator->stats().new_targets += TargetFeatures(added->edges);
     }
     if (config().save_corpus) {
       fuzzer_->SaveCorpusProgram(*added);
@@ -1057,6 +1217,9 @@ class Worker {
         .Add("dropped_edges", static_cast<uint64_t>(dropped));
     event.Add("exec_time_ms", static_cast<double>(exec_time_us) / 1000.0);
     event.Add("worker", id_);
+    if (config().randomize_d8_flags) {
+      event.Add("d8_random_args", RandomArgsText());
+    }
     if (minimize) {
       event.Add("minimized", minimized).Add("min_tests", minimization.tests);
       event.Add("min_nodes_before",
@@ -1097,6 +1260,30 @@ class Worker {
     return execution->crashed();
   }
 
+  // The path of the files of a saved crash, without the extension.
+  std::string CrashBase(int signal, uint64_t hash) const {
+    return StringPrintf("%s/crashes/crash_sig%d_%016llx",
+                        config().out_dir.c_str(), signal,
+                        static_cast<unsigned long long>(hash));
+  }
+
+  // The target of this worker as it runs now, with its random flags.
+  TargetOptions CurrentTarget() const {
+    TargetOptions target = config().target;
+    target.args = runner_->child().CurrentArgs();
+    target.random_args = nullptr;
+    return target;
+  }
+
+  // The random flags of the current target, separated by spaces.
+  std::string RandomArgsText() const {
+    std::string text;
+    for (const std::string& arg : runner_->child().random_args()) {
+      text += (text.empty() ? "" : " ") + arg;
+    }
+    return text;
+  }
+
   // Everything learned about one crash, for the report and the event log.
   struct CrashInfo {
     CrashSignature signature;
@@ -1113,6 +1300,11 @@ class Worker {
     MinimizationResult minimization;
     bool amplify_ran = false;  // the amplify step ran (5.8)
     AmplifyResult amplify;
+    // The one-file reproducer of a state-dependent crash (NAME.bundle.js).
+    std::string bundle_path;  // empty if Redline did not write it
+    std::string bundle_note;  // why there is no bundle, or why the runs stopped
+    int bundle_runs = 0;      // plain d8 runs of the bundle
+    int bundle_hits = 0;      // ... that crashed with the same signature
     bool reproducible() const { return reproduced > 0; }
   };
 
@@ -1136,8 +1328,150 @@ class Worker {
             : ("amplified_program: " + amplified_program + "\n").c_str());
   }
 
+  // The bundle lines of the crash report (read by the uploader).
+  // `bundle_rate` gives the plain d8 runs of NAME.bundle.js that crashed
+  // with the same signature.
+  static std::string BundleReportLines(const CrashInfo& info) {
+    if (!info.state_dependent) {
+      return "bundle: skipped\n";
+    }
+    if (info.bundle_path.empty()) {
+      return "bundle: no\nbundle_note: " + info.bundle_note + "\n";
+    }
+    return StringPrintf("bundle: %s\nbundle_rate: %d/%d\nbundle_note: %s\n",
+                        BaseName(info.bundle_path).c_str(), info.bundle_hits,
+                        info.bundle_runs, info.bundle_note.c_str());
+  }
+
+  // The time that a plain d8 process needs to start and to stop, in addition
+  // to the time of its scripts.
+  static constexpr uint64_t kBundleStartupUs = 10'000'000;
+
+  // Writes BASE.bundle.js for a state-dependent crash: one part for each
+  // program of `history`, then one part for `source`. `d8 --bundle-reprl`
+  // runs each part in the same way as the REPRL loop runs one program. Thus
+  // ClusterFuzz can reproduce the crash from this one file. Then the bundle
+  // runs in up to crash_bundle_runs plain d8 processes, and the runs that
+  // crash with the signature of the crash are counted.
+  void WriteReprlBundle(const std::vector<std::string>& history,
+                        const std::string& source, const std::string& base,
+                        CrashInfo* info) {
+    std::vector<std::string> scripts;
+    scripts.reserve(history.size() + 1);
+    for (const std::string& program : history) {
+      scripts.push_back(ScriptFor(program));
+    }
+    scripts.push_back(ScriptFor(source));
+    const TargetOptions target = CurrentTarget();
+    const std::string path = base + ".bundle.js";
+    std::string signature = info->signature.text;
+    std::replace(signature.begin(), signature.end(), '\n', ' ');
+    const std::string header = StringPrintf(
+        "// redline state-dependent crash: %zu program(s), then the crash "
+        "program\n// signature: %s\n// run: %s --bundle-reprl %s\n",
+        history.size(), signature.c_str(), target.CommandLine().c_str(),
+        BaseName(path).c_str());
+    std::string bundle;
+    if (!MakeReprlBundle(header, scripts, &bundle)) {
+      info->bundle_note = "a program contains the bundle marker";
+      return;
+    }
+    std::string error;
+    if (!WriteStringToFile(path, bundle, &error)) {
+      info->bundle_note = error;
+      return;
+    }
+    info->bundle_path = path;
+    std::vector<std::string> args = target.args;
+    args.push_back("--bundle-reprl");
+    args.push_back(path);
+    const auto env = target.PlainEnvironment();
+    const uint64_t timeout_us =
+        config().target.timeout_us * scripts.size() + kBundleStartupUs;
+    const uint64_t budget_us =
+        static_cast<uint64_t>(config().crash_history_budget_sec * 1e6);
+    const Stopwatch clock;
+    while (info->bundle_runs < config().crash_bundle_runs && !stopping()) {
+      if (clock.ElapsedUs() > budget_us) {
+        info->bundle_note = "time budget used up";
+        break;
+      }
+      const ProcessResult run =
+          RunProcess(target.executable, args, env, timeout_us);
+      if (!run.started) {
+        info->bundle_note = "cannot start d8: " + run.error;
+        break;
+      }
+      info->bundle_runs++;
+      if (!run.timed_out &&
+          CrashSignature::FromOutput(run.signal, run.exit_code,
+                                     run.stderr_text) == info->signature) {
+        info->bundle_hits++;
+      }
+    }
+    stats().bundle_processes += static_cast<uint64_t>(info->bundle_runs);
+    if (info->bundle_hits > 0) {
+      stats().crashes_bundled++;
+    }
+  }
+
+  // The test budget of a minimization that keeps only fragile features.
+  static constexpr int kFragileMinimizerTests = 60;
+
+  // The features that the minimizer must keep. By default, all new features
+  // of the program. With --minimize-code-edges, only the new code edges, the
+  // new builtins edges and the target features. Optimized code features and
+  // hit count buckets change with most edits of a program. A minimization
+  // that keeps them spends its budget and removes little. If the program has
+  // none of the stable features, the property is all its new features,
+  // `*fragile_only` is true, and the budget is small.
+  std::vector<uint32_t> MinimizationProperty(const std::vector<uint32_t>& edges,
+                                             bool* fragile_only) const {
+    *fragile_only = false;
+    const FeatureWeights* weights = fuzzer_->feature_weights_.get();
+    const CoverageMap& coverage = runner_->coverage();
+    if (!config().minimize_code_edges) {
+      return edges;
+    }
+    std::vector<uint32_t> robust;
+    for (uint32_t feature : edges) {
+      const CoverageMap::FeatureKind kind = coverage.KindOf(feature);
+      if (kind == CoverageMap::FeatureKind::kCode ||
+          kind == CoverageMap::FeatureKind::kBuiltins ||
+          (weights != nullptr && weights->IsTarget(feature))) {
+        robust.push_back(feature);
+      }
+    }
+    if (robust.empty()) {
+      *fragile_only = true;
+      return edges;
+    }
+    return robust;
+  }
+
+  // With --harvest-crashes, a crash of a minimizer probe or of a
+  // determinism rerun counts like a crash of the mutate stage. These stages
+  // run most of the executions, and their programs are close relatives of
+  // the programs that reached new coverage.
+  void HarvestCrash(const std::string& source, const Execution& execution,
+                    const Lineage& parent, const char* detail) {
+    if (!config().harvest_crashes) {
+      return;
+    }
+    Lineage lineage = parent;
+    lineage.detail = detail;
+    std::string error;
+    std::shared_ptr<Program> program = Program::Parse(source, lineage, &error);
+    if (program == nullptr) {
+      return;
+    }
+    stats().harvested_crashes++;
+    ProcessCrash(source, *program, execution, lineage);
+  }
+
   void ProcessCrash(const std::string& source, const Program& program,
                     const Execution& execution, const Lineage& lineage) {
+    FlagPin pin(runner_->child());
     SharedCoverage& shared = fuzzer_->coverage_;
     const bool unique = shared.ClaimNewCrashEdges(runner_->coverage().bitmap());
     const uint64_t hash = Program::HashSource(source);
@@ -1237,6 +1571,14 @@ class Worker {
           stats().crash_replay_executions.load() - replay_execs_before;
     }
 
+    // 2a. A state-dependent crash also gets a one-file reproducer: a d8
+    //     bundle of the needed history and the crash program. A plain d8
+    //     with --bundle-reprl runs it like the REPRL loop (DESIGN.md 5.8).
+    if (info.state_dependent && !stopping()) {
+      WriteReprlBundle(history, source, CrashBase(execution.signal, hash),
+                       &info);
+    }
+
     // 2b. If it does not reproduce alone: the amplify step searches for a
     //     plain d8 command line (extra flags, --stress-runs) that
     //     reproduces the program alone, reliably (DESIGN.md 5.8). This
@@ -1246,7 +1588,7 @@ class Worker {
     if (!info.reproducible() && decision.save && !stopping() &&
         fuzzer_->ClaimAmplify(info.signature)) {
       AmplifyRequest request;
-      request.target = config().target;
+      request.target = CurrentTarget();
       request.program = source;
       request.prelude = config().prelude;
       request.script_path = StringPrintf("%s/crashes/amplify_%016llx.js",
@@ -1358,6 +1700,11 @@ class Worker {
     event.Add("amplify", info.amplify_ran
                              ? (info.amplify.amplified ? "yes" : "no")
                              : "skipped");
+    if (info.state_dependent) {
+      event.Add("bundle", info.bundle_path)
+          .Add("bundle_runs", info.bundle_runs)
+          .Add("bundle_hits", info.bundle_hits);
+    }
     if (info.amplify_ran) {
       event.Add("amplified_args", info.amplify.args);
       event.Add("amplified_hits", info.amplify.hits)
@@ -1370,6 +1717,9 @@ class Worker {
         .Add("detail", lineage.detail)
         .Add("parent", lineage.parent_id);
     event.Add("path", path).Add("worker", id_);
+    if (config().randomize_d8_flags) {
+      event.Add("d8_random_args", RandomArgsText());
+    }
     event.Add("stderr", FirstLines(execution.stderr_output));
     fuzzer_->LogEvent(event);
   }
@@ -1382,9 +1732,7 @@ class Worker {
                         const Execution& execution, const Lineage& lineage,
                         const CrashInfo& info, bool unique, uint64_t hash,
                         const std::vector<std::string>& history) {
-    std::string base =
-        StringPrintf("%s/crashes/crash_sig%d_%016llx", config().out_dir.c_str(),
-                     execution.signal, static_cast<unsigned long long>(hash));
+    std::string base = CrashBase(execution.signal, hash);
     std::string status;
     if (info.reproducible()) {
       status = StringPrintf("reproducible (%d/%d fresh-target runs crashed)",
@@ -1395,6 +1743,12 @@ class Worker {
           "program(s) in "
           "%s.history/ ran in the same d8 (replay them in order first)",
           info.history_needed, base.substr(base.rfind('/') + 1).c_str());
+      if (!info.bundle_path.empty()) {
+        status += StringPrintf(
+            ", or run %s with d8 --bundle-reprl (%d/%d plain d8 runs crashed)",
+            BaseName(info.bundle_path).c_str(), info.bundle_hits,
+            info.bundle_runs);
+      }
     } else if (info.amplify.amplified) {
       status = StringPrintf(
           "AMPLIFIED: not reproduced in %d fresh-target runs, but %d/%d plain "
@@ -1414,7 +1768,7 @@ class Worker {
         execution.signal, info.minimized ? "minimized" : "not minimized",
         info.signature.text.c_str(), status.c_str(), id_, info.child_age,
         lineage.origin.c_str(), lineage.detail.c_str(), lineage.parent_id,
-        lineage.generation, config().target.CommandLine().c_str());
+        lineage.generation, CurrentTarget().CommandLine().c_str());
     std::string error;
     std::string path = base + ".js";
     if (!WriteStringToFile(path, header + final_source, &error)) {
@@ -1449,7 +1803,8 @@ class Worker {
         "crash\n"
         "history_replayed: %s\nstate_dependent: %s\nhistory_needed: %zu of "
         "%zu\n"
-        "minimized: %s (%d tests, %zu -> %zu nodes)\n%s\n--- stderr "
+        "minimized: %s (%d tests, %zu -> %zu nodes)\nd8_random_args: %s\n"
+        "%s%s\n--- stderr "
         "---\n%s\n--- stdout ---\n%s\n"
         "--- fuzzout ---\n%s\n",
         execution.signal, execution.exit_code, info.signature.text.c_str(),
@@ -1459,7 +1814,9 @@ class Worker {
         info.history_needed, info.history_available,
         info.minimized ? "yes" : "no", info.minimization.tests,
         info.minimization.nodes_before, info.minimization.nodes_after,
+        RandomArgsText().c_str(),
         AmplifyReportLines(info, amplified_program).c_str(),
+        BundleReportLines(info).c_str(),
         Truncate(execution.stderr_output, kMaxSavedOutput).c_str(),
         Truncate(execution.stdout_output, kMaxSavedOutput).c_str(),
         Truncate(execution.fuzzout, kMaxSavedOutput).c_str());
@@ -1474,9 +1831,14 @@ class Worker {
     return path;
   }
 
+  // Separates the random flags from the other random decisions: a change
+  // of the flags does not change the programs.
+  static constexpr uint64_t kFlagsSeedSalt = 0x5DEECE66Dull;
+
   Fuzzer* fuzzer_;
   int id_;
   Random rng_;
+  Random flags_rng_;  // random d8 flags (randomize_d8_flags)
   std::unique_ptr<ScriptRunner> runner_;
   std::unique_ptr<SyntaxChecker> checker_;
   std::thread thread_;
@@ -1484,6 +1846,9 @@ class Worker {
   uint64_t executions_ = 0;  // target executions of this worker
   std::deque<std::string> history_;
   size_t history_bytes_ = 0;
+  std::vector<uint8_t> child_target_buckets_;
+  uint32_t child_target_hits_ = 0;
+  uint32_t child_execs_ = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -1494,6 +1859,10 @@ Fuzzer::Fuzzer(FuzzConfig config) : config_(std::move(config)) {}
 Fuzzer::~Fuzzer() {
   for (auto& worker : workers_) {
     worker->Join();
+  }
+  if (feature_weights_ != nullptr &&
+      FeatureWeights::Active() == feature_weights_.get()) {
+    FeatureWeights::SetActive(nullptr);
   }
 }
 
@@ -1584,6 +1953,24 @@ bool Fuzzer::Initialize(std::string* error) {
 
   CollectImports();
 
+  // Coverage counters and change-based fuzzing: the targets become watched
+  // edges.
+  config_.target.watch_optimized = config_.watch_optimized;
+  uint32_t targets_code_edges = 0;
+  if (!config_.targets_file.empty()) {
+    if (!ReadTargetsFile(config_.targets_file, &targets_, &focus_,
+                         &targets_code_edges, error)) {
+      return false;
+    }
+    if (!config_.focus) {
+      focus_.clear();
+    }
+    config_.target.watch_edges.clear();
+    for (const auto& target : targets_) {
+      config_.target.watch_edges.push_back(target.first);
+    }
+  }
+
   for (int i = 0; i < config_.jobs; i++) {
     auto worker = std::make_unique<Worker>(this, i);
     if (!worker->Start(error)) {
@@ -1591,6 +1978,10 @@ bool Fuzzer::Initialize(std::string* error) {
       return false;
     }
     workers_.push_back(std::move(worker));
+  }
+
+  if (!InitializeFeatureWeights(targets_code_edges, error)) {
+    return false;
   }
 
   // Ask the target what it offers beyond the hand-written model.
@@ -1618,6 +2009,227 @@ bool Fuzzer::Initialize(std::string* error) {
     }
   }
   return true;
+}
+
+bool Fuzzer::InitializeFeatureWeights(uint32_t targets_code_edges,
+                                      std::string* error) {
+  const CoverageMap& coverage = workers_[0]->coverage();
+  uint32_t code_edges = 0;
+  for (const CoverageMap::Region& region : coverage.regions()) {
+    if (region.kind == CoverageMap::RegionKind::kCode) {
+      code_edges += region.count;
+    } else if (region.kind == CoverageMap::RegionKind::kOptimized) {
+      geometry_.optimized_first = region.first;
+      geometry_.optimized_count = region.count;
+    }
+  }
+  // The weights and the admission rule of the optimized code features apply
+  // in both layouts. Without coverage counters and without optimized code
+  // features, all features keep the weight 1.
+  if (!coverage.counters_mode() && geometry_.optimized_count == 0) {
+    return true;
+  }
+  if (targets_code_edges != 0 && targets_code_edges != code_edges) {
+    *error = StringPrintf(
+        "%s was made for a d8 with %u code edges, but the target has %u. Run "
+        "tools/change_targets.py again for this d8.",
+        config_.targets_file.c_str(), targets_code_edges, code_edges);
+    return false;
+  }
+  geometry_.counters = coverage.counters_mode();
+  geometry_.bucket_first = coverage.bucket_base();
+  geometry_.features = coverage.num_edges();
+  geometry_.watched = static_cast<uint32_t>(coverage.watched().size());
+  feature_weights_ = FeatureWeights::Build(coverage, config_.feature_weights,
+                                           targets_, focus_);
+  FeatureWeights::SetActive(feature_weights_.get());
+  REDLINE_LOG(kLog,
+              "coverage %s: %u edges (%u code), %u optimized code features, "
+              "%u watched edges, %zu target edges, %u focus edges",
+              geometry_.counters ? "counters" : "bits", coverage.real_edges(),
+              code_edges, geometry_.optimized_count, geometry_.watched,
+              feature_weights_->target_edges().size(),
+              feature_weights_->focus_edges());
+  return true;
+}
+
+bool Fuzzer::KeepFocused(std::vector<uint32_t>* claimed) {
+  const FeatureWeights* weights = feature_weights_.get();
+  if (claimed->empty() || weights == nullptr || !weights->filters_admission()) {
+    return !claimed->empty();
+  }
+  const size_t before = claimed->size();
+  claimed->erase(std::remove_if(claimed->begin(), claimed->end(),
+                                [weights](uint32_t feature) {
+                                  return !weights->InFocus(feature);
+                                }),
+                 claimed->end());
+  unfocused_features_.fetch_add(before - claimed->size(),
+                                std::memory_order_relaxed);
+  if (claimed->empty()) {
+    unfocused_programs_.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+  return true;
+}
+
+void Fuzzer::RecordTargetFlags(const std::vector<std::string>& args,
+                               double score) {
+  if (score <= 0) {
+    return;
+  }
+  std::scoped_lock<std::mutex> lock(target_flags_mutex_);
+  for (TargetFlagEntry& entry : target_flags_) {
+    if (entry.args == args) {
+      entry.score = std::max(entry.score, score);
+      return;
+    }
+  }
+  if (target_flags_.size() < 64) {
+    target_flags_.push_back(TargetFlagEntry{args, score});
+  } else {
+    auto worst = std::min_element(
+        target_flags_.begin(), target_flags_.end(),
+        [](const TargetFlagEntry& a, const TargetFlagEntry& b) {
+          return a.score < b.score;
+        });
+    if (score > worst->score) {
+      *worst = TargetFlagEntry{args, score};
+    }
+  }
+  has_target_flags_.store(true, std::memory_order_relaxed);
+}
+
+void Fuzzer::RecordTargetChild(bool hit) {
+  if (hit) {
+    target_children_hit_.fetch_add(1, std::memory_order_relaxed);
+  }
+  target_children_completed_.fetch_add(1, std::memory_order_release);
+}
+
+std::vector<std::string> Fuzzer::DrawD8Flags(Random& rng) {
+  D8FlagProfile profile = D8FlagProfile::kMaglev;
+  ParseD8FlagProfile(config_.d8_flag_profile, &profile);
+  const std::vector<std::string>& fixed = config_.target.args;
+  std::vector<std::string> fresh = RandomD8Flags(rng, profile, fixed);
+  if (targets_.empty() || !has_target_flags_.load(std::memory_order_relaxed)) {
+    return fresh;
+  }
+  // When most children reach target edges, `EffectiveTargetGuidedChance` lowers
+  // the guided probability so that new children get fresh random flags.
+  const uint64_t completed =
+      target_children_completed_.load(std::memory_order_acquire);
+  const uint64_t hit = target_children_hit_.load(std::memory_order_relaxed);
+  const double effective_guided_chance =
+      EffectiveTargetGuidedChance(completed, hit);
+  if (!rng.Chance(effective_guided_chance)) {
+    return fresh;
+  }
+  std::vector<std::string> base;
+  {
+    std::scoped_lock<std::mutex> lock(target_flags_mutex_);
+    if (target_flags_.empty()) {
+      return fresh;
+    }
+    size_t best = rng.Index(target_flags_.size());
+    const int k = TargetTournament();
+    for (int i = 1; i < k; i++) {
+      size_t candidate = rng.Index(target_flags_.size());
+      if (target_flags_[candidate].score > target_flags_[best].score) {
+        best = candidate;
+      }
+    }
+    base = target_flags_[best].args;
+  }
+  if (rng.Chance(TargetMutateChance())) {
+    return CombineD8Flags(base, fresh, rng, fixed);
+  }
+  return base;
+}
+
+std::string Fuzzer::CoverageStatus() const {
+  if (feature_weights_ == nullptr) {
+    return "";
+  }
+  std::string out;
+  if (feature_weights_ != nullptr && feature_weights_->has_focus()) {
+    out += StringPrintf(" | focus %u/%u", FocusSeen(),
+                        feature_weights_->focus_edges());
+  }
+  if (feature_weights_ != nullptr &&
+      !feature_weights_->target_edges().empty()) {
+    auto count = [this](const std::vector<uint32_t>& edges) {
+      uint32_t found = 0;
+      for (uint32_t edge : edges) {
+        if (coverage_.IsSeen(edge)) {
+          found++;
+        }
+      }
+      return found;
+    };
+    out += StringPrintf(" | target %u/%zu (line %u/%zu)",
+                        count(feature_weights_->target_edges()),
+                        feature_weights_->target_edges().size(),
+                        count(feature_weights_->line_target_edges()),
+                        feature_weights_->line_target_edges().size());
+  }
+  if (geometry_.optimized_count != 0) {
+    out += StringPrintf(" | opt %u",
+                        coverage_.CountSeen(geometry_.optimized_first,
+                                            geometry_.optimized_first +
+                                                geometry_.optimized_count - 1));
+  }
+  if (geometry_.watched != 0) {
+    out += StringPrintf(
+        " | buckets %u",
+        coverage_.CountSeen(geometry_.bucket_first, geometry_.features));
+  }
+  return out;
+}
+
+uint32_t Fuzzer::FocusSeen() const {
+  uint32_t found = 0;
+  for (const auto& [first, last] : feature_weights_->focus()) {
+    found += coverage_.CountSeen(first, last);
+  }
+  return found;
+}
+
+void Fuzzer::AddCoverageStats(JsonObject* event) const {
+  if (feature_weights_ == nullptr) {
+    return;
+  }
+  if (feature_weights_->has_focus()) {
+    event->Add("focus_found", FocusSeen())
+        .Add("focus_total", feature_weights_->focus_edges());
+    event->Add("unfocused_programs",
+               unfocused_programs_.load(std::memory_order_relaxed));
+  }
+  if (geometry_.counters) {
+    uint32_t found = 0;
+    for (uint32_t edge : feature_weights_->target_edges()) {
+      if (coverage_.IsSeen(edge)) {
+        found++;
+      }
+    }
+    event->Add("target_found", found)
+        .Add("target_total",
+             static_cast<uint64_t>(feature_weights_->target_edges().size()));
+    if (!targets_.empty() && config_.randomize_d8_flags) {
+      event->Add("target_children_completed", target_children_completed())
+          .Add("target_children_hit", target_children_hit());
+    }
+  }
+  if (geometry_.optimized_count != 0) {
+    event->Add("opt_found",
+               coverage_.CountSeen(
+                   geometry_.optimized_first,
+                   geometry_.optimized_first + geometry_.optimized_count - 1));
+  }
+  if (geometry_.counters) {
+    event->Add("bucket_found",
+               coverage_.CountSeen(geometry_.bucket_first, geometry_.features));
+  }
 }
 
 void Fuzzer::CollectImports() {
@@ -1782,8 +2394,8 @@ std::string Fuzzer::StatusLine() const {
   double exec_share = Percent(stats_.exec_time_us.load(),
                               static_cast<uint64_t>(elapsed_s * 1e6) *
                                   static_cast<uint64_t>(config_.jobs));
-  return StringPrintf(
-      "%s | execs %llu (%.0f/s) | cov %.3f%% (%u edges) | corpus %zu | "
+  std::string line = StringPrintf(
+      "%s | execs %llu (%.0f/s) | cov %.3f%% (%u edges)%s | corpus %zu | "
       "ok %.1f%% fail %.1f%% timeout %.1f%% | invalid %.2f%% noop %llu | "
       "crashes %llu (%llu sigs, %llu repro) | cands %llu flaky %llu | min %llu "
       "tests (%.1f%% of execs, %.1f%% of "
@@ -1793,7 +2405,8 @@ std::string Fuzzer::StatusLine() const {
       static_cast<unsigned long long>(execs),
       static_cast<double>(execs) / elapsed_s,
       100.0 * coverage_.coverage_fraction(), coverage_.found_edges(),
-      corpus_->size(), Percent(stats_.succeeded.load(), fuzz),
+      CoverageStatus().c_str(), corpus_->size(),
+      Percent(stats_.succeeded.load(), fuzz),
       Percent(stats_.failed.load(), fuzz),
       Percent(stats_.timed_out.load(), fuzz),
       Percent(stats_.invalid.load(), produced),
@@ -1821,6 +2434,7 @@ std::string Fuzzer::StatusLine() const {
           ? 0.0
           : static_cast<double>(stats_.corpus_nodes.load()) /
                 static_cast<double>(stats_.corpus_added.load()));
+  return line;
 }
 
 std::string Fuzzer::ComponentTables(bool include_generators) const {
@@ -1856,13 +2470,17 @@ void Fuzzer::WriteStatsEvent() {
   event.Add("found_edges", coverage_.found_edges())
       .Add("num_edges", coverage_.num_edges());
   event.Add("suppressed_flaky_edges", coverage_.suppressed_flaky_edges());
+  AddCoverageStats(&event);
   event.Add("unique_crashes", stats_.unique_crashes.load());
   event.Add("duplicate_crashes", stats_.duplicate_crashes.load());
+  event.Add("harvested_crashes", stats_.harvested_crashes.load());
   event.Add("crash_signatures", stats_.crash_signatures.load());
   event.Add("crashes_reproduced", stats_.crashes_reproduced.load());
   event.Add("crashes_state_dependent", stats_.crashes_state_dependent.load());
   event.Add("crashes_amplified", stats_.crashes_amplified.load());
   event.Add("amplify_processes", stats_.amplify_processes.load());
+  event.Add("crashes_bundled", stats_.crashes_bundled.load());
+  event.Add("bundle_processes", stats_.bundle_processes.load());
   event.Add("crash_replay_executions", stats_.crash_replay_executions.load());
   event.Add("imports_total", stats_.imports_total.load());
   event.Add("imports_added", stats_.imports_added.load());
@@ -1960,6 +2578,21 @@ int Fuzzer::Run() {
     event.AddRaw("selectors", selectors.ToString());
     event.Add("imports", static_cast<uint64_t>(import_files_.size()));
     event.Add("num_edges", coverage_.num_edges());
+    event.Add("coverage_mode", geometry_.counters ? "counters" : "bits");
+    if (geometry_.counters) {
+      event.Add("watched_edges", geometry_.watched)
+          .Add("optimized_features", geometry_.optimized_count);
+      event.Add(
+          "target_edges",
+          static_cast<uint64_t>(feature_weights_ != nullptr
+                                    ? feature_weights_->target_edges().size()
+                                    : 0));
+      event.Add("focus_edges", feature_weights_ != nullptr
+                                   ? feature_weights_->focus_edges()
+                                   : 0u);
+    } else if (geometry_.optimized_count != 0) {
+      event.Add("optimized_features", geometry_.optimized_count);
+    }
     LogEvent(event);
   }
   REDLINE_LOG(

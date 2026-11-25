@@ -258,7 +258,7 @@ Subgraph<MaglevGraphOptimizer>::Subgraph(
       blocks_(zone_),
       saved_block_(reducer->current_block()),
       saved_position_(reducer->current_block_position()),
-      saved_kna_(&reducer->known_node_aspects()),
+      saved_kna_(reducer->TakeKnownNodeAspects()),
       parent_(reducer->active_subgraph_),
       stashed_nodes_at_(zone_),
       stashed_nodes_at_end_(zone_) {
@@ -283,7 +283,7 @@ Subgraph<MaglevGraphOptimizer>::Subgraph(
 
   // Active KNA = clone of parent, so refinements inside the subgraph don't
   // leak back. Restored to parent_kna_ in the destructor.
-  reducer_->set_known_node_aspects(saved_kna_->Clone(zone_));
+  reducer_->set_known_node_aspects(saved_kna_->Clone());
 
   // We need to set a context, since this is unconditioned in the frame state.
   // It should never be used, since this will never be executed. Use a DeadValue
@@ -332,7 +332,10 @@ Subgraph<MaglevGraphOptimizer>::~Subgraph() {
                               blocks_.end());
       reducer_->set_current_block(exit_block);
       reducer_->SetNewNodePosition(BasicBlockPosition::End());
-      // KNA stays as exit_block's merged aspects (set during Bind).
+      // KNA stays as exit_block's merged aspects (set during Bind); our
+      // saved_kna_ is automatically returned to the pool by ~Subgraph().
+      DCHECK_NE(saved_kna_.get(), parent_->saved_kna_.get());
+      DCHECK_NE(saved_kna_.get(), &reducer_->known_node_aspects());
       return;
     }
     if (reducer_->pending_splice_.has_value()) {
@@ -349,7 +352,8 @@ Subgraph<MaglevGraphOptimizer>::~Subgraph() {
   }
   reducer_->set_current_block(saved_block_);
   reducer_->SetNewNodePosition(saved_position_);
-  reducer_->set_known_node_aspects(saved_kna_);
+  DCHECK_NE(&reducer_->known_node_aspects(), saved_kna_.get());
+  reducer_->set_known_node_aspects(std::move(saved_kna_));
 
   if (parent_ == nullptr) {
     DCHECK(reducer_->new_nodes_at_.empty());
@@ -365,7 +369,7 @@ Subgraph<MaglevGraphOptimizer>::~Subgraph() {
 void Subgraph<MaglevGraphOptimizer>::MergeIntoLabel(Label* label,
                                                     BasicBlock* predecessor) {
   // Borrow active KNA into variable_frame_ so the merge sees it.
-  variable_frame_.set_known_node_aspects(&reducer_->known_node_aspects());
+  variable_frame_.set_known_node_aspects(reducer_->TakeKnownNodeAspects());
   if (label->variable_merge_state_ == nullptr) {
     label->variable_merge_state_ = MergePointInterpreterFrameState::New(
         *dummy_unit_, variable_frame_, /*merge_offset=*/0,
@@ -376,7 +380,7 @@ void Subgraph<MaglevGraphOptimizer>::MergeIntoLabel(Label* label,
         reducer_->graph(), reducer_->is_tracing(), *dummy_unit_,
         variable_frame_, predecessor, std::nullopt);
   }
-  variable_frame_.clear_known_node_aspects();
+  reducer_->set_known_node_aspects(variable_frame_.TakeKnownNodeAspects());
 }
 
 void Subgraph<MaglevGraphOptimizer>::Goto(Label* label) {
@@ -404,12 +408,14 @@ void Subgraph<MaglevGraphOptimizer>::Bind(Label* label) {
   blocks_.push_back(block);
   merge_state->InitializeWithBasicBlock(block);
 
-  // Pull merged frame state + KNA back into variable_frame_, then move KNA
-  // onto the reducer as the active aspects.
+  // Pull merged frame state + cloned KNA into variable_frame_, then move the
+  // cloned KNA onto the reducer as the active aspects while preserving
+  // merge_state's unpolluted KNA for RecomputeKnownNodeAspectsProcessor when it
+  // later walks the spliced blocks.
   variable_frame_.CopyFrom(*dummy_unit_, *merge_state,
-                           /*preserve_known_node_aspects=*/true, zone_);
-  reducer_->set_known_node_aspects(variable_frame_.known_node_aspects());
-  variable_frame_.clear_known_node_aspects();
+                           /*preserve_known_node_aspects=*/true);
+  DCHECK_NE(&reducer_->known_node_aspects(), saved_kna_.get());
+  reducer_->set_known_node_aspects(variable_frame_.TakeKnownNodeAspects());
 
   // Set predecessor IDs on the predecessor blocks' control nodes.
   if (label->predecessor_count_ > 1) {
@@ -932,6 +938,13 @@ Jump* MaglevGraphOptimizer::FoldBranch(BasicBlock* current,
   return new_control_node;
 }
 
+ProcessResult MaglevGraphOptimizer::AbortBlock(BasicBlock* block,
+                                               AbortReason reason) {
+  block->OverwriteControlWithAbort(reason);
+  reducer_.graph()->set_may_have_unreachable_blocks(true);
+  return ProcessResult::kRevisit;
+}
+
 void MaglevGraphOptimizer::AttachExceptionHandlerInfo(NodeBase* node) {
   DCHECK(node->properties().can_throw());
   DCHECK(current_node()->properties().can_throw());
@@ -1104,9 +1117,6 @@ ProcessResult MaglevGraphOptimizer::ProcessCheckMaps(NodeT* node,
     return ProcessResult::kTruncateBlock;
   }
   if (result.IsDone()) {
-    if (merger.emit_check_with_migration()) {
-      return ProcessResult::kContinue;
-    }
     return RemoveCurrentNode();
   }
   if constexpr (std::is_same_v<NodeT, CheckMaps> ||
@@ -1178,7 +1188,14 @@ ProcessResult MaglevGraphOptimizer::VisitCheckNotUndefined(
 
 ProcessResult MaglevGraphOptimizer::VisitCheckHoleyFloat64NotHoleOrUndefined(
     CheckHoleyFloat64NotHoleOrUndefined* node, const ProcessingState& state) {
-  // TODO(b/424157317): Optimize.
+  ValueNode* input = node->input_node(0);
+  if (std::optional<Float64> cst = reducer_.TryGetHoleyFloat64Constant(
+          input, NodeType::kNumberOrOddball)) {
+    return RemoveCheckOrDeopt(!cst->is_undefined_or_hole_nan(),
+                              DeoptimizeReason::kHoleOrUndefined);
+  }
+  REMOVE_AND_RETURN_IF_DONE(reducer_.EnsureType(
+      input, NodeType::kNumber, DeoptimizeReason::kHoleOrUndefined));
   return ProcessResult::kContinue;
 }
 #define VISIT_CHECK(Type)                                 \
@@ -1627,12 +1644,12 @@ ProcessResult MaglevGraphOptimizer::VisitCall(Call* node,
   }
 
   compiler::SharedFunctionInfoRef shared = target_function->shared(broker());
-  // Do not reduce calls to functions with break points.
-  if (shared.HasBreakInfo(broker())) return ProcessResult::kContinue;
   if (IsClassConstructor(shared.kind())) {
     // If we have a class constructor, we should raise an exception.
     return ThrowAndTruncate(Throw::kThrowConstructorNonCallableError, target);
   }
+  // Do not reduce calls to functions with break points.
+  if (shared.HasBreakInfo(broker())) return ProcessResult::kContinue;
 
   // Call's varargs slots are [receiver, arg0, arg1, ...]; CallKnownBuiltin
   // pulls receiver into a fixed input slot.
@@ -1645,9 +1662,13 @@ ProcessResult MaglevGraphOptimizer::VisitCall(Call* node,
   // callees, kNullOrUndefined receivers are replaced by the global proxy;
   // otherwise we emit a runtime ConvertReceiver. Already-known JSReceivers
   // pass through unchanged.
+  if (receiver->IsAnyHoleConstant()) return AbortAndTruncate();
   ConvertReceiverMode receiver_mode = node->receiver_mode();
   ReduceResult converted_receiver_result =
       reducer_.GetConvertReceiver(shared, receiver, receiver_mode);
+  if (converted_receiver_result.IsDoneWithAbort()) {
+    return ProcessResult::kTruncateBlock;
+  }
   if (!converted_receiver_result.IsDoneWithValue()) {
     return ProcessResult::kContinue;
   }
@@ -1724,7 +1745,8 @@ ProcessResult MaglevGraphOptimizer::VisitCall(Call* node,
     arguments[i] = node->arg(i).node();
   }
 
-  if (!reducer_.CanInlineCall(current_unit, shared, call_frequency, arguments,
+  if (!reducer_.CanInlineCall(current_unit, shared, feedback_cell,
+                              call_frequency, arguments,
                               new_call_node->use_repr_hints())) {
     return ReplaceWith(new_call_node);
   }
@@ -1746,13 +1768,14 @@ ProcessResult MaglevGraphOptimizer::VisitCall(Call* node,
   bool is_small_function =
       bytecode_length <
       reducer_.graph()->compilation_info()->flags().max_eager_inlined_bytecode;
-  KnownNodeAspects* call_aspects = known_node_aspects().Clone(reducer_.zone());
+  KnownNodeAspects::Ptr call_aspects = known_node_aspects().Clone();
   call_aspects->virtual_objects() =
       new_call_node->lazy_deopt_info()->top_frame().GetVirtualObjects();
   MaglevCallSiteInfo* call_site = reducer_.zone()->New<MaglevCallSiteInfo>(
       MaglevCallerDetails{
           base::VectorOf(arguments),
-          &new_call_node->lazy_deopt_info()->top_frame(), call_aspects,
+          &new_call_node->lazy_deopt_info()->top_frame(),
+          std::move(call_aspects),
           nullptr,  // loop_effects
           ZoneUnorderedMap<KnownNodeAspects::LoadedContextSlotsKey, Node*>(
               reducer_.zone()),  // unobserved_context_slot_stores
@@ -2179,24 +2202,34 @@ ProcessResult MaglevGraphOptimizer::VisitLoadDoubleDataViewElement(
 ProcessResult MaglevGraphOptimizer::VisitLoadTypedArrayLength(
     LoadTypedArrayLength* node, const ProcessingState& state) {
   if (!IsRabGsabTypedArrayElementsKind(node->elements_kind())) {
-    REPLACE_AND_RETURN_IF_DONE(
-        known_node_aspects().TryFindLoadedConstantProperty(
-            node->ValueInput().node(), PropertyKey::TypedArrayLength()));
+    PropertyConstness constness = v8_flags.track_array_buffer_views
+                                      ? PropertyConstness::kMutable
+                                      : PropertyConstness::kConst;
+    REPLACE_AND_RETURN_IF_DONE(known_node_aspects().TryFindLoadedProperty(
+        node->ValueInput().node(), PropertyKey::TypedArrayLength(), constness));
   }
   return ProcessResult::kContinue;
 }
 
 ProcessResult MaglevGraphOptimizer::VisitLoadDataViewByteLength(
     LoadDataViewByteLength* node, const ProcessingState& state) {
-  REPLACE_AND_RETURN_IF_DONE(known_node_aspects().TryFindLoadedConstantProperty(
-      node->ValueInput().node(), PropertyKey::ArrayBufferViewByteLength()));
+  PropertyConstness constness = v8_flags.track_array_buffer_views
+                                    ? PropertyConstness::kMutable
+                                    : PropertyConstness::kConst;
+  REPLACE_AND_RETURN_IF_DONE(known_node_aspects().TryFindLoadedProperty(
+      node->ValueInput().node(), PropertyKey::ArrayBufferViewByteLength(),
+      constness));
   return ProcessResult::kContinue;
 }
 
 ProcessResult MaglevGraphOptimizer::VisitLoadDataViewDataPointer(
     LoadDataViewDataPointer* node, const ProcessingState& state) {
-  REPLACE_AND_RETURN_IF_DONE(known_node_aspects().TryFindLoadedConstantProperty(
-      node->ValueInput().node(), PropertyKey::ArrayBufferViewDataPointer()));
+  PropertyConstness constness = v8_flags.track_array_buffer_views
+                                    ? PropertyConstness::kMutable
+                                    : PropertyConstness::kConst;
+  REPLACE_AND_RETURN_IF_DONE(known_node_aspects().TryFindLoadedProperty(
+      node->ValueInput().node(), PropertyKey::ArrayBufferViewDataPointer(),
+      constness));
   return ProcessResult::kContinue;
 }
 
@@ -3739,15 +3772,13 @@ ProcessResult MaglevGraphOptimizer::VisitBranchIfRootConstant(
 
 ProcessResult MaglevGraphOptimizer::VisitBranchIfToBooleanTrue(
     BranchIfToBooleanTrue* node, const ProcessingState& state) {
-  if (IsConstantNode(node->input_node(0)->opcode())) {
-    // Holes shouldn't flow up to here: there should be either a ThrowXXXIfHole
-    // or a CheckNotHole before, which should have been constant-folded into
-    // unconditional deopt/throw if their input is a hole.
-    DCHECK_IMPLIES(node->input_node(0)->Is<HeapConstant>(),
-                   !node->input_node(0)->Cast<HeapConstant>()->IsAnyHole());
+  ValueNode* input = node->input_node(0);
+  if (IsConstantNode(input->opcode())) {
+    if (input->IsAnyHoleConstant()) {
+      return AbortBlock(state.block());
+    }
 
-    bool condition =
-        FromConstantToBool(reducer_.local_isolate(), node->input_node(0));
+    bool condition = FromConstantToBool(reducer_.local_isolate(), input);
     FoldBranch(state.block(), node, condition);
     return ProcessResult::kRevisit;
   }
@@ -4035,9 +4066,7 @@ ProcessResult MaglevGraphOptimizer::VisitJumpLoop(
 ProcessResult MaglevGraphOptimizer::VisitDeadValue(
     DeadValue* node, const ProcessingState& state) {
   // DeadValues are unreachable, so we truncate the block now.
-  auto res = reducer_.BuildAbort(AbortReason::kUnreachable);
-  CHECK(res.IsDoneWithAbort());
-  return ProcessResult::kTruncateBlock;
+  return AbortAndTruncate();
 }
 
 // Nodes never emitted before Graph optimizer.

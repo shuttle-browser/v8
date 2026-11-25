@@ -123,7 +123,8 @@ class V8_EXPORT_PRIVATE MaglevAssembler : public MacroAssembler {
   // Whether the architecture has a register that always reads as zero, which
   // can be stored instead of materializing a zero constant.
   static constexpr bool HasZeroRegister() {
-#if defined(V8_TARGET_ARCH_ARM64) || defined(V8_TARGET_ARCH_LOONG64)
+#if defined(V8_TARGET_ARCH_ARM64) || defined(V8_TARGET_ARCH_LOONG64) || \
+    defined(V8_TARGET_ARCH_RISCV64)
     return true;
 #else
     return false;
@@ -133,7 +134,7 @@ class V8_EXPORT_PRIVATE MaglevAssembler : public MacroAssembler {
   static Register ZeroRegister() {
 #if defined(V8_TARGET_ARCH_ARM64)
     return xzr;
-#elif defined(V8_TARGET_ARCH_LOONG64)
+#elif defined(V8_TARGET_ARCH_LOONG64) || defined(V8_TARGET_ARCH_RISCV64)
     return zero_reg;
 #else
     UNREACHABLE();
@@ -536,6 +537,9 @@ class V8_EXPORT_PRIVATE MaglevAssembler : public MacroAssembler {
   inline void Move(DoubleRegister dst, double n);
   inline void Move(DoubleRegister dst, Float64 n);
   inline void Move(Register dst, Handle<HeapObject> obj);
+  // Loads {obj} with LoadRoot if it is an immortal immovable root, and returns
+  // whether it did.
+  bool TryLoadRoot(Register dst, Handle<HeapObject> obj);
 
   void Move(ExternalReference dst, int32_t imm);
 
@@ -575,6 +579,7 @@ class V8_EXPORT_PRIVATE MaglevAssembler : public MacroAssembler {
                                                        DoubleRegister src);
 
   inline void SignExtend32To64Bits(Register dst, Register src);
+  inline void ZeroExtend32To64Bits(Register dst, Register src);
   inline void NegateInt32(Register val);
 
   void CountLeadingZerosInt32(Register dst, Register src);
@@ -1076,12 +1081,12 @@ class SaveRegisterStateForCall {
       }
       pushed_reg_index++;
     }
-#ifdef V8_TARGET_ARCH_ARM64
+#if defined(V8_TARGET_ARCH_ARM64) || V8_X64_16BYTE_STACK_ALIGNMENT_BOOL
     pushed_reg_index = RoundUp<2>(pushed_reg_index);
 #endif
     int num_double_slots = snapshot_.live_double_registers.Count() *
                            (kDoubleSize / kSystemPointerSize);
-#ifdef V8_TARGET_ARCH_ARM64
+#if defined(V8_TARGET_ARCH_ARM64) || V8_X64_16BYTE_STACK_ALIGNMENT_BOOL
     num_double_slots = RoundUp<2>(num_double_slots);
 #endif
     safepoint.SetNumExtraSpillSlots(pushed_reg_index + num_double_slots);

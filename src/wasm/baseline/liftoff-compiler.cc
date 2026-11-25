@@ -3520,7 +3520,7 @@ class LiftoffCompiler {
     LiftoffRegList pinned;
     LiftoffRegister obj = pinned.set(__ PopToRegister(pinned));
     if (null_check_strategy_ == compiler::NullCheckStrategy::kExplicit ||
-        IsSubtypeOf(kWasmRefI31, arg.type.AsNonShared(), decoder->module_) ||
+        arg.type.can_be_i31() ||
         IsSubtypeOf(kWasmExnRef, arg.type.AsNonShared(), decoder->module_) ||
         !arg.type.use_wasm_null()) {
       // Use an explicit null check if
@@ -6517,7 +6517,7 @@ class LiftoffCompiler {
     } else {
       LiftoffRegister full_index = __ PopToRegister();
       index = BoundsCheckMem(decoder, imm.memory, type.size(), imm.offset,
-                             full_index, {}, kDoForceCheck, kCheckAlignment);
+                             full_index, {}, kDontForceCheck, kCheckAlignment);
       pinned.set(index);
       CODE_COMMENT("atomic load");
     }
@@ -6525,8 +6525,13 @@ class LiftoffCompiler {
     Register addr = pinned.set(GetMemoryStart(imm.mem_index, pinned));
     RegClass rc = reg_class_for(kind);
     LiftoffRegister value = pinned.set(__ GetUnusedRegister(rc, pinned));
-    __ AtomicLoad(value, addr, index, offset, type, nullptr, imm.memory_order,
-                  pinned, i64_offset);
+    uint32_t trapping_load_pc = 0;
+    __ AtomicLoad(value, addr, index, offset, type, &trapping_load_pc,
+                  imm.memory_order, pinned, i64_offset);
+    if (index != no_reg && imm.memory->bounds_checks == kTrapHandler) {
+      DCHECK_NE(trapping_load_pc, 0);
+      RegisterTrappingInstruction(decoder, trapping_load_pc);
+    }
     __ PushRegister(kind, value);
 
     if (V8_UNLIKELY(v8_flags.trace_wasm_memory)) {
@@ -7472,21 +7477,29 @@ class LiftoffCompiler {
     ValueKind elem_kind = imm.array_type->element_type().kind();
     if (!CheckSupportedType(decoder, elem_kind, "array load")) return;
 
-    // As we don't have `PeekToModifiableRegister`, simply allocate a new
-    // register for the array + index  and then "free" the array and
-    // index registers.
-    LiftoffRegister mem_location =
+    // As we don't have `PeekToModifiableRegister`, allocate a new register for
+    // the scaled index (or for `array + scaled_index` for non-reference types,
+    // where i64 values need register pairs and no write barrier is emitted).
+    LiftoffRegister offset_or_mem_location =
         pinned.set(__ GetUnusedRegister(kGpReg, pinned));
     int elem_size_shift = value_kind_size_log2(elem_kind);
-    if (elem_size_shift != 0) {
-      __ emit_i32_shli(mem_location.gp(), index->gp(), elem_size_shift);
-      __ emit_i32_add(mem_location.gp(), mem_location.gp(), array->gp());
+    if (is_reference(elem_kind)) {
+      DCHECK_NE(elem_size_shift, 0);
+      __ emit_i32_shli(offset_or_mem_location.gp(), index->gp(),
+                       elem_size_shift);
+    } else if (elem_size_shift != 0) {
+      __ emit_i32_shli(offset_or_mem_location.gp(), index->gp(),
+                       elem_size_shift);
+      __ emit_i32_add(offset_or_mem_location.gp(), offset_or_mem_location.gp(),
+                      array->gp());
+      pinned.clear(*array);
+      array = {};
     } else {
-      __ emit_i32_add(mem_location.gp(), array->gp(), index->gp());
+      __ emit_i32_add(offset_or_mem_location.gp(), array->gp(), index->gp());
+      pinned.clear(*array);
+      array = {};
     }
-    pinned.clear(*array);
     pinned.clear(*index);
-    array = {};
     index = {};
 
     LiftoffRegister new_value = pinned.set(__ PopToRegister(pinned));
@@ -7496,11 +7509,11 @@ class LiftoffCompiler {
 
     LiftoffRegister result_reg = expected_value;
     if (is_reference(elem_kind)) {
-      __ AtomicCompareExchangeTaggedPointer(mem_location.gp(), no_reg, offset,
-                                            expected_value, new_value,
-                                            result_reg, nullptr, pinned);
+      __ AtomicCompareExchangeTaggedPointer(
+          array->gp(), offset_or_mem_location.gp(), offset, expected_value,
+          new_value, result_reg, nullptr, pinned);
     } else {
-      __ AtomicCompareExchange(mem_location.gp(), no_reg, offset,
+      __ AtomicCompareExchange(offset_or_mem_location.gp(), no_reg, offset,
                                expected_value, new_value, result_reg,
                                StoreType::ForValueKind(elem_kind), nullptr,
                                false, LiftoffAssembler::kNative);
@@ -8172,7 +8185,7 @@ class LiftoffCompiler {
       }
       // Skipping the write barrier is safe as long as:
       // {obj} is freshly allocated, and
-      // {obj} is in new-space (not pretenured).
+      // {obj} is in new-space.
       // OR
       // {!initial_values_on_stack}, i.e., only RO-space objects as fields.
       // There currently is no shared new-space, and descriptors are allocated
@@ -8341,7 +8354,7 @@ class LiftoffCompiler {
     // Initialize the array's elements.
     // Skipping the write barrier is safe as long as:
     // {obj} is freshly allocated, and
-    // {obj} is in new-space (not pretenured).
+    // {obj} is in new-space.
     // OR
     // {value} is read-only.
     bool in_old_space = is_shared || v8_flags.single_generation;
@@ -8598,7 +8611,7 @@ class LiftoffCompiler {
                    (i << value_kind_size_log2(elem_kind));
       // Skipping the write barrier is safe as long as:
       // (1) {array} is freshly allocated, and
-      // (2) {array} is in new-space (not pretenured).
+      // (2) {array} is in new-space.
       StoreObjectField(decoder, array.gp(), no_reg, offset - kHeapObjectTag,
                        element, false, pinned, elem_kind, write_barrier);
     }
@@ -8901,7 +8914,7 @@ class LiftoffCompiler {
     Register tmp1 = scratch_null;  // Done with null checks.
 
     // Add Smi check if the source type may store a Smi (i31ref or JS Smi).
-    if (IsSubtypeOf(kWasmRefI31, obj_type.AsNonShared(), module)) {
+    if (obj_type.can_be_i31()) {
       __ emit_smi_check(obj_reg, no_match, LiftoffAssembler::kJumpOnSmi,
                         frozen);
     }
@@ -11073,7 +11086,7 @@ class LiftoffCompiler {
           offsetof(WasmInternalFunction, protected_implicit_arg_));
 
       __ LoadCodePointer(target_reg, internal_function,
-                         offsetof(WasmInternalFunction, raw_call_target_));
+                         offsetof(WasmInternalFunction, call_target_));
 
       // Now the call target is in {target_reg} and the first parameter
       // (WasmTrustedInstanceData or WasmImportData) is in

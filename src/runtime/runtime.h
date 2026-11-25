@@ -70,11 +70,7 @@ constexpr bool CanTriggerGC(T... properties) {
   F(AtomicsOr, 3, 1)                                   \
   F(AtomicsSub, 3, 1)                                  \
   F(AtomicsXor, 3, 1)                                  \
-  F(SetAllowAtomicsWait, 1, 1)                         \
-  F(AtomicsLoadSharedStructOrArray, 2, 1)              \
-  F(AtomicsStoreSharedStructOrArray, 3, 1)             \
-  F(AtomicsExchangeSharedStructOrArray, 3, 1)          \
-  F(AtomicsCompareExchangeSharedStructOrArray, 4, 1)
+  F(SetAllowAtomicsWait, 1, 1)
 
 #define FOR_EACH_INTRINSIC_BIGINT(F, I)                               \
   F(BigIntCompareToNumber, 3, 1)                                      \
@@ -83,7 +79,6 @@ constexpr bool CanTriggerGC(T... properties) {
   F(BigIntEqualToNumber, 2, 1)                                        \
   F(BigIntEqualToString, 2, 1)                                        \
   F(BigIntExponentiate, 2, 1)                                         \
-  F(BigIntMaxBits, 0, 1)                                              \
   F(BigIntToNumber, 1, 1)                                             \
   F(BigIntUnaryOp, 2, 1)                                              \
   F(ToBigInt, 1, 1)                                                   \
@@ -129,7 +124,6 @@ constexpr bool CanTriggerGC(T... properties) {
   F(CompileOptimizedOSRFromMaglevInlined, 2, 1)                  \
   F(LogOrTraceOptimizedOSREntry, 0, 1)                           \
   F(CompileLazy, 1, 1)                                           \
-  F(CompileBaseline, 1, 1)                                       \
   F(InstallBaselineCode, 1, 1)                                   \
   F(InstallSFICode, 1, 1)                                        \
   F(NotifyDeoptimized, 0, 1)                                     \
@@ -311,7 +305,6 @@ constexpr bool CanTriggerGC(T... properties) {
   F(ReportMessageFromMicrotask, 1, 1)                      \
   F(RunMicrotaskCallback, 2, 1)                            \
   F(PerformMicrotaskCheckpoint, 0, 1)                      \
-  F(SharedValueBarrierSlow, 1, 1)                          \
   F(StackGuard, 0, 1)                                      \
   F(HandleNoHeapWritesInterrupts, 0, 1)                    \
   F(StackGuardWithGap, 1, 1)                               \
@@ -559,16 +552,19 @@ constexpr bool CanTriggerGC(T... properties) {
   F(BaselineOsr, -1, 1)                                                  \
   F(BenchMaglev, 2, 1)                                                   \
   F(BenchTurbofan, 2, 1)                                                 \
+  F(BigIntMaxBits, 0, 1)                                                 \
   F(BlockAt, 2, 1)                                                       \
   F(VerifyGetJSBuiltinState, 1, 1)                                       \
   F(ClearFunctionFeedback, 1, 1)                                         \
   F(ClearMegamorphicStubCache, 0, 1)                                     \
+  F(CompileBaseline, 1, 1)                                               \
   F(CompleteInobjectSlackTracking, 1, 1)                                 \
   F(ConstructConsString, 2, 1)                                           \
   F(ConstructDouble, 2, 1)                                               \
   F(ConstructInternalizedString, 1, 1)                                   \
   F(ConstructSlicedString, 2, 1)                                         \
   F(ConstructThinString, 1, 1)                                           \
+  F(ConsumeCodeCache, 2, 1)                                              \
   F(CurrentFrameIsTurbofan, 0, 1)                                        \
   F(DebugPrint, -1, 1, RuntimeCallProperty::kCannotTriggerGC)            \
   F(DebugPrintCppHeapPointerTable, -1, 1)                                \
@@ -595,6 +591,7 @@ constexpr bool CanTriggerGC(T... properties) {
   F(GetBytecode, 1, 1)                                                   \
   F(ExhaustInterruptBudget, 1, 1)                                        \
   F(GetCallable, 1, 1)                                                   \
+  F(GetCodeCache, 1, 1)                                                  \
   F(GetFeedback, 1, 1)                                                   \
   F(GetFunctionForCurrentFrame, 0, 1)                                    \
   F(GetInitializerFunction, 1, 1)                                        \
@@ -663,7 +660,6 @@ constexpr bool CanTriggerGC(T... properties) {
   F(OptimizeFunctionOnNextCall, -1, 1)                                   \
   F(OptimizeOsr, -1, 1)                                                  \
   F(PrepareFunctionForOptimization, -1, 1)                               \
-  F(PretenureAllocationSite, 1, 1)                                       \
   F(PrintWithNameForAssert, 2, 1, RuntimeCallProperty::kCannotTriggerGC) \
   F(PromiseSpeciesProtector, 0, 1)                                       \
   F(RegExpSpeciesProtector, 0, 1)                                        \

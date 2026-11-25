@@ -428,7 +428,7 @@ class TurboshaftGraphBuildingInterface
 
     if (mode_ == kRegular) {
       StackCheck(WasmStackCheckOp::Kind::kFunctionEntry);
-      instance_cache_.Initialize(trusted_instance_data);
+      instance_cache_.Initialize(trusted_instance_data, decoder->module_);
     }
 
     if (v8_flags.trace_wasm) {
@@ -2141,9 +2141,8 @@ class TurboshaftGraphBuildingInterface
                   offsetof(WasmFastApiCallData, callback_data_));
       V<WordPtr> data_argument_to_pass = __ AdaptLocalArgument(callback_data);
 
-      START_ALLOW_USE_DEPRECATED()
-      constexpr size_t data_offset = offsetof(v8::FastApiCallbackOptions, data);
-      END_ALLOW_USE_DEPRECATED()
+      constexpr size_t data_offset =
+          offsetof(v8::FastApiCallbackOptions, data_);
       __ StoreOffHeap(options_object, data_argument_to_pass,
                       MemoryRepresentation::UintPtr(), data_offset);
     }
@@ -5564,9 +5563,10 @@ class TurboshaftGraphBuildingInterface
   }
 
   void WaitqueueNew(FullDecoder* decoder, Value* result) {
-    result->op =
+    V<HeapObject> waitqueue =
         CallBuiltinThroughJumptable<BuiltinCallDescriptor::WasmWaitqueueNew>(
             decoder, {});
+    result->op = __ AnnotateWasmType(waitqueue, result->type);
   }
 
   void ArrayNew(FullDecoder* decoder, const ArrayIndexImmediate& imm,
@@ -5923,12 +5923,7 @@ class TurboshaftGraphBuildingInterface
     if constexpr (SmiValuesAre31Bits()) {
       V<Word32> shifted =
           __ Word32ShiftLeft(input.get<Word32>(), kSmiTagSize + kSmiShiftSize);
-      if constexpr (Is64()) {
-        // The uppermost bits don't matter.
-        result->op = __ BitcastWord32ToWord64(shifted);
-      } else {
-        result->op = shifted;
-      }
+      result->op = __ ChangeUint32ToUintPtr(shifted);
     } else {
       // Set the topmost bit to sign-extend the second bit. This way,
       // interpretation in JS (if this value escapes there) will be the same as
@@ -6716,7 +6711,8 @@ class TurboshaftGraphBuildingInterface
    public:
     explicit InstanceCache(Assembler& assembler) : asm_(assembler) {}
 
-    void Initialize(V<WasmTrustedInstanceData> trusted_instance_data) {
+    void Initialize(V<WasmTrustedInstanceData> trusted_instance_data,
+                    const WasmModule* module) {
       DCHECK(!trusted_data_.valid());  // Only call {Initialize()} once.
       trusted_data_ = trusted_instance_data;
       managed_object_maps_ =
@@ -6727,11 +6723,38 @@ class TurboshaftGraphBuildingInterface
           __ Load(trusted_instance_data, LoadOp::Kind::TaggedBase().Immutable(),
                   MemoryRepresentation::TaggedPointer(),
                   WasmTrustedInstanceData::kNativeContextOffset);
+      if (!module->memories.empty()) {
+        const WasmMemory& mem0 = module->memories[0];
+        if (!mem0.can_move()) {
+          memory0_start_ = __ Load(
+              trusted_instance_data, LoadOp::Kind::TaggedBase().Immutable(),
+              MemoryRepresentation::UintPtr(),
+              WasmTrustedInstanceData::kMemory0StartOffset);
+        }
+        if (!mem0.can_grow()) {
+          if (mem0.is_shared) {
+            V<WordPtr> size_addr = __ Load(
+                trusted_instance_data, LoadOp::Kind::TaggedBase().Immutable(),
+                MemoryRepresentation::UintPtr(),
+                WasmTrustedInstanceData::kMemory0SizeOrAddressOffset);
+            memory0_size_ =
+                __ Load(size_addr, LoadOp::Kind::RawAligned().Immutable(),
+                        MemoryRepresentation::UintPtr(), 0);
+          } else {
+            memory0_size_ = __ Load(
+                trusted_instance_data, LoadOp::Kind::TaggedBase().Immutable(),
+                MemoryRepresentation::UintPtr(),
+                WasmTrustedInstanceData::kMemory0SizeOrAddressOffset);
+          }
+        }
+      }
     }
 
     V<WasmTrustedInstanceData> trusted_instance_data() { return trusted_data_; }
     V<FixedArray> managed_object_maps() { return managed_object_maps_; }
     V<NativeContext> native_context() { return native_context_; }
+    OptionalV<WordPtr> immutable_memory0_start() { return memory0_start_; }
+    OptionalV<WordPtr> immutable_memory0_size() { return memory0_size_; }
 
    private:
     // For compatibility with `__` macro.
@@ -6741,6 +6764,8 @@ class TurboshaftGraphBuildingInterface
     V<WasmTrustedInstanceData> trusted_data_;
     V<FixedArray> managed_object_maps_;
     V<NativeContext> native_context_;
+    OptionalV<WordPtr> memory0_start_;
+    OptionalV<WordPtr> memory0_size_;
 
     // Other fields for internal usage.
     Assembler& asm_;
@@ -8267,6 +8292,9 @@ class TurboshaftGraphBuildingInterface
   }
 
   V<WordPtr> MemStart(uint32_t index) {
+    if (index == 0 && instance_cache_.immutable_memory0_start().has_value()) {
+      return instance_cache_.immutable_memory0_start().value();
+    }
     const WasmMemory& mem = env_->module->memories[index];
     LoadOp::Kind kind = LoadOp::Kind::TaggedBase();
     if (!mem.can_move()) kind = kind.Immutable();
@@ -8274,6 +8302,7 @@ class TurboshaftGraphBuildingInterface
         instance_cache_.trusted_instance_data();
 
     if (index == 0) {
+      DCHECK(mem.can_move());
       return __ Load(trusted_data, kind, MemoryRepresentation::UintPtr(),
                      WasmTrustedInstanceData::kMemory0StartOffset);
     }
@@ -8311,8 +8340,12 @@ class TurboshaftGraphBuildingInterface
   }
 
   V<WordPtr> MemSize(uint32_t index) {
+    if (index == 0 && instance_cache_.immutable_memory0_size().has_value()) {
+      return instance_cache_.immutable_memory0_size().value();
+    }
     const WasmMemory& mem = env_->module->memories[index];
     if (mem.is_shared) {
+      DCHECK(index != 0 || mem.can_grow());
       V<WordPtr> size_address = MemSizeAddress(index);
       // A relaxed (non-atomic) aligned word load is sufficient for bounds
       // checks; `memory.size` uses an explicit atomic load.
@@ -8329,6 +8362,7 @@ class TurboshaftGraphBuildingInterface
         instance_cache_.trusted_instance_data();
 
     if (index == 0) {
+      DCHECK(mem.can_grow());
       return __ Load(trusted_data, kind, MemoryRepresentation::UintPtr(),
                      WasmTrustedInstanceData::kMemory0SizeOrAddressOffset);
     }
@@ -8595,11 +8629,8 @@ class TurboshaftGraphBuildingInterface
             ? LoadOp::Kind::TrapOnNull().Immutable()
             : LoadOp::Kind::TaggedBase().Immutable();
 
-    V<WasmInternalFunction> internal_function =
-        V<WasmInternalFunction>::Cast(__ LoadTrustedPointer(
-            func_ref, load_kind, kWasmInternalFunctionTrustedPointerTag,
-            offsetof(WasmFuncRef, trusted_internal_)));
-    return BuildFunctionTargetAndImplicitArg(internal_function);
+    return BuildFunctionTargetAndImplicitArg(
+        LoadInternalFunctionFromFuncRef(func_ref, load_kind));
   }
 
   OpIndex AnnotateResultIfReference(OpIndex result, wasm::ValueType type) {
@@ -9090,8 +9121,9 @@ class TurboshaftGraphBuildingInterface
                         compiler::WasmTypeCheckConfig config,
                         const Value& object, Value* value_on_fallthrough,
                         uint32_t br_depth, bool null_succeeds) {
-    OpIndex cast_succeeds = __ WasmTypeCheck(object.get<Object>(), rtt, config);
-    IF (__ Word32Equal(cast_succeeds, 0)) {
+    V<Word32> cast_succeeds =
+        __ WasmTypeCheck(object.get<Object>(), rtt, config);
+    IF_NOT (cast_succeeds) {
       // It is necessary in case of {null_succeeds} to forward the value.
       // This will add a TypeGuard to the non-null type (as in this case the
       // object is non-nullable).

@@ -6,6 +6,7 @@
 
 #include "src/snapshot/snapshot.h"
 
+#include "include/v8-cppgc.h"
 #include "src/api/api-inl.h"  // For OpenHandle.
 #include "src/base/numerics/safe_conversions.h"
 #include "src/baseline/baseline-batch-compiler.h"
@@ -25,6 +26,7 @@
 #include "src/snapshot/shared-heap-serializer.h"
 #include "src/snapshot/snapshot-utils.h"
 #include "src/snapshot/startup-serializer.h"
+#include "src/tracing/trace-event.h"
 #include "src/utils/memcopy.h"
 #include "src/utils/version.h"
 
@@ -258,7 +260,7 @@ void Snapshot::ClearReconstructableDataForSerialization(
 #if V8_ENABLE_WEBASSEMBLY
     // Clear the cached js-to-wasm wrappers.
     isolate->heap()->SetJSToWasmWrappers(
-        ReadOnlyRoots(isolate).empty_weak_fixed_array());
+        isolate->heap()->empty_protected_weak_fixed_array());
 #endif  // V8_ENABLE_WEBASSEMBLY
 
     // Must happen after heap iteration since SFI::DiscardCompiled may allocate.

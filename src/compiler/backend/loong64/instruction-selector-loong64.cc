@@ -47,6 +47,9 @@ class Loong64OperandGenerator final : public OperandGenerator {
       if (constant->IsIntegral()) {
         return constant->integral() == 0;
       }
+      if (constant->kind == ConstantOp::Kind::kSmi) {
+        return constant->smi().value() == 0;
+      }
       if (constant->kind == ConstantOp::Kind::kFloat32) {
         return constant->float32().get_bits() == 0;
       }
@@ -829,7 +832,9 @@ void InstructionSelector::VisitStore(OpIndex node) {
   // TODO(loong64): I guess this could be done in a better way.
   if (write_barrier_kind != kNoWriteBarrier &&
       !v8_flags.disable_write_barriers) {
-    DCHECK(CanBeTaggedOrCompressedOrTrustedPointer(rep));
+    DCHECK(CanBeTaggedOrCompressedOrTrustedPointer(rep) ||
+           (write_barrier_kind == kSkippedWriteBarrier &&
+            rep == MachineRepresentation::kTaggedSigned));
     AddressingMode addressing_mode;
     InstructionOperand inputs[4];
     size_t input_count = 0;
@@ -858,6 +863,8 @@ void InstructionSelector::VisitStore(OpIndex node) {
       inputs[input_count++] = g.UseImmediate64(static_cast<int64_t>(tag));
     } else if (write_barrier_kind == kSkippedWriteBarrier) {
       code = kArchStoreSkippedWriteBarrier;
+      code |=
+          CheckSmiField::encode(rep == MachineRepresentation::kTaggedSigned);
     } else {
       code = kArchStoreWithWriteBarrier;
       const RecordWriteMode record_write_mode =
@@ -1370,13 +1377,21 @@ void InstructionSelector::VisitWord64Clz(OpIndex node) {
   VisitRR(this, kLoong64Clz_d, node);
 }
 
-void InstructionSelector::VisitWord32Ctz(OpIndex node) { UNREACHABLE(); }
+void InstructionSelector::VisitWord32Ctz(OpIndex node) {
+  VisitRR(this, kLoong64Ctz_w, node);
+}
 
-void InstructionSelector::VisitWord64Ctz(OpIndex node) { UNREACHABLE(); }
+void InstructionSelector::VisitWord64Ctz(OpIndex node) {
+  VisitRR(this, kLoong64Ctz_d, node);
+}
 
-void InstructionSelector::VisitWord32Popcnt(OpIndex node) { UNREACHABLE(); }
+void InstructionSelector::VisitWord32Popcnt(OpIndex node) {
+  VisitRR(this, kLoong64Popcnt_w, node);
+}
 
-void InstructionSelector::VisitWord64Popcnt(OpIndex node) { UNREACHABLE(); }
+void InstructionSelector::VisitWord64Popcnt(OpIndex node) {
+  VisitRR(this, kLoong64Popcnt_d, node);
+}
 
 void InstructionSelector::VisitInt32Add(OpIndex node) {
   Loong64OperandGenerator g(this);
@@ -1906,12 +1921,6 @@ void InstructionSelector::VisitTryTruncateFloat64ToUint32(OpIndex node) {
   Emit(kLoong64Float64ToUint32, output_count, outputs, 1, inputs);
 }
 
-void InstructionSelector::VisitBitcastWord32ToWord64(OpIndex node) {
-  DCHECK(SmiValuesAre31Bits());
-  DCHECK(COMPRESS_POINTERS_BOOL);
-  EmitIdentity(node);
-}
-
 void InstructionSelector::VisitChangeInt32ToInt64(OpIndex node) {
   Loong64OperandGenerator g(this);
   const ChangeOp& change_op = this->Get(node).template Cast<ChangeOp>();
@@ -2235,6 +2244,16 @@ void InstructionSelector::EmitPrepareArguments(
     OpIndex node) {
   Loong64OperandGenerator g(this);
 
+  // Zero-valued constants (e.g. Smi zero) can be stored through the zero
+  // register, but only for non-FP parameters: the code generator dispatches
+  // FP pokes on the operand being an FP register.
+  auto poke_value = [&](const PushParameter& input) {
+    if (IsFloatingPoint(input.location.GetType().representation())) {
+      return g.UseRegister(input.node);
+    }
+    return g.UseRegisterOrImmediateZero(input.node);
+  };
+
   // Prepare for C function call.
   if (call_descriptor->IsCFunctionCall()) {
     int gp_param_count = static_cast<int>(call_descriptor->GPParameterCount());
@@ -2244,11 +2263,11 @@ void InstructionSelector::EmitPrepareArguments(
     Emit(kArchPrepareCallCFunction, g.NoOutput(), g.TempImmediate(param_count));
 
     // Poke any stack arguments.
-    int slot = 0;
-    for (PushParameter input : (*arguments)) {
-      Emit(kLoong64Poke, g.NoOutput(), g.UseRegister(input.node),
-           g.TempImmediate(slot << kSystemPointerSizeLog2));
-      ++slot;
+    for (size_t n = 0; n < arguments->size(); ++n) {
+      PushParameter input = (*arguments)[n];
+      if (!input.node.valid()) continue;
+      Emit(kLoong64Poke, g.NoOutput(), poke_value(input),
+           g.TempImmediate(static_cast<int>(n << kSystemPointerSizeLog2)));
     }
   } else {
     int push_count = static_cast<int>(call_descriptor->ParameterSlotCount());
@@ -2266,7 +2285,7 @@ void InstructionSelector::EmitPrepareArguments(
     for (size_t n = 0; n < arguments->size(); ++n) {
       PushParameter input = (*arguments)[n];
       if (input.node.valid()) {
-        Emit(kLoong64Poke, g.NoOutput(), g.UseRegister(input.node),
+        Emit(kLoong64Poke, g.NoOutput(), poke_value(input),
              g.TempImmediate(static_cast<int>(n << kSystemPointerSizeLog2)));
       }
     }
@@ -2609,26 +2628,31 @@ void VisitAtomicStore(InstructionSelector* selector, OpIndex node,
     write_barrier_kind = kFullWriteBarrier;
   }
 
-  InstructionOperand inputs[] = {g.UseRegister(base), g.UseRegister(index),
-                                 g.UseRegisterOrImmediateZero(value)};
+  InstructionOperand inputs[] = {g.UseUniqueRegister(base),
+                                 g.UseUniqueRegister(index),
+                                 g.UseRegisterAtEndOrImmediateZero(value)};
   InstructionOperand temps[2] = {};
   size_t temp_count = 0;
   InstructionCode code;
 
   if (write_barrier_kind != kNoWriteBarrier &&
       !v8_flags.disable_write_barriers) {
-    DCHECK(CanBeTaggedPointer(rep));
+    DCHECK(CanBeTaggedOrCompressedPointer(rep) ||
+           (write_barrier_kind == kSkippedWriteBarrier &&
+            rep == MachineRepresentation::kTaggedSigned));
     DCHECK_EQ(AtomicWidthSize(width), kTaggedSize);
 
     if (write_barrier_kind == kSkippedWriteBarrier) {
       code = kArchAtomicStoreSkippedWriteBarrier;
-      temps[temp_count++] = g.TempRegister();
+      code |=
+          CheckSmiField::encode(rep == MachineRepresentation::kTaggedSigned);
       temps[temp_count++] = g.TempRegister();
     } else {
       RecordWriteMode record_write_mode =
           WriteBarrierKindToRecordWriteMode(write_barrier_kind);
       code = kArchAtomicStoreWithWriteBarrier;
       code |= RecordWriteModeField::encode(record_write_mode);
+      temps[temp_count++] = g.TempRegister();
     }
   } else {
     switch (rep) {
@@ -3674,6 +3698,22 @@ SIMD_VISIT_EXTRACT_LANE(I8x16, S)
 SIMD_TYPE_LIST(SIMD_VISIT_REPLACE_LANE)
 #undef SIMD_VISIT_REPLACE_LANE
 
+#define SIMD_VISIT_MOVE_LANE(Type)                                     \
+  void InstructionSelector::Visit##Type##MoveLane(OpIndex node) {      \
+    Loong64OperandGenerator g(this);                                   \
+    const Simd128MoveLaneOp& op = Get(node).Cast<Simd128MoveLaneOp>(); \
+    Emit(kLoong64##Type##MoveLane, g.DefineSameAsFirst(node),          \
+         g.UseRegister(op.into()), g.UseRegister(op.from()),           \
+         g.UseImmediate(op.from_lane), g.UseImmediate(op.into_lane));  \
+  }
+SIMD_VISIT_MOVE_LANE(F64x2)
+SIMD_VISIT_MOVE_LANE(F32x4)
+SIMD_VISIT_MOVE_LANE(I64x2)
+SIMD_VISIT_MOVE_LANE(I32x4)
+SIMD_VISIT_MOVE_LANE(I16x8)
+SIMD_VISIT_MOVE_LANE(I8x16)
+#undef SIMD_VISIT_MOVE_LANE
+
 #define SIMD_VISIT_UNOP(Name, instruction)              \
   void InstructionSelector::Visit##Name(OpIndex node) { \
     VisitRR(this, instruction, node);                   \
@@ -4026,6 +4066,10 @@ InstructionSelector::SupportedMachineOperatorFlags() {
          MachineOperatorBuilder::kFloat32RoundTruncate |
          MachineOperatorBuilder::kFloat64RoundTiesEven |
          MachineOperatorBuilder::kFloat32RoundTiesEven |
+         MachineOperatorBuilder::kWord32Ctz |
+         MachineOperatorBuilder::kWord64Ctz |
+         MachineOperatorBuilder::kWord32Popcnt |
+         MachineOperatorBuilder::kWord64Popcnt |
          MachineOperatorBuilder::kWord64Select;
 }
 

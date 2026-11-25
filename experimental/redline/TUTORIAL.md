@@ -49,7 +49,7 @@ A d8 with coverage instrumentation executes every program. This d8 is the *targe
 Build the target:
 
 ```shell
-gn gen out/fuzzbuild --args='is_debug=false dcheck_always_on=true v8_enable_debug_code=true v8_static_library=true v8_enable_verify_heap=true v8_fuzzilli=true v8_enable_backtrace=true v8_enable_partition_alloc=false v8_enable_builtins_profiling=true sanitizer_coverage_flags="inline-bool-flag" target_cpu="x64" use_remoteexec=true'
+gn gen out/fuzzbuild --args='is_debug=false dcheck_always_on=true v8_enable_debug_code=true v8_static_library=true v8_enable_verify_heap=true v8_redline=true v8_enable_backtrace=true v8_enable_partition_alloc=false v8_enable_builtins_profiling=true sanitizer_coverage_flags="inline-bool-flag" target_cpu="x64" use_remoteexec=true'
 autoninja -C out/fuzzbuild d8
 ```
 
@@ -62,7 +62,7 @@ If you do not have remote build execution, remove `use_remoteexec=true` from the
 | `v8_enable_debug_code=true` | Makes the d8 flag `--debug-code` available. This flag adds assertions to the code that V8 generates. |
 | `v8_static_library=true` | Builds the V8 libraries as static libraries instead of source sets. |
 | `v8_enable_verify_heap=true` | Compiles the heap verifier (`VERIFY_HEAP`) into d8. |
-| `v8_fuzzilli=true` | Adds the REPRL loop and the shared-memory coverage map to d8. Redline uses both. |
+| `v8_redline=true` | Adds the REPRL loop, the `redline()` builtin and the shared-memory coverage map to d8 (`experimental/redline/d8/`). Redline uses all three. |
 | `v8_enable_backtrace=true` | Makes d8 print a stack trace when it crashes. Redline uses the top frames for crash signatures. |
 | `v8_enable_partition_alloc=false` | Makes d8 use the system allocator instead of PartitionAlloc. |
 | `v8_enable_builtins_profiling=true` | Makes d8 report the basic blocks of the builtins as additional coverage edges. |
@@ -116,6 +116,7 @@ out/redline/redline selftest --d8=out/fuzzbuild/d8
 ...
 PASS  REPRL handshake and coverage initialization
 INFO  instrumented edges: <n>
+INFO  coverage header: inline-bool-flag, 1 bit(s) per edge, code 1..<n> builtins <n>..<n>, build id <hex>
 PASS  empty script succeeds: succeeded (exit code 0, signal 0, <n> ms)
 PASS  uncaught exception is reported as failed: failed (exit code 1, signal 0, <n> ms)
 ...
@@ -123,6 +124,8 @@ selftest: <n> passed, 0 failed
 ```
 
 The second command checks the execution layer: the REPRL handshake, the outcomes, the output capture, the coverage and the restart of d8.
+The `coverage header` line shows the header of the shared memory of d8.
+It has the mode of `sanitizer_coverage_flags`, the regions of edges and the build ID of d8.
 If a check fails, examine the build of the target first.
 
 ## 3. Run one program
@@ -438,6 +441,7 @@ cat experimental/redline/presets/maglev.json
 ```json
 {
   "d8_extra_args": ["--maglev", "--no-turbofan", "--jit-fuzzing"],
+  "randomize_d8_flags": true,
   "selection": {"seeds": {"strategy": "rarity"}, "partners": {"strategy": "rarity-partner"}, "mutators": {"strategy": "adaptive"},
     "generators": {"strategy": "adaptive", "params": {"weights": {
       "JitOptimize": 8, "Deopt": 3, "OsrLoop": 3, "ElementsKind": 4, "ShapeChange": 3}}}}
@@ -445,6 +449,8 @@ cat experimental/redline/presets/maglev.json
 ```
 
 - `d8_extra_args` adds flags to the d8 flags, like `--d8-extra-args`.
+- `randomize_d8_flags` gives each new d8 process a random set of extra flags, for example `--maglev-assert`. The `flags.*` tunables set their probabilities.
+  `d8_flag_profile` selects the list of random flags: `maglev` (the default) or `turbolev`.
 - `selection` sets the strategies. `weights` sets the base weight of the named generators. The other generators keep their default weights.
 
 `--preset=maglev` loads `presets/maglev.json`. `--preset=FILE.json` loads any file.
@@ -459,6 +465,8 @@ Redline makes the effective configuration from four layers. A later layer wins:
 These rules apply when the layers merge:
 
 - Each layer adds its `d8_extra_args` to the d8 flags. The flag `--d8-extra-args` adds more flags.
+- A `d8_args` key replaces all the d8 flags of the earlier layers.
+- The flag `--d8-args` replaces the default d8 flags and the `d8_args` key. It keeps the `d8_extra_args` of the preset and of the configuration.
 - A `params` object in `selection` replaces the `params` object of an earlier layer. For example, the `weights` of your file replace all the weights of the preset.
 - The flags `--generator-weights`, `--mutator-weights`, `--disable-generator` and `--disable-mutator` change single weights. The other weights stay.
 - The flag `--import` adds files to the seed files of the configuration.
@@ -522,7 +530,7 @@ Write this file to `/tmp/redline-tutorial/typedarray.json`:
 
 The paths of the seed files are relative to the directory where you start Redline.
 Keep the session settings, for example `--jobs` and `--out`, on the command line.
-Then the same file can also be a preset (section 7.9).
+Then the same file can also be a preset (section 7.10).
 
 ### 7.3 Check the configuration
 
@@ -658,6 +666,7 @@ When a worker finds a crash, Redline does these steps:
 
 1. It runs the program again in a new d8, to find out if the crash reproduces.
 2. If the crash does not reproduce alone, Redline runs the earlier programs of the same d8 before it. A crash that needs them is *state-dependent*.
+   For a state-dependent crash, Redline writes these programs and the crash program into one d8 bundle. Then it runs the bundle in plain d8 processes with `--bundle-reprl`.
 3. If the crash still does not reproduce, Redline searches for d8 flags that make it reproduce. This is the amplify step.
 4. Redline minimizes a reproducible crash. The minimized program must give the same crash signature.
 5. Redline saves the files, and adds the signature to `crashes/signatures.txt`.
@@ -676,6 +685,7 @@ The file names contain the signal number and a hash:
 | `crash_sig6_<hash>.orig.js` | The original program, if Redline minimized it. |
 | `crash_sig6_<hash>.txt` | The report: the signature, the reproduction runs, the minimization, and the output of d8. |
 | `crash_sig6_<hash>.history/` | For a state-dependent crash only: the programs to run first, in their order. |
+| `crash_sig6_<hash>.bundle.js` | For a state-dependent crash only: the programs to run first and the crash program, in one file for `d8 --bundle-reprl`. |
 | `signatures.txt` | One line for each crash signature. |
 
 The `.js` file starts with a header:
@@ -751,8 +761,50 @@ out/redline/redline amplify --d8=out/fuzzbuild/d8 --d8-extra-args=--jit-fuzzing 
 `amplify` runs the program in new d8 processes with additional flags, for example `--stress-runs`.
 It prints the flags that reproduce the crash as `amplified_args`.
 For a state-dependent crash, run the files of the `.history/` directory in their order, and then the crash program.
+Or run the bundle in one plain d8 process.
+The d8 must have the `--bundle-reprl` flag:
 
-### 7.9 Make a named preset
+```shell
+out/fuzzbuild/d8 --expose-gc --allow-natives-syntax --fuzzing --bundle-reprl /tmp/redline-typedarray/crashes/crash_sig6_<hash>.bundle.js
+```
+
+Use the d8 flags of the session. The `run:` line at the top of the bundle gives them.
+The report gives the plain d8 runs of the bundle that crashed with the same signature in `bundle_rate`.
+
+### 7.9 Fuzz the changes of a CL (change-based fuzzing)
+
+Change-based fuzzing gives more fuzzing time to the code that a CL changed. It needs a d8 with coverage counters and line tables.
+Build it next to the normal fuzzing build:
+
+```shell
+gn gen out/rl_counters --args='is_debug=false dcheck_always_on=true v8_enable_debug_code=true v8_static_library=true v8_enable_verify_heap=true v8_redline=true v8_enable_backtrace=true v8_enable_partition_alloc=false v8_enable_builtins_profiling=true sanitizer_coverage_flags="inline-8bit-counters,pc-table" symbol_level=1 target_cpu="x64"'
+autoninja -C out/rl_counters d8
+```
+
+Compute the target edges of your change against `origin/main` (the working tree counts too). The first run also writes the edge map of the build, `out/rl_counters/redline/edges.jsonl.gz`:
+
+```shell
+python3 experimental/redline/tools/change_targets.py --d8=out/rl_counters/d8 --out=/tmp/targets.json
+```
+
+For a landed commit, use `--base=COMMIT^ --head=COMMIT`.
+Then fuzz with the targets. For a Maglev change, also turn on the optimized code coverage:
+
+```shell
+out/redline/redline fuzz --d8=out/rl_counters/d8 --preset=maglev \
+    --d8-extra-args=--fuzzilli-enable-optimized-code-coverage \
+    --targets=/tmp/targets.json --jobs=16 --out=/tmp/change_session
+```
+
+The status line shows `focus found/total`, `target found/total`, `opt` and `buckets`.
+The target total counts only the edges that can run without a failed check.
+The focus is the code of the directories of the changed files (`src/maglev/` for a Maglev change).
+Redline keeps a new program only if it does something new in the focus.
+`change_targets.py --focus=src/maglev/,src/compiler/` sets other directories, and `--focus=none` removes the focus.
+`redline fuzz --focus=false` ignores the focus of the targets file.
+`--target-boost=N` (default 20) sets the extra weight of a target edge. `--optimized-weight`, `--builtins-weight`, `--bucket-weight` and `--unfocused-weight` set the other weights. The `coverage` block of a configuration file sets the same values.
+
+### 7.10 Make a named preset
 
 `--preset=NAME` loads `experimental/redline/presets/NAME.json`.
 Copy your file into this directory, and check it:

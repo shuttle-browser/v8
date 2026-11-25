@@ -648,11 +648,8 @@ InstructionOperand OperandForDeopt(Isolate* isolate, OperandGenerator* g,
     const Operation& bitcast_input = g->Get(bitcast->input());
     if (const ConstantOp* cst =
             bitcast_input.TryCast<Opmask::kWord32Constant>()) {
-      if constexpr (Is64()) {
-        return g->UseImmediate64(cst->word32());
-      } else {
-        return g->UseImmediate(cst->word32());
-      }
+      DCHECK(!Is64());
+      return g->UseImmediate(cst->word32());
     } else if (Is64() && bitcast_input.Is<Opmask::kWord64Constant>()) {
       if (rep == MachineRepresentation::kWord32) {
         return g->UseImmediate(bitcast_input.Cast<ConstantOp>().word32());
@@ -1877,7 +1874,6 @@ VISIT_UNSUPPORTED_OP(Int64LessThan)
 VISIT_UNSUPPORTED_OP(Int64LessThanOrEqual)
 VISIT_UNSUPPORTED_OP(Uint64LessThan)
 VISIT_UNSUPPORTED_OP(Uint64LessThanOrEqual)
-VISIT_UNSUPPORTED_OP(BitcastWord32ToWord64)
 VISIT_UNSUPPORTED_OP(ChangeInt32ToInt64)
 VISIT_UNSUPPORTED_OP(ChangeInt64ToFloat64)
 VISIT_UNSUPPORTED_OP(ChangeUint32ToUint64)
@@ -2011,14 +2007,16 @@ IF_WASM(VISIT_UNSUPPORTED_OP, MemoryFill)
 
 IF_SIMD128(VISIT_UNSUPPORTED_OP, I32x4AddPairwise)
 IF_SIMD128(VISIT_UNSUPPORTED_OP, I32x4DotI8x16S)
+#endif  // !V8_TARGET_ARCH_ARM64
 
+#if !V8_TARGET_ARCH_ARM64 && !V8_TARGET_ARCH_LOONG64
 IF_SIMD128(VISIT_UNSUPPORTED_OP, I8x16MoveLane)
 IF_SIMD128(VISIT_UNSUPPORTED_OP, I16x8MoveLane)
 IF_SIMD128(VISIT_UNSUPPORTED_OP, I32x4MoveLane)
 IF_SIMD128(VISIT_UNSUPPORTED_OP, I64x2MoveLane)
 IF_SIMD128(VISIT_UNSUPPORTED_OP, F32x4MoveLane)
 IF_SIMD128(VISIT_UNSUPPORTED_OP, F64x2MoveLane)
-#endif  // !V8_TARGET_ARCH_ARM64
+#endif  // !V8_TARGET_ARCH_ARM64 && !V8_TARGET_ARCH_LOONG64
 
 IF_SIMD128(VISIT_UNSUPPORTED_OP, F16x8MoveLane)
 
@@ -2071,6 +2069,10 @@ void InstructionSelector::VisitOsrValue(OpIndex node) {
 void InstructionSelector::VisitPhi(OpIndex node) {
   const Operation& op = Get(node);
   DCHECK_EQ(op.input_count, PredecessorCount(current_block_));
+  if (V8_UNLIKELY(op.input_count == 1)) {
+    EmitIdentity(node);
+    return;
+  }
   PhiInstruction* phi = instruction_zone()->template New<PhiInstruction>(
       instruction_zone(), GetVirtualRegister(node),
       static_cast<size_t>(op.input_count));
@@ -2434,13 +2436,14 @@ void InstructionSelector::VisitTailCall(OpIndex node) {
     buffer.instruction_args.push_back(g.TempImmediate(callee->shifted_tag()));
   }
 
-  // Add an immediate operand that represents the offset to the first slot
-  // that is unused with respect to the stack pointer that has been updated
-  // for the tail call instruction. Backends that pad arguments can write the
-  // padding value at this offset from the stack.
-  const int optional_padding_offset =
+  // Add an immediate operand carrying the callee's unpadded stack parameter
+  // slot count. Backends that pad odd stack argument areas use this both to
+  // check whether a padding slot is present and to zero that slot above the
+  // parameters (and above any return address on the stack).
+  const int unpadded_stack_param_slots =
       callee->GetOffsetToFirstUnusedStackSlot() - 1;
-  buffer.instruction_args.push_back(g.TempImmediate(optional_padding_offset));
+  buffer.instruction_args.push_back(
+      g.TempImmediate(unpadded_stack_param_slots));
 
   const int first_unused_slot_offset =
       kReturnAddressStackSlotCount + stack_param_delta;
@@ -3113,8 +3116,6 @@ void InstructionSelector::VisitNode(OpIndex node) {
           return VisitTruncateInt64ToInt32(node);
         case ChangeOp::Kind::kBitcast:
           switch (multi(change.from, change.to)) {
-            case multi(Rep::Word32(), Rep::Word64()):
-              return VisitBitcastWord32ToWord64(node);
             case multi(Rep::Word32(), Rep::Float32()):
               return VisitBitcastInt32ToFloat32(node);
             case multi(Rep::Word64(), Rep::Float64()):
@@ -3722,6 +3723,7 @@ void InstructionSelector::VisitNode(OpIndex node) {
         case multi(Rep::Word32(), Rep::Tagged()):
         case multi(Rep::Word64(), Rep::Tagged()):
           if (cast.kind == TaggedBitcastOp::Kind::kSmi) {
+            DCHECK_EQ(cast.from, Rep::WordPtr());
             MarkAsRepresentation(MachineRepresentation::kTaggedSigned, node);
             return EmitIdentity(node);
           } else {
@@ -4338,10 +4340,16 @@ FrameStateDescriptor* InstructionSelector::GetFrameStateDescriptor(
       this->turboshaft_graph()->Get(node).template Cast<FrameStateOp>();
   auto* desc = GetFrameStateDescriptorInternal(instruction_zone(),
                                                this->turboshaft_graph(), state);
-  *max_unoptimized_frame_height_ =
-      std::max(*max_unoptimized_frame_height_,
-               desc->total_conservative_frame_size_in_bytes() +
-                   (desc->max_arguments() * kSystemPointerSize));
+  // Include the maximum stack size needed by each parent frame in the deopt
+  // chain, as a parent frame may have another call site with more outgoing
+  // arguments than the inlined call site leading to this frame state.
+  for (FrameStateDescriptor* iter = desc; iter != nullptr;
+       iter = iter->outer_state()) {
+    *max_unoptimized_frame_height_ =
+        std::max(*max_unoptimized_frame_height_,
+                 iter->total_conservative_frame_size_in_bytes() +
+                     (iter->max_arguments() * kSystemPointerSize));
+  }
   return desc;
 }
 

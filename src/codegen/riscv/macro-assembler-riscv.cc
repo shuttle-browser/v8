@@ -441,7 +441,7 @@ void MacroAssembler::LoadExternalPointerField(Register destination,
                                               Register isolate_root) {
   DCHECK(!AreAliased(destination, isolate_root));
   ASM_CODE_COMMENT(this);
-#ifdef V8_ENABLE_SANDBOX
+#ifdef V8_COMPRESS_POINTERS
   DCHECK(!tag_range.IsEmpty());
   DCHECK(!IsSharedExternalPointerType(tag_range));
   UseScratchRegisterScope temps(this);
@@ -487,7 +487,7 @@ void MacroAssembler::LoadExternalPointerField(Register destination,
   }
 #else
   LoadWord(destination, field_operand);
-#endif  // V8_ENABLE_SANDBOX
+#endif  // V8_COMPRESS_POINTERS
 }
 
 void MacroAssembler::MaybeSaveRegisters(RegList registers) {
@@ -2623,14 +2623,19 @@ void MacroAssembler::li(Register rd, Operand j, LiFlags mode) {
 #endif
       return;
     } else if (RelocInfo::IsFullEmbeddedObject(j.rmode())) {
+      Handle<HeapObject> handle;
       if (j.IsHeapNumberRequest()) {
         RequestHeapNumber(j.heap_number_request());
-        immediate = j.immediate_for_heap_number_request();
+        // Heap-number requests have no real handle location. Leave `handle`
+        // null so that AddEmbeddedObject skips handle-based deduplication (the
+        // pool slot is filled in later by PatchInHeapNumberRequest). Also keep
+        // the immediate at zero instead of exposing the request's double bits.
+        immediate = 0;
       } else {
         immediate = j.immediate();
+        handle = Handle<HeapObject>(reinterpret_cast<Address*>(immediate));
       }
 #if V8_TARGET_ARCH_RISCV64
-      Handle<HeapObject> handle(reinterpret_cast<Address*>(immediate));
       EmbeddedObjectIndex index = AddEmbeddedObject(handle);
       if (RecordEntry64(index, j.rmode()) == RelocInfoStatus::kMustRecord) {
         RecordRelocInfo(j.rmode(), index);
@@ -2648,6 +2653,15 @@ void MacroAssembler::li(Register rd, Operand j, LiFlags mode) {
       return;
     } else {
       immediate = j.immediate();
+    }
+    if (mode == OPTIMIZE_SIZE && !ShouldRecordRelocInfo(j.rmode())) {
+      // The fixed-length sequence below is there so that whatever finds the
+      // load through its reloc info can patch in another value. Without reloc
+      // info nothing can, so load the value as the plain constant it is. That
+      // is the usual case for external references and for the off-heap
+      // builtin entries CallBuiltin and TailCallBuiltin load.
+      li(rd, Operand(immediate), mode);
+      return;
     }
     RecordRelocInfo(j.rmode(), immediate);
     li_ptr(rd, immediate);
@@ -6100,7 +6114,7 @@ void MacroAssembler::WasmRvvGtU(VRegister dst, VRegister lhs, VRegister rhs) {
 void MacroAssembler::WasmRvvS128const(VRegister dst, const uint8_t imms[16]) {
   uint64_t vals[2];
   memcpy(vals, imms, sizeof(vals));
-  VU.SetSimd128(E64);
+  VU.SetSimd128(E64, tu);
   li(kScratchReg, vals[1]);
   vmv_sx(kSimd128ScratchReg, kScratchReg);
   vslideup_vi(dst, kSimd128ScratchReg, 1);
@@ -6111,7 +6125,7 @@ void MacroAssembler::WasmRvvS128const(VRegister dst, const uint8_t imms[16]) {
 void MacroAssembler::WasmRvvS128const(VRegister dst, const uint8_t imms[16]) {
   uint32_t vals[4];
   memcpy(vals, imms, sizeof(vals));
-  VU.SetSimd128(E32);
+  VU.SetSimd128(E32, tu);
   li(kScratchReg, vals[3]);
   vmv_vx(kSimd128ScratchReg, kScratchReg);
   li(kScratchReg, vals[2]);
@@ -7918,6 +7932,8 @@ void MacroAssembler::PushDispatchHandle(Register dispatch_handle,
   DCHECK(!AreAliased(dispatch_handle, scratch1, scratch2));
 #ifdef V8_ENABLE_SANDBOX
   AssertZeroExtended(dispatch_handle);
+  And(dispatch_handle, dispatch_handle,
+      Operand(~((1 << kJSDispatchHandleShift) - 1)));
   LoadParameterCountFromJSDispatchTable(scratch1, dispatch_handle, scratch2);
   ZeroExtendWord(dispatch_handle, dispatch_handle);
   slli(scratch1, scratch1, 32);

@@ -30,6 +30,7 @@
 #include "src/objects/js-array-buffer.h"
 #include "src/objects/js-objects.h"
 #include "src/objects/literal-objects.h"
+#include "src/objects/scope-info.h"
 #include "src/objects/tagged-field-inl.h"
 #include "src/objects/templates.h"
 #include "src/sandbox/sandbox-zero-segment.h"
@@ -1106,10 +1107,6 @@ void ReportSandboxViolation() {
   PrintToStderr("\n## V8 sandbox violation detected!\n\n");
 }
 
-#ifdef V8_USE_ADDRESS_SANITIZER
-bool g_is_asan_fault_harmless = false;
-#endif
-
 void UninstallCrashFilter() {
   // NOTE: This code MUST be async-signal safe.
   // NO malloc or stdio is allowed here.
@@ -1400,33 +1397,29 @@ bool IsHarmlessMemcpyParamOverlap() {
          sandbox->ReservationContains(dest_last);
 }
 
-bool IsHarmlessASanFault(const char* description, Address faultaddr,
-                         MemoryAccessType access_type) {
+void FilterHarmlessASanFault(const char* description, Address faultaddr,
+                             MemoryAccessType access_type) {
   if (description && strcmp(description, "memcpy-param-overlap") == 0) {
     if (IsHarmlessMemcpyParamOverlap()) {
-      PrintToStderr(
+      FilterCrash(
           "Caught harmless ASan fault (overlapping memcpy safely contained "
-          "in the sandbox).\n");
-      return true;
+          "in the sandbox).");
     }
     // Otherwise, treat it as a sandbox violation.
-    return false;
+    return;
   }
 
   if (faultaddr == kNullAddress) {
-    PrintToStderr(
+    FilterCrash(
         "Caught ASan fault without a fault address. Ignoring it as we cannot "
-        "check if it is a sandbox violation.\n");
-    return true;
+        "check if it is a sandbox violation.");
   }
 
   if (IsCrashInSafeMemoryRegion(faultaddr, access_type)) {
-    PrintToStderr("Caught harmless ASan fault (inside safe region).\n");
-    return true;
+    FilterCrash("Caught harmless ASan fault (inside safe region).");
   }
-
-  return false;
 }
+
 }  // namespace
 
 extern "C" V8_EXPORT_PRIVATE void __asan_on_error() {
@@ -1449,28 +1442,20 @@ extern "C" V8_EXPORT_PRIVATE void __asan_on_error() {
   const MemoryAccessType access_type = __asan_get_report_access_type() == 0
                                            ? MemoryAccessType::kRead
                                            : MemoryAccessType::kWrite;
-  if (IsHarmlessASanFault(description, faultaddr, access_type)) {
-    g_is_asan_fault_harmless = true;
-  } else {
-    ReportSandboxViolation();
-  }
+  FilterHarmlessASanFault(description, faultaddr, access_type);
+
+  // If we get here, we've detected a sandbox violation.
+  ReportSandboxViolation();
 }
 #endif  // V8_USE_ADDRESS_SANITIZER
 
 #ifdef V8_USE_ANY_SANITIZER
 void SanitizerFaultHandler() {
 #ifdef V8_USE_ADDRESS_SANITIZER
-  if (!g_is_sandbox_violation && !g_is_asan_fault_harmless) {
+  if (!g_is_sandbox_violation) {
     PrintToStderr(
         "Warning: ASan death callback triggered before the fault could be "
         "classified. Falling back to treating it as a sandbox violation.\n");
-  }
-
-  if (g_is_asan_fault_harmless && !g_is_sandbox_violation) {
-    PrintToStderr("Exiting process after harmless fault...\n");
-    int status =
-        SandboxTesting::mode() == SandboxTesting::Mode::kForFuzzing ? -1 : 0;
-    _exit(status);
   }
 #endif  // V8_USE_ADDRESS_SANITIZER
 
@@ -1506,11 +1491,10 @@ void InstallCrashFilter() {
   CHECK(success);
 
 #ifdef V8_USE_ANY_SANITIZER
-  // We install a sanitizer death callback. For ASan, this will check the flag
-  // set by __asan_on_error to determine if the fault was harmless.
-  //
-  // The crash handler also resets the signal handler as sanitizer may use
-  // `abort()` via `abort_on_error=1` option to signal problems.
+  // We install a sanitizer death callback to report sandbox violations for
+  // sanitizers that don't go through __asan_on_error(), and to reset the signal
+  // handlers as sanitizers may use `abort()` via `abort_on_error=1` option to
+  // signal problems.
   __sanitizer_set_death_callback(&SanitizerFaultHandler);
 #endif  // V8_USE_ANY_SANITIZER
 }
@@ -1572,8 +1556,12 @@ SandboxTesting::InstanceTypeMap& SandboxTesting::GetInstanceTypeMap() {
     types["SEQ_TWO_BYTE_STRING_TYPE"] = SEQ_TWO_BYTE_STRING_TYPE;
     types["INTERNALIZED_ONE_BYTE_STRING_TYPE"] =
         INTERNALIZED_ONE_BYTE_STRING_TYPE;
+    types["UNCACHED_EXTERNAL_ONE_BYTE_STRING_TYPE"] =
+        UNCACHED_EXTERNAL_ONE_BYTE_STRING_TYPE;
     types["SLICED_ONE_BYTE_STRING_TYPE"] = SLICED_ONE_BYTE_STRING_TYPE;
     types["CONS_ONE_BYTE_STRING_TYPE"] = CONS_ONE_BYTE_STRING_TYPE;
+    types["THIN_ONE_BYTE_STRING_TYPE"] = THIN_ONE_BYTE_STRING_TYPE;
+    types["FREE_SPACE_TYPE"] = FREE_SPACE_TYPE;
     types["SHARED_FUNCTION_INFO_TYPE"] = SHARED_FUNCTION_INFO_TYPE;
     types["SCRIPT_TYPE"] = SCRIPT_TYPE;
     types["JS_PROMISE_TYPE"] = JS_PROMISE_TYPE;
@@ -1586,10 +1574,16 @@ SandboxTesting::InstanceTypeMap& SandboxTesting::GetInstanceTypeMap() {
     types["FIXED_DOUBLE_ARRAY_TYPE"] = FIXED_DOUBLE_ARRAY_TYPE;
     types["WEAK_HOMOMORPHIC_FIXED_ARRAY_TYPE"] =
         WEAK_HOMOMORPHIC_FIXED_ARRAY_TYPE;
-    types["NATIVE_CONTEXT_TYPE"] = NATIVE_CONTEXT_TYPE;
+    for (std::underlying_type_t<InstanceType> context_type = FIRST_CONTEXT_TYPE;
+         context_type <= LAST_CONTEXT_TYPE; ++context_type) {
+      InstanceType instance_type = static_cast<InstanceType>(context_type);
+      types[ToString(instance_type)] = instance_type;
+    }
+    types["SCOPE_INFO_TYPE"] = SCOPE_INFO_TYPE;
     types["MAP_TYPE"] = MAP_TYPE;
     types["CLASS_BOILERPLATE_TYPE"] = CLASS_BOILERPLATE_TYPE;
 #ifdef V8_ENABLE_WEBASSEMBLY
+    types["WASM_CONTINUATION_OBJECT_TYPE"] = WASM_CONTINUATION_OBJECT_TYPE;
     types["WASM_FUNC_REF_TYPE"] = WASM_FUNC_REF_TYPE;
     types["WASM_GLOBAL_OBJECT_TYPE"] = WASM_GLOBAL_OBJECT_TYPE;
     types["WASM_INSTANCE_OBJECT_TYPE"] = WASM_INSTANCE_OBJECT_TYPE;
@@ -1660,6 +1654,13 @@ SandboxTesting::FieldOffsetMap& SandboxTesting::GetFieldOffsetMap() {
         offsetof(SlicedString, offset_);
     fields[CONS_ONE_BYTE_STRING_TYPE]["first"] = offsetof(ConsString, first_);
     fields[CONS_ONE_BYTE_STRING_TYPE]["second"] = offsetof(ConsString, second_);
+    fields[THIN_ONE_BYTE_STRING_TYPE]["actual"] = offsetof(ThinString, actual_);
+    fields[SEQ_ONE_BYTE_STRING_TYPE]["chars"] = sizeof(SeqOneByteString);
+    fields[INTERNALIZED_ONE_BYTE_STRING_TYPE]["chars"] =
+        sizeof(SeqOneByteString);
+    fields[FREE_SPACE_TYPE]["size_in_tagged"] =
+        offsetof(FreeSpace, size_in_tagged_);
+    fields[FREE_SPACE_TYPE]["next"] = offsetof(FreeSpace, next_);
     fields[SHARED_FUNCTION_INFO_TYPE]["trusted_function_data"] =
         offsetof(SharedFunctionInfo, trusted_function_data_);
     fields[SHARED_FUNCTION_INFO_TYPE]["length"] =
@@ -1672,6 +1673,7 @@ SandboxTesting::FieldOffsetMap& SandboxTesting::GetFieldOffsetMap() {
         offsetof(SharedFunctionInfo, script_);
     fields[SHARED_FUNCTION_INFO_TYPE]["unique_id"] =
         offsetof(SharedFunctionInfo, unique_id_);
+    fields[SCRIPT_TYPE]["source"] = offsetof(Script, source_);
     fields[SCRIPT_TYPE]["wasm_managed_native_module"] =
         offsetof(Script, eval_from_position_);
     fields[JS_PROMISE_TYPE]["reactions_or_result"] =
@@ -1688,8 +1690,19 @@ SandboxTesting::FieldOffsetMap& SandboxTesting::GetFieldOffsetMap() {
     fields[FIXED_ARRAY_TYPE]["data"] = FixedArray::kHeaderSize;
     fields[WEAK_HOMOMORPHIC_FIXED_ARRAY_TYPE]["length"] =
         offsetof(WeakFixedArray, length_);
+    for (std::underlying_type_t<InstanceType> context_type = FIRST_CONTEXT_TYPE;
+         context_type <= LAST_CONTEXT_TYPE; ++context_type) {
+      InstanceType instance_type = static_cast<InstanceType>(context_type);
+      fields[instance_type]["scope_info"] = Context::kScopeInfoOffset;
+      fields[instance_type]["previous"] = Context::kPreviousOffset;
+    }
     fields[NATIVE_CONTEXT_TYPE]["microtask_queue"] =
         NativeContext::kMicrotaskQueueOffset;
+    fields[SCOPE_INFO_TYPE]["flags"] = offsetof(ScopeInfo, flags_);
+    fields[SCOPE_INFO_TYPE]["parameter_count"] =
+        offsetof(ScopeInfo, parameter_count_);
+    fields[SCOPE_INFO_TYPE]["context_local_count"] =
+        offsetof(ScopeInfo, context_local_count_);
     fields[CLASS_BOILERPLATE_TYPE]["instance_properties_template"] =
         offsetof(ClassBoilerplate, instance_properties_template_);
 #ifdef V8_INTL_SUPPORT
@@ -1697,6 +1710,8 @@ SandboxTesting::FieldOffsetMap& SandboxTesting::GetFieldOffsetMap() {
         offsetof(JSSegments, icu_iterator_with_text_);
 #endif  // V8_INTL_SUPPORT
 #ifdef V8_ENABLE_WEBASSEMBLY
+    fields[WASM_CONTINUATION_OBJECT_TYPE]["stack_obj"] =
+        offsetof(WasmContinuationObject, stack_obj_);
     fields[WASM_FUNC_REF_TYPE]["trusted_internal"] =
         offsetof(WasmFuncRef, trusted_internal_);
     fields[WASM_GLOBAL_OBJECT_TYPE]["buffer"] =
