@@ -249,6 +249,11 @@ void NodeInfo::TraceSetPossibleMaps(const KnownNodeAspects& known_node_aspects,
   std::cout << std::endl;
 }
 
+// Note: `KnaMap::CanSkipSharedRange` skips shared roots and leaves during
+// `DestructivelyIntersect` based on the survival and side-effect invariants of
+// the merge callbacks below; keep `CanSkipSharedRange` in sync if these
+// callbacks change.
+// LINT.IfChange(KnaMergeSkipShared)
 void KnownNodeAspects::Merge(const KnownNodeAspects& other, Zone* zone) {
   bool side_effects_require_invalidation = false;
   DestructivelyIntersect(
@@ -301,6 +306,7 @@ void KnownNodeAspects::Merge(const KnownNodeAspects& other, Zone* zone) {
       may_have_aliasing_contexts_, other.may_have_aliasing_contexts());
   DestructivelyIntersect(loaded_context_slots_, other.loaded_context_slots_);
 }
+// LINT.ThenChange(maglev-kna-map.h:KnaMergeSkipShared)
 
 // Loop-header variant of Merge. The forward (LHS) predecessor dominates the
 // loop body, so its facts hold throughout the loop: keep them instead of
@@ -427,7 +433,7 @@ void KnownNodeAspects::MergeForLoop(const KnownNodeAspects& backedge,
       });
 }
 
-void KnownNodeAspects::UnwrapIdentitiesAndPhisInKeys(Zone* zone) {
+void KnownNodeAspects::UnwrapIdentitiesAndPhisInKeys() {
   auto unwrap = [](ValueNode* node) -> ValueNode* {
     return node == nullptr ? nullptr : node->UnwrapIdentitiesAndPhis();
   };
@@ -561,8 +567,8 @@ void KnownNodeAspects::ClearUnstableNodeAspectsForStoreMap(
 }
 
 void KnownNodeAspects::ClearUnstableNodeAspectsForMigration(
-    Node* node, bool is_tracing_enabled) {
-  if (MarkSingleMapAsStale(node->input_node(0), is_tracing_enabled)) {
+    ValueNode* object, bool is_tracing_enabled) {
+  if (MarkSingleMapAsStale(object, is_tracing_enabled)) {
     return;
   }
 
@@ -596,8 +602,10 @@ void KnownNodeAspects::ClearUnstableNodeAspectsForElementsTransition(
   // A transitioning object's elements store may be reallocated; drop cached
   // elements for any node that may alias a source-mapped object (including
   // nodes whose map is unknown or already stale).
+  auto const_it =
+      std::as_const(loaded_properties_).find(PropertyKey::Elements());
+  if (const_it == loaded_properties_.end() || const_it->second.empty()) return;
   auto it = loaded_properties_.find(PropertyKey::Elements());
-  if (it == loaded_properties_.end()) return;
   bool dropped_any = it->second.EraseIf([&](ValueNode* obj, ValueNode* const&) {
     const NodeInfo* info = TryGetInfoWithFreshMaps(obj);
     if (!info) return true;
@@ -636,25 +644,26 @@ void KnownNodeAspects::ClearUnstableNodeAspects(bool is_tracing_enabled) {
   may_have_aliasing_contexts_ = KnownNodeAspects::ContextSlotLoadsAlias::kNever;
 }
 
-KnownNodeAspects* KnownNodeAspects::CloneForLoopHeader(
-    bool optimistic, LoopEffects* loop_effects, Zone* zone) const {
-  return zone->New<KnownNodeAspects>(*this, optimistic, loop_effects, zone);
+KnownNodeAspects::Ptr KnownNodeAspects::CloneForLoopHeader(
+    bool optimistic, LoopEffects* loop_effects) const {
+  return pool_->New(*this, optimistic, loop_effects);
 }
 
 KnownNodeAspects::KnownNodeAspects(const KnownNodeAspects& other,
                                    bool optimistic_initial_state,
-                                   LoopEffects* loop_effects, Zone* zone)
-    : loaded_constant_properties_(other.loaded_constant_properties_),
-      loaded_properties_(zone),
-      loaded_tagged_keyed_properties_(zone),
+                                   LoopEffects* loop_effects)
+    : pool_(other.pool_),
+      loaded_constant_properties_(other.loaded_constant_properties_),
+      loaded_properties_(&pool_->loaded_property_pool),
+      loaded_tagged_keyed_properties_(&pool_->tagged_keyed_pool),
       loaded_context_constants_(other.loaded_context_constants_),
-      loaded_context_slots_(zone),
-      available_expressions_(zone),
+      loaded_context_slots_(&pool_->context_slots_pool),
+      available_expressions_(&pool_->available_expressions_pool),
       side_effects_require_invalidation_(false),
       may_have_aliasing_contexts_(
           KnownNodeAspects::ContextSlotLoadsAlias::kNever),
       effect_epoch_(other.effect_epoch_),
-      node_infos_(zone),
+      node_infos_(&pool_->node_infos_pool),
       virtual_objects_(other.virtual_objects_) {
   if (!other.side_effects_require_invalidation_) {
     node_infos_ = other.node_infos_;
@@ -728,8 +737,6 @@ KnownNodeAspects::KnownNodeAspects(const KnownNodeAspects& other,
       available_expressions_.emplace(e);
     }
   }
-
-  virtual_objects_.Snapshot();
 }
 
 // LINT.IfChange(IsCompatibleWithLoopHeader)
@@ -904,7 +911,7 @@ KnownNodeAspects::ContextStoreResult KnownNodeAspects::RecordContextSlotStore(
 
 bool KnownNodeAspects::MarkSingleMapAsStale(ValueNode* node,
                                             bool is_tracing_enabled) {
-  if (NodeInfo* node_info = TryGetInfoFor(node)) {
+  if (const NodeInfo* node_info = TryGetInfoFor(node)) {
     if (node_info->possible_maps_are_known() && !node_info->maps_are_stale() &&
         node_info->possible_maps().size() == 1) {
       compiler::MapRef old_map = node_info->possible_maps().at(0);

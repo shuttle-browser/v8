@@ -939,6 +939,10 @@ inline constexpr bool IsZeroExtendedRepresentation(ValueRepresentation repr) {
 #if defined(V8_TARGET_ARCH_RISCV64) || defined(V8_TARGET_ARCH_LOONG64)
   // on RISC-V and LoongArch64, 32-bit values are always sign-extended.
   return false;
+#elif defined(V8_TARGET_ARCH_PPC64) || defined(V8_TARGET_ARCH_S390X)
+  // On PPC64 and S390x, int32 values are sign-extended, while uint32 values
+  // are zero-extended.
+  return (repr == ValueRepresentation::kUint32);
 #else
   return (repr == ValueRepresentation::kUint32 ||
           repr == ValueRepresentation::kInt32);
@@ -2789,12 +2793,15 @@ class ValueNode : public Node {
   Tribool IsHole(RootIndex hole_index) const;
   Tribool IsTheHole() const { return IsHole(RootIndex::kTheHoleValue); }
   Tribool IsTdzHole() const { return IsHole(RootIndex::kTdzHoleValue); }
+  bool IsAnyHoleConstant() const;
 
   inline void MaybeRecordUseReprHint(UseRepresentationSet repr);
   inline void MaybeRecordUseReprHint(UseRepresentation repr);
 
   ValueNode* UnwrapIdentities();
   const ValueNode* UnwrapIdentities() const;
+
+  ValueNode* UnwrapIdentitiesAndReturnedValues();
 
   // Like UnwrapIdentities, but also unwraps phis with a single input (which are
   // not exception phis or resumable loop phis), since the optimizer replaces
@@ -2884,6 +2891,14 @@ inline ValueNode* ValueNode::UnwrapIdentities() {
 inline const ValueNode* ValueNode::UnwrapIdentities() const {
   const ValueNode* node = this;
   while (node->Is<Identity>()) node = node->input(0).node();
+  return node;
+}
+
+inline ValueNode* ValueNode::UnwrapIdentitiesAndReturnedValues() {
+  ValueNode* node = this;
+  while (node->Is<Identity>() || node->Is<ReturnedValue>()) {
+    node = node->input(0).node();
+  }
   return node;
 }
 
@@ -5287,15 +5302,13 @@ class HeapConstant : public FixedInputValueNodeT<0, HeapConstant> {
   using OutputRegister = Register;
 
   explicit HeapConstant(uint64_t bitfield, compiler::HeapObjectRef object)
-      : Base(bitfield), object_(object) {}
+      : Base(bitfield), object_(object) {
+    DCHECK(!object_.IsAnyHole());
+  }
 
   bool ToBoolean(LocalIsolate* local_isolate) const {
     return Object::BooleanValue(*object_.object(), local_isolate);
   }
-
-  bool IsAnyHole() const { return object_.IsAnyHole(); }
-  bool IsTheHole() const { return object_.IsTheHole(); }
-  bool IsTdzHole() const { return object_.IsTdzHole(); }
 
   void SetValueLocationConstraints();
   void GenerateCode(MaglevAssembler*, const ProcessingState&);
@@ -5338,6 +5351,7 @@ class RootConstant : public FixedInputValueNodeT<0, RootConstant> {
   }
 
   bool ToBoolean(LocalIsolate* local_isolate) const;
+  bool IsAnyHole() const;
 
   RootIndex index() const { return index_; }
 
@@ -5820,11 +5834,6 @@ class VirtualObject : public FixedInputValueNodeT<0, VirtualObject> {
   }
 
   void set(uint32_t offset, ValueNode* value) {
-    // Snapshotting behavior is currently not enforced or required, and the
-    // DCHECK below no longer holds.
-    // TODO(victorgomes): Re-enable if this is needed again, otherwise remove
-    // the DCHECK.
-    // DCHECK(!IsSnapshot());
     set_by_index(object_layout_->SlotAtOffset(offset), value);
   }
 
@@ -5841,25 +5850,6 @@ class VirtualObject : public FixedInputValueNodeT<0, VirtualObject> {
   }
 
   const vobj::ObjectLayout* object_layout() const { return object_layout_; }
-
-  bool compatible_for_merge(const VirtualObject* other) const {
-    if (object_layout_->object_type != other->object_layout_->object_type) {
-      return false;
-    }
-    if (allocation_ != other->allocation_) return false;
-    // Currently, the graph builder will never change the VO map.
-    if (has_static_map()) {
-      if (map() != other->map()) return false;
-    }
-    return slot_count() == other->slot_count();
-  }
-
-  // VOs are snapshotted at branch points and when they are leaked to
-  // DeoptInfos. This is because the snapshots need to preserve the original
-  // values at the time of branching or deoptimization. While a VO is not yet
-  // snapshotted, it can be modified freely.
-  bool IsSnapshot() const { return snapshotted_; }
-  void Snapshot() { snapshotted_ = true; }
 
   enum class ForEachSlotIterationMode {
     kDefault,
@@ -5923,40 +5913,6 @@ class VirtualObject : public FixedInputValueNodeT<0, VirtualObject> {
       VirtualObjectList virtual_objects, Function&& f,
       ForEachSlotIterationMode mode = ForEachSlotIterationMode::kDefault,
       const VirtualObjectAncestors* ancestors = nullptr) const;
-
-  template <typename Function>
-  inline std::optional<VirtualObject*> Merge(const VirtualObject* other,
-                                             uint32_t new_object_id, Zone* zone,
-                                             Function MergeValue) const {
-    VirtualObject* result = Clone(new_object_id, zone, /* empty_clone */ true);
-    DCHECK(compatible_for_merge(other));
-    for (int i = 0; i < slot_count(); i++) {
-      if (auto success = MergeValue(get_by_index(i), other->get_by_index(i))) {
-        result->set_by_index(i, *success);
-      } else {
-        return {};
-      }
-    }
-    return result;
-  }
-
-  VirtualObject* Clone(uint32_t new_object_id, Zone* zone,
-                       bool empty_clone = false) const {
-    VirtualObject* result;
-    ValueNode** slots = zone->AllocateArray<ValueNode*>(slot_count());
-    result = NodeBase::New<VirtualObject>(zone, 0, map(), new_object_id,
-                                          object_layout_, slot_count(), slots);
-
-    if (empty_clone) return result;
-
-    // Copy content
-    for (int i = 0; i < slot_count(); i++) {
-      result->set_by_index(i, get_by_index(i));
-    }
-
-    result->set_allocation(allocation());
-    return result;
-  }
 
   int slot_count() const { return slots_.length(); }
 
@@ -6025,7 +5981,6 @@ class VirtualObject : public FixedInputValueNodeT<0, VirtualObject> {
   // map ValueNode* into a MapRef. Currently we don't always have it available.
   compiler::OptionalMapRef map_;
   const int id_;
-  bool snapshotted_ = false;  // Object should not be modified anymore.
   base::Vector<ValueNode*> slots_;
   const vobj::ObjectLayout* object_layout_;
   mutable InlinedAllocation* allocation_ = nullptr;
@@ -6132,8 +6087,7 @@ struct VirtualJSGeneratorObjectShape : VirtualJSObjectShape {
   V(resume_mode, offsetof(T, resume_mode_), vobj::FieldType::kTagged)   \
   V(continuation, offsetof(T, continuation_), vobj::FieldType::kTagged) \
   V(parameters_and_registers, offsetof(T, parameters_and_registers_),   \
-    vobj::FieldType::kTagged)                                           \
-  V(yielded_value, offsetof(T, yielded_value_), vobj::FieldType::kTagged)
+    vobj::FieldType::kTagged)
 
   DEF_SHAPE(VirtualJSObjectShape, FIELD_LIST);
 #undef FIELD_LIST
@@ -6151,21 +6105,20 @@ struct VirtualJSAsyncGeneratorObjectShape : VirtualJSGeneratorObjectShape {
 
 struct VirtualJSAsyncFunctionObjectShape : VirtualJSObjectShape {
   using T = JSAsyncFunctionObject;
-#define FIELD_LIST(V)                                                     \
-  V(function, offsetof(T, function_), vobj::FieldType::kTagged)           \
-  V(context, offsetof(T, context_), vobj::FieldType::kTagged)             \
-  V(receiver, offsetof(T, receiver_), vobj::FieldType::kTagged)           \
-  V(input_or_debug_pos, offsetof(T, input_or_debug_pos_),                 \
-    vobj::FieldType::kTagged)                                             \
-  V(resume_mode, offsetof(T, resume_mode_), vobj::FieldType::kTagged)     \
-  V(continuation, offsetof(T, continuation_), vobj::FieldType::kTagged)   \
-  V(parameters_and_registers, offsetof(T, parameters_and_registers_),     \
-    vobj::FieldType::kTagged)                                             \
-  V(yielded_value, offsetof(T, yielded_value_), vobj::FieldType::kTagged) \
-  V(promise, offsetof(T, promise_), vobj::FieldType::kTagged)             \
-  V(await_resolve_closure, offsetof(T, await_resolve_closure_),           \
-    vobj::FieldType::kTagged)                                             \
-  V(await_reject_closure, offsetof(T, await_reject_closure_),             \
+#define FIELD_LIST(V)                                                   \
+  V(function, offsetof(T, function_), vobj::FieldType::kTagged)         \
+  V(context, offsetof(T, context_), vobj::FieldType::kTagged)           \
+  V(receiver, offsetof(T, receiver_), vobj::FieldType::kTagged)         \
+  V(input_or_debug_pos, offsetof(T, input_or_debug_pos_),               \
+    vobj::FieldType::kTagged)                                           \
+  V(resume_mode, offsetof(T, resume_mode_), vobj::FieldType::kTagged)   \
+  V(continuation, offsetof(T, continuation_), vobj::FieldType::kTagged) \
+  V(parameters_and_registers, offsetof(T, parameters_and_registers_),   \
+    vobj::FieldType::kTagged)                                           \
+  V(promise, offsetof(T, promise_), vobj::FieldType::kTagged)           \
+  V(await_resolve_closure, offsetof(T, await_resolve_closure_),         \
+    vobj::FieldType::kTagged)                                           \
+  V(await_reject_closure, offsetof(T, await_reject_closure_),           \
     vobj::FieldType::kTagged)
   DEF_SHAPE(VirtualJSObjectShape, FIELD_LIST);
 #undef FIELD_LIST
@@ -6329,10 +6282,6 @@ class VirtualObjectList {
     VirtualObject* entry_;
   };
 
-  bool operator==(const VirtualObjectList& other) const {
-    return head_ == other.head_;
-  }
-
   void Add(VirtualObject* object) {
     DCHECK_NOT_NULL(object);
     DCHECK_NULL(object->next_);
@@ -6354,46 +6303,6 @@ class VirtualObjectList {
   }
 
   void Print(std::ostream& os, const char* prefix) const;
-
-  // It iterates both list in reverse other of ids until a common point.
-  template <typename Function>
-  static VirtualObject* WalkUntilCommon(const VirtualObjectList& list1,
-                                        const VirtualObjectList& list2,
-                                        Function&& f) {
-    VirtualObject* vo1 = list1.head_;
-    VirtualObject* vo2 = list2.head_;
-    while (vo1 != nullptr && vo2 != nullptr && vo1 != vo2) {
-      DCHECK_NE(vo1->id(), vo2->id());
-      if (vo1->id() > vo2->id()) {
-        f(vo1, list1);
-        vo1 = vo1->next_;
-      } else {
-        f(vo2, list2);
-        vo2 = vo2->next_;
-      }
-    }
-    if (vo1 == vo2) return vo1;
-    return nullptr;
-  }
-
-  void Snapshot() const {
-    for (VirtualObject* vo : *this) {
-      if (vo->IsSnapshot()) {
-        // Stop processing once a snapshotted object is found, as all remaining
-        // objects must be snapshotted.
-        break;
-      }
-      vo->Snapshot();
-    }
-    SLOW_DCHECK(IsSnapshot());
-  }
-
-  bool IsSnapshot() const {
-    for (VirtualObject* vo : *this) {
-      if (!vo->IsSnapshot()) return false;
-    }
-    return true;
-  }
 
   VirtualObject* head() const { return head_; }
 
@@ -6427,7 +6336,9 @@ class InlinedAllocation : public FixedInputValueNodeT<1, InlinedAllocation> {
   explicit InlinedAllocation(uint64_t bitfield, VirtualObject* object)
       : Base(bitfield),
         object_(object),
-        escape_analysis_result_(EscapeAnalysisResult::kUnknown) {}
+        escape_analysis_result_(EscapeAnalysisResult::kUnknown) {
+    DCHECK_NOT_NULL(object);
+  }
 
   static constexpr OpProperties kProperties = OpProperties::NotIdempotent();
   DECLARE_INPUTS(AllocationBlock)
@@ -6439,8 +6350,8 @@ class InlinedAllocation : public FixedInputValueNodeT<1, InlinedAllocation> {
 
   void VerifyInputs() const;
 
-  AllocationBlock* allocation_block();
-  const AllocationBlock* allocation_block() const;
+  V8_EXPORT_PRIVATE AllocationBlock* allocation_block();
+  V8_EXPORT_PRIVATE const AllocationBlock* allocation_block() const;
 
   NodeType type(compiler::JSHeapBroker* broker) {
     VirtualObject* obj = object();
@@ -6486,7 +6397,10 @@ class InlinedAllocation : public FixedInputValueNodeT<1, InlinedAllocation> {
     return use_count_ > non_escaping_use_count_;
   }
   void ForceEscaping() {
-    DCHECK(!HasBeenAnalysed());
+    // See AddNonEscapingUses: subsequent Turbolev phases after
+    // TurbolevEscapeAnalysis can call ForceEscaping on already-escaped
+    // allocations.
+    DCHECK(!HasBeenAnalysed() || HasEscaped());
     non_escaping_use_count_ = 0;
   }
 
@@ -6512,13 +6426,8 @@ class InlinedAllocation : public FixedInputValueNodeT<1, InlinedAllocation> {
     return escape_analysis_result_ != EscapeAnalysisResult::kUnknown;
   }
 
-  void UpdateObject(VirtualObject* object) {
-    DCHECK_EQ(this, object->allocation());
-    object_ = object;
-  }
-
  private:
-  VirtualObject* object_;
+  VirtualObject* const object_;
   EscapeAnalysisResult escape_analysis_result_;
   int non_escaping_use_count_ = 0;
   int offset_ = -1;  // Set by AllocationBlock.
@@ -6642,8 +6551,9 @@ inline void VirtualObject::ForEachNestedRuntimeInput(
 
 class AllocationBlock : public FixedInputValueNodeT<0, AllocationBlock> {
  public:
-  explicit AllocationBlock(uint64_t bitfield, AllocationType allocation_type)
-      : Base(bitfield), allocation_type_(allocation_type) {}
+  explicit AllocationBlock(uint64_t bitfield, AllocationType allocation_type =
+                                                  AllocationType::kYoung)
+      : Base(AllocationTypeField::update(bitfield, allocation_type)) {}
 
   static constexpr OpProperties kProperties = OpProperties::CanAllocate() |
                                               OpProperties::DeferredCall() |
@@ -6654,7 +6564,9 @@ class AllocationBlock : public FixedInputValueNodeT<0, AllocationBlock> {
   void GenerateCode(MaglevAssembler*, const ProcessingState&);
   void PrintParams(std::ostream&) const;
 
-  AllocationType allocation_type() const { return allocation_type_; }
+  AllocationType allocation_type() const {
+    return AllocationTypeField::decode(bitfield());
+  }
   int size() const { return size_; }
   void set_size(int size) { size_ = size; }
 
@@ -6665,20 +6577,9 @@ class AllocationBlock : public FixedInputValueNodeT<0, AllocationBlock> {
     size_ += alloc->size();
   }
 
-  void TryPretenure(ValueNode* input);
-
-  bool elided_write_barriers_depend_on_type() const {
-    return elided_write_barriers_depend_on_type_;
-  }
-  void set_elided_write_barriers_depend_on_type() {
-    elided_write_barriers_depend_on_type_ = true;
-  }
-
  private:
-  void TryPretenure();
-  AllocationType allocation_type_;
+  using AllocationTypeField = NextBitField<AllocationType, 4>;
   int size_ = 0;
-  bool elided_write_barriers_depend_on_type_ = false;
   InlinedAllocation::List allocation_list_;
 };
 
@@ -6747,11 +6648,11 @@ class ArgumentsElements : public FixedInputValueNodeT<1, ArgumentsElements> {
 class AllocateElementsArray
     : public FixedInputValueNodeT<1, AllocateElementsArray> {
  public:
-  explicit AllocateElementsArray(uint64_t bitfield, ElementsKind elements_kind,
-                                 AllocationType allocation_type)
-      : Base(bitfield),
-        elements_kind_(elements_kind),
-        allocation_type_(allocation_type) {}
+  explicit AllocateElementsArray(
+      uint64_t bitfield, ElementsKind elements_kind,
+      AllocationType allocation_type = AllocationType::kYoung)
+      : Base(AllocationTypeField::update(bitfield, allocation_type)),
+        elements_kind_(elements_kind) {}
 
   static constexpr OpProperties kProperties =
       OpProperties::CanAllocate() | OpProperties::EagerDeopt() |
@@ -6765,11 +6666,13 @@ class AllocateElementsArray
   void PrintParams(std::ostream&) const;
 
   ElementsKind elements_kind() const { return elements_kind_; }
-  AllocationType allocation_type() const { return allocation_type_; }
+  AllocationType allocation_type() const {
+    return AllocationTypeField::decode(bitfield());
+  }
 
  private:
+  using AllocationTypeField = NextBitField<AllocationType, 4>;
   const ElementsKind elements_kind_;
-  const AllocationType allocation_type_;
 };
 
 class CreateFunctionContext
@@ -7506,7 +7409,7 @@ class MigrateMapIfNeeded : public FixedInputValueNodeT<2, MigrateMapIfNeeded> {
       OpProperties::EagerDeopt() | OpProperties::DeferredCall() |
       OpProperties::CanAllocate() | OpProperties::CanWrite() |
       OpProperties::CanRead();
-  DECLARE_INPUTS(Map, Object)
+  DECLARE_INPUTS(Map, Receiver)
   DECLARE_INPUT_TYPES(Tagged, Tagged)
 
   int MaxCallStackArgs() const;
@@ -8152,11 +8055,14 @@ class ProcessWasmArgument
 class CreateFastArrayElements
     : public FixedInputValueNodeT<1, CreateFastArrayElements> {
  public:
-  explicit CreateFastArrayElements(uint64_t bitfield,
-                                   AllocationType allocation_type)
-      : Base(bitfield), allocation_type_(allocation_type) {}
+  explicit CreateFastArrayElements(
+      uint64_t bitfield,
+      AllocationType allocation_type = AllocationType::kYoung)
+      : Base(AllocationTypeField::update(bitfield, allocation_type)) {}
 
-  AllocationType allocation_type() const { return allocation_type_; }
+  AllocationType allocation_type() const {
+    return AllocationTypeField::decode(bitfield());
+  }
 
   static constexpr OpProperties kProperties =
       OpProperties::CanAllocate() | OpProperties::NotIdempotent();
@@ -8165,9 +8071,10 @@ class CreateFastArrayElements
 
   void SetValueLocationConstraints();
   void GenerateCode(MaglevAssembler*, const ProcessingState&);
+  void PrintParams(std::ostream&) const;
 
  private:
-  const AllocationType allocation_type_;
+  using AllocationTypeField = NextBitField<AllocationType, 4>;
 };
 
 class NewConsString : public FixedInputValueNodeT<3, NewConsString> {
@@ -8454,6 +8361,7 @@ class PropertyKey {
   enum Type {
     // kName must be zero so that pointers are unaffected.
     kName = 0,
+    kDoubleField,
     kElements,
     kTypedArrayLength,
     // TODO(leszeks): We could probably share kStringLength with
@@ -8465,10 +8373,17 @@ class PropertyKey {
   };
   static constexpr int kTypeMask = 0x7;
   static_assert((kName & ~kTypeMask) == 0);
+  static_assert((kDoubleField & ~kTypeMask) == 0);
   static_assert((kElements & ~kTypeMask) == 0);
   static_assert((kTypedArrayLength & ~kTypeMask) == 0);
   static_assert((kStringLength & ~kTypeMask) == 0);
+  static_assert((kArrayBufferViewByteLength & ~kTypeMask) == 0);
+  static_assert((kArrayBufferViewDataPointer & ~kTypeMask) == 0);
   static_assert((kNone & ~kTypeMask) == 0);
+
+  static PropertyKey DoubleField(compiler::NameRef ref) {
+    return PropertyKey(ref, kDoubleField);
+  }
 
   static PropertyKey Elements() { return PropertyKey(kElements); }
 
@@ -8489,10 +8404,7 @@ class PropertyKey {
   // Allow implicit conversion from NameRef to key, so that callers in the
   // common path can use a NameRef directly.
   // NOLINTNEXTLINE
-  PropertyKey(compiler::NameRef ref)
-      : data_(reinterpret_cast<Address>(ref.data())) {
-    DCHECK_EQ(data_ & kTypeMask, kName);
-  }
+  PropertyKey(compiler::NameRef ref) : PropertyKey(ref, kName) {}
 
   PropertyKey(const PropertyKey&) V8_NOEXCEPT = default;
   PropertyKey& operator=(const PropertyKey&) V8_NOEXCEPT = default;
@@ -8502,9 +8414,10 @@ class PropertyKey {
   }
   bool operator<(const PropertyKey& other) const { return data_ < other.data_; }
 
-  compiler::NameRef name() {
-    DCHECK_EQ(type(), kName);
-    return compiler::NameRef(reinterpret_cast<compiler::ObjectData*>(data_),
+  compiler::NameRef name() const {
+    DCHECK(type() == kName || type() == kDoubleField);
+    return compiler::NameRef(reinterpret_cast<compiler::ObjectData*>(
+                                 data_ & ~static_cast<Address>(kTypeMask)),
                              false);
   }
 
@@ -8514,7 +8427,14 @@ class PropertyKey {
   Address data() const { return data_; }
 
  private:
-  explicit PropertyKey(Type type) : data_(type) { DCHECK_NE(type, kName); }
+  explicit PropertyKey(Type type) : data_(type) {
+    DCHECK(type != kName && type != kDoubleField);
+  }
+  PropertyKey(compiler::NameRef ref, Type type)
+      : data_(reinterpret_cast<Address>(ref.data()) | type) {
+    DCHECK(type == kName || type == kDoubleField);
+    DCHECK_EQ(reinterpret_cast<Address>(ref.data()) & kTypeMask, 0);
+  }
 
   Address data_;
 };
@@ -8523,6 +8443,9 @@ inline std::ostream& operator<<(std::ostream& os, PropertyKey key) {
   switch (key.type()) {
     case PropertyKey::kName:
       os << *key.name().object();
+      break;
+    case PropertyKey::kDoubleField:
+      os << "DoubleField(" << *key.name().object() << ")";
       break;
     case PropertyKey::kElements:
       os << "Elements";
@@ -9391,7 +9314,7 @@ class StoreMap : public FixedInputNodeT<1, StoreMap> {
 
   compiler::MapRef map() const { return map_; }
   Kind kind() const { return KindField::decode(bitfield()); }
-  bool NoWriteBarrier() const;
+  V8_EXPORT_PRIVATE bool NoWriteBarrier() const;
 
   bool is_transitioning() const {
     switch (kind()) {
@@ -10340,6 +10263,8 @@ class Construct : public VarargsValueNodeT<3, Construct> {
   static constexpr OpProperties kProperties = OpProperties::JSCall();
   DECLARE_INPUTS(Target, NewTarget, Context)
 
+  NodeType type() const { return NodeType::kJSReceiver; }
+
   compiler::FeedbackSource feedback() const { return feedback_; }
 
   int MaxCallStackArgs() const;
@@ -10663,6 +10588,8 @@ class ConstructForwardVarargs
   static constexpr OpProperties kProperties = OpProperties::JSCall();
   DECLARE_INPUTS(Target, NewTarget, Context)
 
+  NodeType type() const { return NodeType::kJSReceiver; }
+
   int MaxCallStackArgs() const;
   void SetValueLocationConstraints();
   void GenerateCode(MaglevAssembler*, const ProcessingState&);
@@ -10793,11 +10720,11 @@ class CallKnownJSFunction : public VarargsValueNodeT<4, CallKnownJSFunction> {
   // This ctor is used when for variable input counts.
   // Inputs must be initialized manually.
   inline CallKnownJSFunction(
-      uint64_t bitfield,
-      JSDispatchHandle dispatch_handle,
+      uint64_t bitfield, JSDispatchHandle dispatch_handle,
       compiler::SharedFunctionInfoRef shared_function_info, ValueNode* closure,
       ValueNode* context, ValueNode* receiver, ValueNode* new_target,
-      const compiler::FeedbackSource& feedback_source);
+      const compiler::FeedbackSource& feedback_source,
+      bool can_inline_js_to_wasm_wrapper);
 
   // This node might eventually be overwritten by conversion nodes that need
   // to do a deferred call.
@@ -10805,7 +10732,12 @@ class CallKnownJSFunction : public VarargsValueNodeT<4, CallKnownJSFunction> {
       OpProperties::JSCall() | OpProperties::DeferredCall();
   DECLARE_INPUTS(Target, Context, Receiver, NewTarget)
 
-  JSDispatchHandle dispatch_handle() const { return dispatch_handle_; }
+  // Snapshots MaglevReducer::CanInlineJSToWasmWrapper() at node construction
+  // time so TurbolevGraphBuilder does not re-read the mutable JSDispatchTable.
+  // When true, all argument inputs are wrapped in ProcessWasmArgument nodes.
+  constexpr bool can_inline_js_to_wasm_wrapper() const {
+    return CanInlineJSToWasmWrapperField::decode(bitfield());
+  }
   compiler::SharedFunctionInfoRef shared_function_info() const {
     return shared_function_info_;
   }
@@ -10818,6 +10750,7 @@ class CallKnownJSFunction : public VarargsValueNodeT<4, CallKnownJSFunction> {
   void SetValueLocationConstraints();
   void GenerateCode(MaglevAssembler*, const ProcessingState&);
   void PrintParams(std::ostream&) const;
+  void VerifyInputs() const;
 
   int expected_parameter_count() const { return expected_parameter_count_; }
 
@@ -10827,6 +10760,8 @@ class CallKnownJSFunction : public VarargsValueNodeT<4, CallKnownJSFunction> {
   UseRepresentationSet use_repr_hints() { return use_repr_hints_; }
 
  private:
+  using CanInlineJSToWasmWrapperField = NextBitField<bool, 1>;
+
   JSDispatchHandle dispatch_handle_;
   const compiler::SharedFunctionInfoRef shared_function_info_;
   // Cache the expected parameter count so that we can access it in
@@ -10986,6 +10921,8 @@ class ConstructWithSpread : public VarargsValueNodeT<3, ConstructWithSpread> {
 
   static constexpr OpProperties kProperties = OpProperties::JSCall();
   DECLARE_INPUTS(Target, NewTarget, Context)
+
+  NodeType type() const { return NodeType::kJSReceiver; }
 
   int num_args_no_spread() const {
     DCHECK_GT(num_args(), 0);

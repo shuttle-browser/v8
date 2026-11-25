@@ -48,15 +48,14 @@
 #include "src/flags/flags.h"
 #include "src/handles/global-handles.h"
 #include "src/heap/heap-inl.h"
-#include "src/heap/pretenuring-handler.h"
 #include "src/objects/objects-inl.h"
 #include "src/profiler/allocation-tracker.h"
 #include "src/profiler/heap-profiler.h"
 #include "src/profiler/heap-snapshot-generator.h"
 #include "test/cctest/cctest.h"
-#include "test/cctest/collector.h"
 #include "test/cctest/heap/heap-utils.h"
 #include "test/cctest/jsonstream-helper.h"
+#include "test/common/collector.h"
 
 #if V8_ENABLE_WEBASSEMBLY
 #include "src/wasm/wasm-module-builder.h"
@@ -1146,7 +1145,7 @@ bool IsReachable(const v8::HeapGraphNode* from, const v8::HeapGraphNode* to,
 // and the module must reference both its namespaces and, once evaluated, its
 // exports. Taking a snapshot must not evaluate the deferred module.
 TEST(HeapSnapshotDeferredModuleNamespace) {
-  i::v8_flags.js_defer_import_eval = true;
+  i::v8_flags.js_defer_import_eval.Set(true);
   LocalContext env;
   v8::Isolate* isolate = env.isolate();
   v8::HandleScope scope(isolate);
@@ -1714,7 +1713,7 @@ static TestStatsStream GetHeapStatsUpdate(
 
 TEST(HeapSnapshotObjectsStats) {
   // Concurrent allocation and conservative stack scanning might break results.
-  i::v8_flags.stress_concurrent_allocation = false;
+  i::v8_flags.stress_concurrent_allocation.Set(false);
   i::DisableConservativeStackScanningScopeForTesting no_stack_scanning(
       CcTest::heap());
 
@@ -2267,7 +2266,7 @@ TEST(NativeSnapshotObjectIdMoving) {
   i::heap::ManualEvacuationCandidatesSelectionScope
       manual_evacuation_candidate_selection_scope(manual_gc_scope);
   // Concurrent allocation writes page flags in a racy way.
-  i::v8_flags.stress_concurrent_allocation = false;
+  i::v8_flags.stress_concurrent_allocation.Set(false);
 
   LocalContext env;
   v8::Isolate* isolate = env.isolate();
@@ -3189,7 +3188,7 @@ TEST(ManyLocalsInSharedContext) {
   // This test gets very slow with slow asserts (18 minutes instead of 1:30,
   // as of November 2018).
 #ifdef ENABLE_SLOW_DCHECKS
-  i::v8_flags.enable_slow_asserts = false;
+  i::v8_flags.enable_slow_asserts.Set(false);
 #endif
   LocalContext env;
   v8::HandleScope scope(env.isolate());
@@ -3235,7 +3234,7 @@ TEST(ManyLocalsInSharedContext) {
 }
 
 TEST(AllocationSitesAreVisible) {
-  i::v8_flags.lazy_feedback_allocation = false;
+  i::v8_flags.lazy_feedback_allocation.Set(false);
   LocalContext env;
   v8::Isolate* isolate = env.isolate();
   v8::HandleScope scope(isolate);
@@ -3488,10 +3487,10 @@ TEST(TrackHeapAllocationsWithInlining) {
 }
 
 TEST(TrackHeapAllocationsWithoutInlining) {
-  i::v8_flags.turbo_inlining = false;
+  i::v8_flags.turbo_inlining.Set(false);
   // Disable inlining
-  i::v8_flags.max_inlined_bytecode_size = 0;
-  i::v8_flags.max_inlined_bytecode_size_small = 0;
+  i::v8_flags.max_inlined_bytecode_size.Set(0);
+  i::v8_flags.max_inlined_bytecode_size_small.Set(0);
   v8::HandleScope scope(CcTest::isolate());
   LocalContext env;
 
@@ -3536,7 +3535,7 @@ static const char* inline_heap_allocation_source =
 
 
 TEST(TrackBumpPointerAllocations) {
-  i::v8_flags.allow_natives_syntax = true;
+  i::v8_flags.allow_natives_syntax.Set(true);
   v8::HandleScope scope(CcTest::isolate());
   LocalContext env;
 
@@ -3691,7 +3690,7 @@ TEST(ArrayBufferSharedBackingStore) {
 
 
 TEST(WeakContainers) {
-  i::v8_flags.allow_natives_syntax = true;
+  i::v8_flags.allow_natives_syntax.Set(true);
   LocalContext env;
   v8::HandleScope scope(env.isolate());
   if (!CcTest::i_isolate()->use_optimizer()) return;
@@ -3898,7 +3897,7 @@ void CheckEmbedderGraphSnapshot(v8::Isolate* isolate,
 }
 
 TEST(EmbedderGraph) {
-  i::v8_flags.heap_profiler_use_embedder_graph = true;
+  i::v8_flags.heap_profiler_use_embedder_graph.Set(true);
   LocalContext env;
   v8::HandleScope scope(env.isolate());
   i::Isolate* isolate = reinterpret_cast<i::Isolate*>(env.isolate());
@@ -3963,7 +3962,7 @@ void CheckEmbedderGraphWithNamedEdges(v8::Isolate* isolate,
 }
 
 TEST(EmbedderGraphWithNamedEdges) {
-  i::v8_flags.heap_profiler_use_embedder_graph = true;
+  i::v8_flags.heap_profiler_use_embedder_graph.Set(true);
   LocalContext env;
   v8::HandleScope scope(env.isolate());
   i::Isolate* isolate = reinterpret_cast<i::Isolate*>(env.isolate());
@@ -4030,7 +4029,7 @@ void BuildEmbedderGraphWithContext(v8::Isolate* v8_isolate,
 }
 
 TEST(EmbedderGraphMultipleCallbacks) {
-  i::v8_flags.heap_profiler_use_embedder_graph = true;
+  i::v8_flags.heap_profiler_use_embedder_graph.Set(true);
   LocalContext env;
   v8::HandleScope scope(env.isolate());
   i::Isolate* isolate = reinterpret_cast<i::Isolate*>(env.isolate());
@@ -4109,7 +4108,7 @@ void BuildEmbedderGraphWithWrapperNode(v8::Isolate* v8_isolate,
 }
 
 TEST(EmbedderGraphWithWrapperNode) {
-  i::v8_flags.heap_profiler_use_embedder_graph = true;
+  i::v8_flags.heap_profiler_use_embedder_graph.Set(true);
   LocalContext env;
   v8::HandleScope scope(env.isolate());
   i::Isolate* isolate = reinterpret_cast<i::Isolate*>(env.isolate());
@@ -4168,7 +4167,7 @@ void BuildEmbedderGraphWithPrefix(v8::Isolate* v8_isolate,
 }
 
 TEST(EmbedderGraphWithPrefix) {
-  i::v8_flags.heap_profiler_use_embedder_graph = true;
+  i::v8_flags.heap_profiler_use_embedder_graph.Set(true);
   LocalContext env;
   v8::HandleScope scope(env.isolate());
   i::Isolate* isolate = reinterpret_cast<i::Isolate*>(env.isolate());
@@ -4291,13 +4290,13 @@ static const char* simple_sampling_heap_profiler_script =
     "foo();";
 
 TEST(SamplingHeapProfiler) {
-  i::v8_flags.allow_natives_syntax = true;
+  i::v8_flags.allow_natives_syntax.Set(true);
   v8::HandleScope scope(CcTest::isolate());
   LocalContext env;
   v8::HeapProfiler* heap_profiler = env.isolate()->GetHeapProfiler();
 
   // Suppress randomness to avoid flakiness in tests.
-  i::v8_flags.sampling_heap_profiler_suppress_randomness = true;
+  i::v8_flags.sampling_heap_profiler_suppress_randomness.Set(true);
 
   // Sample should be empty if requested before sampling has started.
   {
@@ -4371,19 +4370,19 @@ TEST(SamplingHeapProfiler) {
 }
 
 TEST(SamplingHeapProfilerRateAgnosticEstimates) {
-  i::v8_flags.allow_natives_syntax = true;
+  i::v8_flags.allow_natives_syntax.Set(true);
   v8::HandleScope scope(CcTest::isolate());
   LocalContext env;
   v8::HeapProfiler* heap_profiler = env.isolate()->GetHeapProfiler();
 
   // Disable compilation cache to force compilation in both cases
-  i::v8_flags.compilation_cache = false;
+  i::v8_flags.compilation_cache.Set(false);
 
   // Suppress randomness to avoid flakiness in tests.
-  i::v8_flags.sampling_heap_profiler_suppress_randomness = true;
+  i::v8_flags.sampling_heap_profiler_suppress_randomness.Set(true);
 
   // stress_incremental_marking adds randomness to the test.
-  i::v8_flags.stress_incremental_marking = false;
+  i::v8_flags.stress_incremental_marking.Set(false);
 
   // warmup compilation
   CompileRun(simple_sampling_heap_profiler_script);
@@ -4455,7 +4454,7 @@ TEST(SamplingHeapProfilerApiAllocation) {
   v8::HeapProfiler* heap_profiler = env.isolate()->GetHeapProfiler();
 
   // Suppress randomness to avoid flakiness in tests.
-  i::v8_flags.sampling_heap_profiler_suppress_randomness = true;
+  i::v8_flags.sampling_heap_profiler_suppress_randomness.Set(true);
 
   heap_profiler->StartSamplingHeapProfiler(256);
 
@@ -4478,7 +4477,7 @@ TEST(SamplingHeapProfilerApiSamples) {
   v8::HeapProfiler* heap_profiler = env.isolate()->GetHeapProfiler();
 
   // Suppress randomness to avoid flakiness in tests.
-  i::v8_flags.sampling_heap_profiler_suppress_randomness = true;
+  i::v8_flags.sampling_heap_profiler_suppress_randomness.Set(true);
 
   heap_profiler->StartSamplingHeapProfiler(1024);
 
@@ -4522,7 +4521,7 @@ TEST(SamplingHeapProfilerSetInterval) {
   LocalContext env;
   v8::HeapProfiler* heap_profiler = env.isolate()->GetHeapProfiler();
 
-  i::v8_flags.sampling_heap_profiler_suppress_randomness = true;
+  i::v8_flags.sampling_heap_profiler_suppress_randomness.Set(true);
 
   const uint64_t initial_interval = 1024;
   const uint64_t updated_interval = 4096;
@@ -4559,7 +4558,7 @@ TEST(SamplingHeapProfilerSampleIntervalSurvivesGC) {
   LocalContext env;
   v8::HeapProfiler* heap_profiler = env.isolate()->GetHeapProfiler();
 
-  i::v8_flags.sampling_heap_profiler_suppress_randomness = true;
+  i::v8_flags.sampling_heap_profiler_suppress_randomness.Set(true);
 
   const uint64_t interval = 1024;
   heap_profiler->StartSamplingHeapProfiler(
@@ -4602,7 +4601,7 @@ TEST(SamplingHeapProfilerLeftTrimming) {
   v8::HeapProfiler* heap_profiler = env.isolate()->GetHeapProfiler();
 
   // Suppress randomness to avoid flakiness in tests.
-  i::v8_flags.sampling_heap_profiler_suppress_randomness = true;
+  i::v8_flags.sampling_heap_profiler_suppress_randomness.Set(true);
 
   heap_profiler->StartSamplingHeapProfiler(64);
 
@@ -4621,91 +4620,13 @@ TEST(SamplingHeapProfilerLeftTrimming) {
   heap_profiler->StopSamplingHeapProfiler();
 }
 
-TEST(SamplingHeapProfilerPretenuredInlineAllocations) {
-  i::v8_flags.allow_natives_syntax = true;
-  i::v8_flags.expose_gc = true;
-
-  CcTest::InitializeVM();
-  if (!CcTest::i_isolate()->use_optimizer()) return;
-  if (i::v8_flags.gc_global || i::v8_flags.stress_compaction ||
-      i::v8_flags.stress_incremental_marking ||
-      i::v8_flags.stress_concurrent_allocation ||
-      i::v8_flags.single_generation || i::v8_flags.scavenger_chaos_mode) {
-    return;
-  }
-
-  v8::HandleScope scope(CcTest::isolate());
-  LocalContext env;
-  v8::HeapProfiler* heap_profiler = env.isolate()->GetHeapProfiler();
-
-  // Suppress randomness to avoid flakiness in tests.
-  i::v8_flags.sampling_heap_profiler_suppress_randomness = true;
-
-  // Disable loop unrolling to have a more predictable number of allocations
-  // (loop unrolling could cause allocation folding).
-  i::v8_flags.turboshaft_loop_unrolling = false;
-
-  GrowNewSpaceToMaximumCapacity(CcTest::heap());
-
-  std::array<char, 1024> source;
-  v8::base::SNPrintF(source,
-                     "var number_elements = %d;"
-                     "var elements = new Array(number_elements);"
-                     "function f() {"
-                     "  for (var i = 0; i < number_elements; i++) {"
-                     "    elements[i] = [{}, {}, {}];"
-                     "  }"
-                     "  return elements[number_elements - 1];"
-                     "};"
-                     "%%PrepareFunctionForOptimization(f);"
-                     "f(); gc({type: 'minor'});"
-                     "f(); f();"
-                     "%%OptimizeFunctionOnNextCall(f);"
-                     "f();"
-                     "f;",
-                     i::PretenuringHandler::GetMinMementoCountForTesting() + 1);
-
-  v8::Local<v8::Function> f =
-      v8::Local<v8::Function>::Cast(CompileRun(source.data()));
-
-  // Make sure the function is producing pre-tenured objects.
-  auto res = f->Call(env.local(), env->Global(), 0, nullptr).ToLocalChecked();
-  i::DirectHandle<i::JSObject> o = i::Cast<i::JSObject>(
-      v8::Utils::OpenDirectHandle(*v8::Local<v8::Object>::Cast(res)));
-  CHECK(CcTest::heap()->InOldSpace(o->elements()));
-  CHECK(CcTest::heap()->InOldSpace(*o));
-
-  // Call the function and profile it.
-  heap_profiler->StartSamplingHeapProfiler(64);
-  for (int i = 0; i < 80; ++i) {
-    f->Call(env.local(), env->Global(), 0, nullptr).ToLocalChecked();
-  }
-
-  std::unique_ptr<v8::AllocationProfile> profile(
-      heap_profiler->GetAllocationProfile());
-  CHECK(profile);
-  heap_profiler->StopSamplingHeapProfiler();
-
-  const char* names[] = {"f"};
-  auto node_f = FindAllocationProfileNode(env.isolate(), profile.get(),
-                                          v8::base::ArrayVector(names));
-  CHECK(node_f);
-
-  int count = 0;
-  for (auto allocation : node_f->allocations) {
-    count += allocation.count;
-  }
-
-  CHECK_GE(count, 8000);
-}
-
 TEST(SamplingHeapProfilerLargeInterval) {
   v8::HandleScope scope(CcTest::isolate());
   LocalContext env;
   v8::HeapProfiler* heap_profiler = env.isolate()->GetHeapProfiler();
 
   // Suppress randomness to avoid flakiness in tests.
-  i::v8_flags.sampling_heap_profiler_suppress_randomness = true;
+  i::v8_flags.sampling_heap_profiler_suppress_randomness.Set(true);
 
   heap_profiler->StartSamplingHeapProfiler(512 * 1024);
 
@@ -4730,7 +4651,7 @@ TEST(SamplingHeapProfilerSampleWithoutGCFlags) {
   v8::HeapProfiler* heap_profiler = env.isolate()->GetHeapProfiler();
 
   // Suppress randomness to avoid flakiness in tests.
-  i::v8_flags.sampling_heap_profiler_suppress_randomness = true;
+  i::v8_flags.sampling_heap_profiler_suppress_randomness.Set(true);
 
   heap_profiler->StartSamplingHeapProfiler(1024);
 
@@ -4761,7 +4682,7 @@ TEST(SamplingHeapProfilerSampleIsLive) {
   v8::HeapProfiler* heap_profiler = env.isolate()->GetHeapProfiler();
 
   // Suppress randomness to avoid flakiness in tests.
-  i::v8_flags.sampling_heap_profiler_suppress_randomness = true;
+  i::v8_flags.sampling_heap_profiler_suppress_randomness.Set(true);
 
   heap_profiler->StartSamplingHeapProfiler(
       64, 16,
@@ -4835,7 +4756,7 @@ TEST(SamplingHeapProfilerSampleContext) {
   v8::HeapProfiler* heap_profiler = env.isolate()->GetHeapProfiler();
 
   // Suppress randomness to avoid flakiness in tests.
-  i::v8_flags.sampling_heap_profiler_suppress_randomness = true;
+  i::v8_flags.sampling_heap_profiler_suppress_randomness.Set(true);
 
   sample_context_calls = 0;
   CHECK(heap_profiler->StartSamplingHeapProfiler(
@@ -4872,7 +4793,7 @@ TEST(SamplingHeapProfilerSampleContextMinorGC) {
   v8::HeapProfiler* heap_profiler = env.isolate()->GetHeapProfiler();
 
   // Suppress randomness to avoid flakiness in tests.
-  i::v8_flags.sampling_heap_profiler_suppress_randomness = true;
+  i::v8_flags.sampling_heap_profiler_suppress_randomness.Set(true);
 
   sample_context_calls = 0;
   CHECK(heap_profiler->StartSamplingHeapProfiler(
@@ -4902,7 +4823,7 @@ TEST(SamplingHeapProfilerNullSampleContext) {
   v8::HeapProfiler* heap_profiler = env.isolate()->GetHeapProfiler();
 
   // Suppress randomness to avoid flakiness in tests.
-  i::v8_flags.sampling_heap_profiler_suppress_randomness = true;
+  i::v8_flags.sampling_heap_profiler_suppress_randomness.Set(true);
 
   for (v8::SampleContextExtractor extractor :
        {static_cast<v8::SampleContextExtractor>(nullptr),
@@ -4927,6 +4848,62 @@ TEST(SamplingHeapProfilerNullSampleContext) {
   }
 }
 
+namespace {
+
+v8::Global<v8::Map>* lookup_map = nullptr;
+v8::Global<v8::Object>* lookup_key = nullptr;
+int lookup_hits = 0;
+int lookup_failures = 0;
+
+void* MapLookupSampleContextExtractor(v8::Isolate* isolate) {
+  bool found = false;
+  lookup_map->Get(isolate)->Get(lookup_key->Get(isolate), &found);
+  if (found) {
+    ++lookup_hits;
+  } else {
+    ++lookup_failures;
+  }
+  return nullptr;
+}
+
+}  // namespace
+
+TEST(SamplingHeapProfilerMapLookupInExtractor) {
+  LocalContext env;
+  v8::Isolate* isolate = env.isolate();
+  v8::HandleScope scope(isolate);
+  v8::HeapProfiler* heap_profiler = isolate->GetHeapProfiler();
+
+  v8::Global<v8::Map> map(
+      isolate, CompileRun("var key = {}; var map = new Map([[key, 1]]); map")
+                   .As<v8::Map>());
+  v8::Global<v8::Object> key(isolate, CompileRun("key").As<v8::Object>());
+  lookup_map = &map;
+  lookup_key = &key;
+  lookup_hits = lookup_failures = 0;
+
+  i::v8_flags.sampling_heap_profiler_suppress_randomness.Set(true);
+  CHECK(heap_profiler->StartSamplingHeapProfiler(
+      64, 16, v8::HeapProfiler::kSamplingNoFlags,
+      MapLookupSampleContextExtractor));
+  // Growing and shrinking the Map allocates replacement tables, so some
+  // lookups run before the replacement is installed. They must still find
+  // the key.
+  CompileRun(
+      "for (var i = 0; i < 100; i++) {\n"
+      "  var others = [];\n"
+      "  for (var j = 0; j < 40; j++) others.push({});\n"
+      "  for (var j = 0; j < 40; j++) map.set(others[j], j);\n"
+      "  for (var j = 0; j < 40; j++) map.delete(others[j]);\n"
+      "}\n");
+  heap_profiler->StopSamplingHeapProfiler();
+  lookup_map = nullptr;
+  lookup_key = nullptr;
+
+  CHECK_GT(lookup_hits, 0);
+  CHECK_EQ(0, lookup_failures);
+}
+
 TEST(HeapSnapshotPrototypeNotJSReceiver) {
   LocalContext env;
   v8::HandleScope scope(env.isolate());
@@ -4939,14 +4916,14 @@ TEST(HeapSnapshotPrototypeNotJSReceiver) {
 }
 
 TEST(SamplingHeapProfilerSampleDuringDeopt) {
-  i::v8_flags.allow_natives_syntax = true;
+  i::v8_flags.allow_natives_syntax.Set(true);
 
   v8::HandleScope scope(CcTest::isolate());
   LocalContext env;
   v8::HeapProfiler* heap_profiler = env.isolate()->GetHeapProfiler();
 
   // Suppress randomness to avoid flakiness in tests.
-  i::v8_flags.sampling_heap_profiler_suppress_randomness = true;
+  i::v8_flags.sampling_heap_profiler_suppress_randomness.Set(true);
 
   // Small sample interval to force each object to be sampled.
   heap_profiler->StartSamplingHeapProfiler(i::kTaggedSize);
@@ -5280,6 +5257,45 @@ TEST(ObjectRetainedInDirectHandle) {
 
   // Make sure to keep the handle alive.
   CHECK(!direct.is_null());
+}
+
+// Regression test for crbug.com/579051834: The allocation tracker computes
+// line ends of scripts lazily inside a no-GC scope. This must not allocate on
+// the V8 heap (e.g. by flattening a non-flat script source).
+TEST(AllocationTrackerConsStringScriptSource) {
+  LocalContext env;
+  v8::Isolate* isolate = env.isolate();
+  i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(isolate);
+  i::Factory* factory = i_isolate->factory();
+  v8::HandleScope scope(isolate);
+
+  const char* part1 = "function allocateOnHeap() {\n";
+  const char* part2 = "  return new Array(10000);\n}\nallocateOnHeap;";
+  std::string full_source = std::string(part1) + part2;
+  v8::Local<v8::Function> fn =
+      CompileRun(full_source.c_str()).As<v8::Function>();
+  // Make sure the function is compiled, since compiling it would flatten the
+  // source again.
+  fn->Call(env.local(), env->Global(), 0, nullptr).ToLocalChecked();
+
+  // Replace the script source with an equivalent non-flat ConsString.
+  i::DirectHandle<i::JSFunction> function =
+      i::Cast<i::JSFunction>(v8::Utils::OpenDirectHandle(*fn));
+  i::DirectHandle<i::Script> script(
+      i::Cast<i::Script>(function->shared()->script()), i_isolate);
+  i::DirectHandle<i::String> cons_source =
+      factory
+          ->NewConsString(factory->NewStringFromAsciiChecked(part1),
+                          factory->NewStringFromAsciiChecked(part2))
+          .ToHandleChecked();
+  script->set_source(*cons_source);
+  CHECK(!cons_source->IsFlat());
+  CHECK(!script->has_line_ends());
+
+  v8::HeapProfiler* heap_profiler = isolate->GetHeapProfiler();
+  heap_profiler->StartTrackingHeapObjects(true);
+  fn->Call(env.local(), env->Global(), 0, nullptr).ToLocalChecked();
+  heap_profiler->StopTrackingHeapObjects();
 }
 
 #if V8_ENABLE_WEBASSEMBLY

@@ -20,8 +20,7 @@
 #include "src/objects/field-type.h"
 #include "src/objects/hash-table-inl.h"
 #include "src/objects/heap-number-inl.h"
-#include "src/objects/js-shared-array.h"
-#include "src/objects/js-struct.h"
+#include "src/objects/js-proxy-inl.h"
 #include "src/objects/map-updater.h"
 #include "src/objects/object-conversions-inl.h"
 #include "src/objects/ordered-hash-table.h"
@@ -604,7 +603,9 @@ void LookupIterator::ReconfigureDataProperty(DirectHandle<Object> value,
         (((property_details_.attributes() & READ_ONLY) == 0 &&
           (attributes & READ_ONLY) != 0) ||
          (property_details_.attributes() & DONT_ENUM) !=
-             (attributes & DONT_ENUM))) {
+             (attributes & DONT_ENUM) ||
+         (V8_DICT_PROPERTY_CONST_TRACKING_BOOL &&
+          property_details_.constness() == PropertyConstness::kConst))) {
       // Invalidate prototype validity cell when a property is reconfigured
       // from writable to read-only as this may invalidate transitioning store
       // IC handlers.
@@ -667,9 +668,11 @@ void LookupIterator::PrepareTransitionToDataProperty(
   DCHECK_IMPLIES(IsJSProxy(*receiver), name_for_transition()->IsAnyPrivate());
   DCHECK_IMPLIES(!receiver.is_identical_to(GetStoreTarget<JSReceiver>()),
                  name_for_transition()->IsAnyPrivateName());
-  DCHECK(!IsAlwaysSharedSpaceJSObject(*receiver));
 #if V8_ENABLE_WEBASSEMBLY
   DCHECK(!IsWasmObject(*receiver));
+#endif
+#ifdef DEBUG
+  JSReceiver::ValidateExtensibilityInvariant(this, receiver);
 #endif
   if (state_ == TRANSITION) return;
 
@@ -896,8 +899,7 @@ Maybe<bool> LookupIterator::TransitionToAccessorProperty(
   }
 
   DirectHandle<AccessorPair> pair;
-  if (state() == ACCESSOR && IsAccessorPair(*GetAccessors())) {
-    pair = Cast<AccessorPair>(GetAccessors());
+  if (state() == ACCESSOR && TryCast<AccessorPair>(GetAccessors(), &pair)) {
     // If the component and attributes are identical, nothing has to be done.
     if (pair->Equals(*getter, *setter)) {
       if (property_details().attributes() == attributes) {
@@ -1158,31 +1160,12 @@ Handle<Object> LookupIterator::GetDataValue(
   return indirect_handle(FetchValue(allow_allocation), isolate_);
 }
 
-DirectHandle<Object> LookupIterator::GetDataValue(SeqCstAccessTag tag) const {
-  DCHECK_EQ(DATA, state_);
-  // Currently only shared structs and arrays support sequentially consistent
-  // access.
-  DCHECK(IsJSSharedStruct(*holder_) || IsJSSharedArray(*holder_));
-  DirectHandle<JSObject> holder = GetHolder<JSObject>();
-  if (IsElement(*holder)) {
-    ElementsAccessor* accessor = holder->GetElementsAccessor();
-    return accessor->GetAtomic(isolate_, holder, number_, kSeqCstAccess);
-  }
-  DCHECK_EQ(PropertyLocation::kField, property_details_.location());
-  DCHECK_EQ(PropertyKind::kData, property_details_.kind());
-  FieldIndex field_index =
-      FieldIndex::ForDetails(holder->map(), property_details_);
-  return JSObject::FastPropertyAt(
-      isolate_, holder, property_details_.representation(), field_index, tag);
-}
-
 void LookupIterator::WriteDataValue(DirectHandle<Object> value,
                                     bool initializing_store) {
   DCHECK_EQ(DATA, state_);
   // WriteDataValueToWasmObject() must be used instead for writing to
   // WasmObjects.
   DCHECK(!IsWasmObject(*holder_));
-  DCHECK_IMPLIES(IsJSSharedStruct(*holder_), IsShared(*value));
 
   DirectHandle<JSReceiver> holder = GetHolder<JSReceiver>();
   if (IsElement(*holder)) {
@@ -1192,8 +1175,8 @@ void LookupIterator::WriteDataValue(DirectHandle<Object> value,
   } else if (holder->HasFastProperties()) {
     DCHECK(IsJSObject(*holder));
     if (property_details_.location() == PropertyLocation::kField) {
-      // Check that in case of VariableMode::kConst field the existing value is
-      // equal to |value|.
+      // Check that in case of PropertyConstness::kConst field the existing
+      // value is equal to |value| or uninitialized.
       DCHECK_IMPLIES(!initializing_store && property_details_.constness() ==
                                                  PropertyConstness::kConst,
                      CanStayConst(*value));
@@ -1231,70 +1214,6 @@ void LookupIterator::WriteDataValue(DirectHandle<Object> value,
       dictionary->ValueAtPut(dictionary_entry(), *value);
     }
   }
-}
-
-void LookupIterator::WriteDataValue(DirectHandle<Object> value,
-                                    SeqCstAccessTag tag) {
-  DCHECK_EQ(DATA, state_);
-  // Currently only shared structs and arrays support sequentially consistent
-  // access.
-  DCHECK(IsJSSharedStruct(*holder_) || IsJSSharedArray(*holder_));
-  DirectHandle<JSObject> holder = GetHolder<JSObject>();
-  if (IsElement(*holder)) {
-    ElementsAccessor* accessor = holder->GetElementsAccessor();
-    accessor->SetAtomic(holder, number_, *value, kSeqCstAccess);
-    return;
-  }
-  DCHECK_EQ(PropertyLocation::kField, property_details_.location());
-  DCHECK_EQ(PropertyKind::kData, property_details_.kind());
-  DisallowGarbageCollection no_gc;
-  FieldIndex field_index =
-      FieldIndex::ForDescriptor(holder->map(), descriptor_number());
-  holder->FastPropertyAtPut(field_index, *value, tag);
-}
-
-DirectHandle<Object> LookupIterator::SwapDataValue(DirectHandle<Object> value,
-                                                   SeqCstAccessTag tag) {
-  DCHECK_EQ(DATA, state_);
-  // Currently only shared structs and arrays support sequentially consistent
-  // access.
-  DCHECK(IsJSSharedStruct(*holder_) || IsJSSharedArray(*holder_));
-  DirectHandle<JSObject> holder = GetHolder<JSObject>();
-  if (IsElement(*holder)) {
-    ElementsAccessor* accessor = holder->GetElementsAccessor();
-    return accessor->SwapAtomic(isolate_, holder, number_, *value,
-                                kSeqCstAccess);
-  }
-  DCHECK_EQ(PropertyLocation::kField, property_details_.location());
-  DCHECK_EQ(PropertyKind::kData, property_details_.kind());
-  DisallowGarbageCollection no_gc;
-  FieldIndex field_index =
-      FieldIndex::ForDescriptor(holder->map(), descriptor_number());
-  return direct_handle(holder->RawFastPropertyAtSwap(field_index, *value, tag),
-                       isolate_);
-}
-
-DirectHandle<Object> LookupIterator::CompareAndSwapDataValue(
-    DirectHandle<Object> expected, DirectHandle<Object> value,
-    SeqCstAccessTag tag) {
-  DCHECK_EQ(DATA, state_);
-  // Currently only shared structs and arrays support sequentially consistent
-  // access.
-  DCHECK(IsJSSharedStruct(*holder_) || IsJSSharedArray(*holder_));
-  DisallowGarbageCollection no_gc;
-  DirectHandle<JSObject> holder = GetHolder<JSObject>();
-  if (IsElement(*holder)) {
-    ElementsAccessor* accessor = holder->GetElementsAccessor();
-    return accessor->CompareAndSwapAtomic(isolate_, holder, number_, *expected,
-                                          *value, kSeqCstAccess);
-  }
-  DCHECK_EQ(PropertyLocation::kField, property_details_.location());
-  DCHECK_EQ(PropertyKind::kData, property_details_.kind());
-  FieldIndex field_index =
-      FieldIndex::ForDescriptor(holder->map(), descriptor_number());
-  return direct_handle(holder->RawFastPropertyAtCompareAndSwap(
-                           field_index, *expected, *value, tag),
-                       isolate_);
 }
 
 template <bool is_element>
@@ -1549,7 +1468,7 @@ bool LookupIterator::LookupCachedProperty(
   }
 
   DCHECK_EQ(state(), LookupIterator::ACCESSOR);
-  DCHECK(IsAccessorPair(*GetAccessors()));
+  DCHECK(IsAccessorPair(*accessor_pair));
 
   Tagged<Object> getter = accessor_pair->getter();
   std::optional<Tagged<Name>> maybe_name =
@@ -1723,7 +1642,8 @@ ConcurrentLookupIterator::Result ConcurrentLookupIterator::TryGetOwnChar(
 std::optional<Tagged<PropertyCell>>
 ConcurrentLookupIterator::TryGetPropertyCell(
     Isolate* isolate, LocalIsolate* local_isolate,
-    DirectHandle<JSGlobalObject> holder, DirectHandle<Name> name) {
+    DirectHandle<JSGlobalObject> holder, DirectHandle<Name> name,
+    SearchCachedProperty search_cached_property) {
   DisallowGarbageCollection no_gc;
 
   Tagged<Map> holder_map = holder->map();
@@ -1738,6 +1658,7 @@ ConcurrentLookupIterator::TryGetPropertyCell(
   Tagged<PropertyCell> cell = maybe_cell.value();
 
   if (cell->property_details(kAcquireLoad).kind() == PropertyKind::kAccessor) {
+    if (search_cached_property == SearchCachedProperty::kNo) return {};
     Tagged<Object> maybe_accessor_pair = cell->value(kAcquireLoad);
     if (!IsAccessorPair(maybe_accessor_pair)) return {};
 

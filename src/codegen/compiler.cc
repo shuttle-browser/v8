@@ -393,7 +393,7 @@ CompilationJob::Status UnoptimizedCompilationJob::ExecuteJob() {
 
 CompilationJob::Status UnoptimizedCompilationJob::FinalizeJob(
     DirectHandle<SharedFunctionInfo> shared_info, Isolate* isolate) {
-  DCHECK_EQ(ThreadId::Current(), isolate->thread_id());
+  DCHECK_EQ(base::ThreadId::Current(), isolate->thread_id());
   DisallowCodeDependencyChange no_dependency_change;
   DisallowJavascriptExecution no_js(isolate);
 
@@ -438,7 +438,7 @@ void LogUnoptimizedCompilation(Isolate* isolate,
 // Implementation of OptimizedCompilationJob
 
 CompilationJob::Status OptimizedCompilationJob::PrepareJob(Isolate* isolate) {
-  DCHECK_EQ(ThreadId::Current(), isolate->thread_id());
+  DCHECK_EQ(base::ThreadId::Current(), isolate->thread_id());
   DisallowJavascriptExecution no_js(isolate);
 
   // Delegate to the underlying implementation.
@@ -459,7 +459,7 @@ CompilationJob::Status OptimizedCompilationJob::ExecuteJob(
 }
 
 CompilationJob::Status OptimizedCompilationJob::FinalizeJob(Isolate* isolate) {
-  DCHECK_EQ(ThreadId::Current(), isolate->thread_id());
+  DCHECK_EQ(base::ThreadId::Current(), isolate->thread_id());
   DisallowJavascriptExecution no_js(isolate);
 
   // Delegate to the underlying implementation.
@@ -1033,14 +1033,20 @@ bool CompileTurbofan_NotConcurrent(Isolate* isolate,
   // Success!
   job->RecordCompilationStats(ConcurrencyMode::kSynchronous, isolate);
   DCHECK(!isolate->has_exception());
-  if (job->compilation_info()->is_osr()) {
-    OptimizedOSRCodeCache::Insert(
-        isolate, *compilation_info->closure(), compilation_info->osr_offset(),
-        *compilation_info->code(),
-        compilation_info->function_context_specializing());
-  } else if (!compilation_info->function_context_specializing()) {
-    compilation_info->shared_info()->set_function_context_independent_compiled(
-        true);
+  if (V8_LIKELY(!compilation_info->discard_result_for_testing())) {
+    if (job->compilation_info()->is_osr()) {
+      OptimizedOSRCodeCache::Insert(
+          isolate, *compilation_info->closure(), compilation_info->osr_offset(),
+          *compilation_info->code(),
+          compilation_info->function_context_specializing());
+    } else {
+      if (!compilation_info->function_context_specializing()) {
+        compilation_info->shared_info()
+            ->set_function_context_independent_compiled(true);
+      }
+      compilation_info->closure()->UpdateOptimizedCode(
+          isolate, *compilation_info->code());
+    }
   }
   job->RecordFunctionCompilation(LogEventListener::CodeTag::kFunction, isolate);
   return true;
@@ -1461,6 +1467,20 @@ void FinalizeUnoptimizedCompilation(
   for (const auto& finalize_data : finalize_unoptimized_compilation_data_list) {
     DirectHandle<SharedFunctionInfo> shared_info =
         finalize_data.function_handle();
+    // If the compilation was merged into a cached script, skip any newly
+    // compiled SFI that was discarded in favor of an already-compiled cached
+    // SFI, and otherwise resolve the surviving SFI from the script's SFI list.
+    if (shared_info->script() != *script) continue;
+    if (flags.is_toplevel()) {
+      Tagged<HeapObject> heap_object;
+      if (!script->infos()
+               ->get(shared_info->function_literal_id(kRelaxedLoad))
+               .GetHeapObjectIfWeak(&heap_object)) {
+        continue;
+      }
+      shared_info =
+          direct_handle(Cast<SharedFunctionInfo>(heap_object), isolate);
+    }
     // It's unlikely, but possible, that the bytecode was flushed between being
     // allocated and now, so guard against that case, and against it being
     // flushed in the middle of this loop.
@@ -1575,7 +1595,7 @@ MaybeHandle<SharedFunctionInfo> CompileToplevel(
     IsCompiledScope* is_compiled_scope) {
   TimerEventScope<TimerEventCompileCode> top_level_timer(isolate);
   TRACE_EVENT(TRACE_DISABLED_BY_DEFAULT("v8.compile"), "V8.CompileCode");
-  DCHECK_EQ(ThreadId::Current(), isolate->thread_id());
+  DCHECK_EQ(base::ThreadId::Current(), isolate->thread_id());
 
   PostponeInterruptsScope postpone(isolate);
   DCHECK(!isolate->native_context().is_null());
@@ -1937,7 +1957,7 @@ bool BackgroundCompileTask::is_streaming_compilation() const {
 }
 
 void BackgroundCompileTask::Run() {
-  DCHECK_NE(ThreadId::Current(), isolate_for_local_isolate_->thread_id());
+  DCHECK_NE(base::ThreadId::Current(), isolate_for_local_isolate_->thread_id());
   LocalIsolate isolate(isolate_for_local_isolate_, ThreadKind::kBackground);
   UnparkedScope unparked_scope(&isolate);
   LocalHandleScope handle_scope(&isolate);
@@ -2716,7 +2736,7 @@ Handle<SharedFunctionInfo> BackgroundMergeTask::CompleteMergeInForeground(
   state_ = kDone;
 
   if (isolate->NeedsSourcePositions()) {
-    Script::InitLineEnds(isolate, new_script);
+    Script::InitLineEnds(isolate, old_script);
     SharedFunctionInfo::EnsureSourcePositionsAvailable(isolate, result);
   }
 
@@ -2793,6 +2813,7 @@ MaybeHandle<SharedFunctionInfo> BackgroundCompileTask::FinalizeScript(
         merge.CompleteMergeInForeground(isolate, script);
     maybe_result = result;
     script = handle(Cast<Script>(result->script()), isolate);
+    DCHECK_EQ(*script, *cached_script);
     DCHECK(Object::StrictEquals(script->source(), *source));
     DCHECK(isolate->factory()->script_list()->Contains(MakeWeak(*script)));
   } else {
@@ -2995,7 +3016,7 @@ bool Compiler::CollectSourcePositions(
   }
 
   DCHECK(AllowCompilation::IsAllowed(isolate));
-  DCHECK_EQ(ThreadId::Current(), isolate->thread_id());
+  DCHECK_EQ(base::ThreadId::Current(), isolate->thread_id());
 
   DCHECK(!isolate->has_exception());
   VMState<BYTECODE_COMPILER> state(isolate);
@@ -3057,8 +3078,9 @@ bool Compiler::CollectSourcePositions(
     if (debug_info.value()->HasInstrumentedBytecodeArray()) {
       Tagged<TrustedByteArray> source_position_table =
           job->compilation_info()->bytecode_array()->SourcePositionTable();
-      shared_info->GetActiveBytecodeArray(isolate)->set_source_position_table(
-          source_position_table, kReleaseStore);
+      debug_info.value()
+          ->DebugBytecodeArray(isolate)
+          ->set_source_position_table(source_position_table, kReleaseStore);
     }
   }
 
@@ -3076,7 +3098,7 @@ bool Compiler::Compile(Isolate* isolate, Handle<SharedFunctionInfo> shared_info,
   DCHECK(!shared_info->is_compiled());
   DCHECK(!is_compiled_scope->is_compiled());
   DCHECK(AllowCompilation::IsAllowed(isolate));
-  DCHECK_EQ(ThreadId::Current(), isolate->thread_id());
+  DCHECK_EQ(base::ThreadId::Current(), isolate->thread_id());
   DCHECK(!isolate->has_exception());
   DCHECK(!shared_info->HasBytecodeArray());
 
@@ -3339,7 +3361,6 @@ void Compiler::CompileOptimized(Isolate* isolate,
   DirectHandle<Code> code;
   if (GetOrCompileOptimized(isolate, function, mode, code_kind)
           .ToHandle(&code)) {
-    function->UpdateOptimizedCode(isolate, *code);
     DCHECK_IMPLIES(v8_flags.log_function_events,
                    function->IsLoggingRequested(isolate));
   } else {
@@ -4099,7 +4120,8 @@ MaybeDirectHandle<SharedFunctionInfo> GetSharedFunctionInfoForScriptImpl(
   IsCompiledScope is_compiled_scope;
   if (use_compilation_cache) {
     bool can_consume_code_cache =
-        compile_options & ScriptCompiler::kConsumeCodeCache;
+        (compile_options & ScriptCompiler::kConsumeCodeCache) &&
+        !isolate->requires_bytecode_for_code_coverage();
     if (can_consume_code_cache) {
       compile_timer.set_consuming_code_cache();
     }
@@ -4319,7 +4341,8 @@ MaybeDirectHandle<JSFunction> Compiler::GetWrappedFunction(
   Handle<Script> script;
   IsCompiledScope is_compiled_scope;
   bool can_consume_code_cache =
-      compile_options & ScriptCompiler::kConsumeCodeCache;
+      (compile_options & ScriptCompiler::kConsumeCodeCache) &&
+      !isolate->requires_bytecode_for_code_coverage();
   CompilationCache* compilation_cache = isolate->compilation_cache();
   // First check per-isolate compilation cache.
   CompilationCacheScript::LookupResult lookup_result =

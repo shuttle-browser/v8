@@ -203,8 +203,6 @@ namespace internal {
   V(JSSet)                                      \
   V(JSSetIterator)                              \
   V(JSShadowRealm)                              \
-  V(JSSharedArray)                              \
-  V(JSSharedStruct)                             \
   V(JSSpecialObject)                            \
   V(JSStringIterator)                           \
   V(JSDetachedTypedArray)                       \
@@ -316,11 +314,11 @@ namespace internal {
 // but exist for the sake of type checking, for example IsCallable().
 #define VIRTUAL_OBJECT_TYPE_LIST(V) \
   V(AccessCheckNeeded)              \
-  V(AlwaysSharedSpaceJSObject)      \
   V(BigIntWrapper)                  \
   V(BooleanWrapper)                 \
   V(Callable)                       \
   V(Constructor)                    \
+  V(DescriptorLookupTable)          \
   V(Filler)                         \
   V(HandlerTable)                   \
   V(JSContextExtensionObject)       \

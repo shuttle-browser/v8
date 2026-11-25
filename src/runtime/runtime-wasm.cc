@@ -518,12 +518,9 @@ RUNTIME_FUNCTION(Runtime_TierUpJSToWasmWrapper) {
   const wasm::CanonicalSig* sig =
       wasm::GetTypeCanonicalizer()->LookupFunctionSignature(sig_id);
 
-  Tagged<CodeWrapper> maybe_cached_wrapper =
+  Tagged<Code> wrapper_code =
       wasm::WasmExportWrapperCache::Get(isolate, sig_id);
-  Tagged<Code> wrapper_code;
-  if (!maybe_cached_wrapper.is_null()) {
-    wrapper_code = maybe_cached_wrapper->code(isolate);
-  } else {
+  if (wrapper_code.is_null()) {
     // Set the context on the isolate and open a handle scope for allocation of
     // new objects. Wrap {trusted_data} in a handle so it survives GCs.
     DCHECK(isolate->context().is_null());
@@ -536,7 +533,7 @@ RUNTIME_FUNCTION(Runtime_TierUpJSToWasmWrapper) {
                                                                      sig);
 
     // Compilation must have installed the wrapper into the cache.
-    DCHECK_EQ(new_wrapper_code->wrapper(),
+    DCHECK_EQ(*new_wrapper_code,
               wasm::WasmExportWrapperCache::Get(isolate, sig_id));
 
     // Reset raw pointers still needed outside the slow path.
@@ -600,6 +597,8 @@ RUNTIME_FUNCTION(Runtime_TierUpWasmToJSWrapper) {
   wasm::ImportCallKind kind = resolved.kind();
   callable = resolved.callable();  // Update to ultimate target.
   DCHECK_NE(wasm::ImportCallKind::kLinkError, kind);
+  DCHECK_NE(wasm::ImportCallKind::kWasmToWasm, kind);
+  DCHECK_NE(wasm::ImportCallKind::kReexportedJSFunction, kind);
   int expected_arity = static_cast<int>(sig->parameter_count());
   if (kind == wasm::ImportCallKind::kJSFunction) {
     expected_arity = Cast<JSFunction>(callable)
@@ -1036,9 +1035,25 @@ bool ExecuteWasmDebugBreaks(
     DCHECK(!trusted_instance_data->break_on_entry());
     if (!maybe_on_entry_breakpoints.is_null()) {
       isolate->debug()->OnInstrumentationBreak();
-      if (isolate->debug()->IsRestartFrameScheduled()) return true;
+      if (isolate->debug()->has_scheduled_restart_frame()) return true;
       paused_on_instrumentation = true;
     }
+  }
+
+  // Check whether we hit a breakpoint.
+  DirectHandle<FixedArray> breakpoints;
+  if (isolate->debug()->break_points_active() &&
+      WasmScript::CheckBreakPoints(isolate, script, frame->position(),
+                                   frame->id())
+          .ToHandle(&breakpoints)) {
+    debug_info->ClearStepping(isolate);
+    StepAction step_action = isolate->debug()->last_step_action();
+    v8::debug::BreakReasons break_reasons =
+        isolate->debug()->scheduled_break_on_next_function_call();
+    isolate->debug()->ClearStepping();
+    // We hit one or several breakpoints. Notify the debug listeners.
+    isolate->debug()->OnDebugBreak(breakpoints, step_action, break_reasons);
+    return true;
   }
 
   if (debug_info->IsStepping(frame) && !debug_info->IsFrameBlackboxed(frame)) {
@@ -1050,21 +1065,6 @@ bool ExecuteWasmDebugBreaks(
     if (isolate->debug()->ContinueSteppingIfSkipped(step_action)) return true;
     isolate->debug()->OnDebugBreak(isolate->factory()->empty_fixed_array(),
                                    step_action, break_reasons);
-    return true;
-  }
-
-  // Check whether we hit a breakpoint.
-  DirectHandle<FixedArray> breakpoints;
-  if (WasmScript::CheckBreakPoints(isolate, script, frame->position(),
-                                   frame->id())
-          .ToHandle(&breakpoints)) {
-    debug_info->ClearStepping(isolate);
-    StepAction step_action = isolate->debug()->last_step_action();
-    isolate->debug()->ClearStepping();
-    if (isolate->debug()->break_points_active()) {
-      // We hit one or several breakpoints. Notify the debug listeners.
-      isolate->debug()->OnDebugBreak(breakpoints, step_action);
-    }
     return true;
   }
 
@@ -1590,21 +1590,15 @@ class PrototypesSetup : public wasm::Decoder {
         return ReadOnlyRoots(isolate()).exception();
       }
       // Important: installing {constructor} on {constructors} can invoke
-      // user code. Only determine fast path eligibility after that.
+      // user code. Only determine fast path eligibility and invalidate
+      // prototype chains after that.
       bool fast_path = false;
       DirectHandle<NameDictionary> dictionary;
       if (!prototype_is_null) {
-        if (IsJSObject(*prototype)) {
+        DCHECK_IMPLIES(IsJSObject(*prototype),
+                       Cast<JSObject>(prototype)->map()->is_prototype_map());
+        if (num_methods > 0 && IsJSObject(*prototype)) {
           DirectHandle<JSObject> proto = Cast<JSObject>(prototype);
-          if (!proto->map()->is_prototype_map()) {
-            // Important for correctness: switch to a non-shared map.
-            // Important for performance: switch to dictionary mode.
-            JSObject::OptimizeAsPrototype(proto);
-          } else {
-            // Prepare the fast path by invalidating any ICs that might already
-            // rely on this prototype.
-            JSObject::InvalidatePrototypeChains(proto->map());
-          }
           ToDictionaryMode(proto, num_methods);
           DisallowGarbageCollection using_plain_tagged_values;
           Tagged<Map> map = proto->map();
@@ -1619,8 +1613,11 @@ class PrototypesSetup : public wasm::Decoder {
             DCHECK(!map->has_named_interceptor());
             DCHECK(!IsJSGlobalObject(*proto));
             DCHECK(map->is_dictionary_map());
-            dictionary = handle(proto->property_dictionary(), isolate_);
+            dictionary = direct_handle(proto->property_dictionary(), isolate_);
             if (map->is_extensible() && dictionary->NumberOfElements() == 0) {
+              // Prepare the fast path by invalidating any ICs that might
+              // already rely on this prototype.
+              JSObject::InvalidatePrototypeChains(map);
               fast_path = true;
             }
           }
@@ -1813,15 +1810,14 @@ class PrototypesSetup : public wasm::Decoder {
     if (IsHeapObject(*maybe_proto)) {
       DirectHandle<HeapObject> heap_proto = Cast<HeapObject>(maybe_proto);
       if (IsJSObject(*heap_proto)) {
-        if (HeapLayout::InWritableSharedSpace(*heap_proto)) {
-          DCHECK(v8_flags.harmony_struct);
-          // Shared JS structs are not supported as prototypes, and probably
-          // never will be: we cannot change their maps to add new properties,
-          // and we cannot add pointers to non-shared methods to them.
-          ThrowWasmError(isolate_, MessageTemplate::kWasmTrapIllegalCast);
-          return {};
+        DirectHandle<JSObject> proto = Cast<JSObject>(heap_proto);
+        if (!proto->map()->is_prototype_map()) {
+          // Important for correctness: switch to a non-shared map before
+          // installing a constructor or methods.
+          // Important for performance: switch to dictionary mode.
+          JSObject::OptimizeAsPrototype(proto);
         }
-        return Cast<JSObject>(heap_proto);
+        return proto;
       }
       if (IsJSReceiver(*heap_proto)) {
         return Cast<JSReceiver>(heap_proto);
@@ -2995,7 +2991,7 @@ RUNTIME_FUNCTION(Runtime_WasmAllocateContinuation) {
       wasm::GetTypeCanonicalizer()->LookupFunctionSignature(sig_id);
   auto [arg_buffer_size, alignment] =
       GetBufferSizeAndAlignmentFor(sig->parameters());
-#if V8_TARGET_ARCH_ARM64
+#if V8_TARGET_ARCH_ARM64 || V8_X64_16BYTE_STACK_ALIGNMENT
   // For stack alignment.
   alignment = RoundUp(alignment, 2 * kSystemPointerSize);
 #endif

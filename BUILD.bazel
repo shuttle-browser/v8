@@ -171,6 +171,11 @@ v8_flag(
 )
 
 v8_flag(
+    name = "v8_enable_maglev_kna_btree",
+    default = True,
+)
+
+v8_flag(
     name = "v8_enable_undefined_double",
     default = True,
 )
@@ -280,6 +285,11 @@ v8_flag(
 
 v8_flag(
     name = "v8_enable_ecma402_icu4x",
+    default = False,
+)
+
+v8_flag(
+    name = "v8_enable_descriptor_array_lookup_table",
     default = False,
 )
 
@@ -574,10 +584,12 @@ v8_config(
         "v8_jitless": "V8_JITLESS",
         "v8_enable_vtunejit": "ENABLE_VTUNE_JIT_INTERFACE",
         "v8_enable_undefined_double": "V8_ENABLE_UNDEFINED_DOUBLE",
+        "v8_enable_maglev_kna_btree": "V8_ENABLE_MAGLEV_KNA_BTREE",
         "v8_use_host_cpu_arm_features": "V8_USE_HOST_CPU_ARM_FEATURES",
         "v8_x64_16byte_stack_alignment": "V8_X64_16BYTE_STACK_ALIGNMENT",
         "v8_support_la57": "V8_SUPPORT_LA57",
         "v8_enable_ecma402_icu4x": "V8_ENABLE_ECMA402_ICU4X",
+        "v8_enable_descriptor_array_lookup_table": "V8_ENABLE_DESCRIPTOR_ARRAY_LOOKUP_TABLE",
     },
     defines = [
         "GOOGLE3",
@@ -956,8 +968,6 @@ filegroup(
         "src/base/numbers/fast-dtoa.h",
         "src/base/numbers/fixed-dtoa.cc",
         "src/base/numbers/fixed-dtoa.h",
-        "src/base/numbers/strtod.cc",
-        "src/base/numbers/strtod.h",
         "src/base/numerics/angle_conversions.h",
         "src/base/numerics/basic_ops_impl.h",
         "src/base/numerics/byte_conversions.h",
@@ -1009,6 +1019,8 @@ filegroup(
         "src/base/strings.cc",
         "src/base/strings.h",
         "src/base/strong-alias.h",
+        "src/base/synchronization-point-support.cc",
+        "src/base/synchronization-point-support.h",
         "src/base/sys-info.cc",
         "src/base/sys-info.h",
         "src/base/template-meta-programming/common.h",
@@ -1016,6 +1028,8 @@ filegroup(
         "src/base/template-meta-programming/list.h",
         "src/base/template-meta-programming/string-literal.h",
         "src/base/template-utils.h",
+        "src/base/thread-id.cc",
+        "src/base/thread-id.h",
         "src/base/threaded-list.h",
         "src/base/timezone-cache.h",
         "src/base/types/is-instantiation.h",
@@ -1326,8 +1340,6 @@ filegroup(
         "src/objects/js-regexp.tq",
         "src/objects/js-regexp-string-iterator.tq",
         "src/objects/js-shadow-realm.tq",
-        "src/objects/js-shared-array.tq",
-        "src/objects/js-struct.tq",
         # Temporal is currently gn-only
         # "src/objects/js-temporal-objects.tq",
         "src/objects/js-weak-refs.tq",
@@ -1565,10 +1577,8 @@ filegroup(
         "src/builtins/builtins-reflect.cc",
         "src/builtins/builtins-regexp.cc",
         "src/builtins/builtins-shadow-realm.cc",
-        "src/builtins/builtins-shared-array.cc",
         "src/builtins/builtins-sharedarraybuffer.cc",
         "src/builtins/builtins-string.cc",
-        "src/builtins/builtins-struct.cc",
         "src/builtins/builtins-symbol.cc",
         # Temporal is currently gn-only
         # "src/builtins/builtins-temporal.cc",
@@ -1679,8 +1689,6 @@ filegroup(
         "src/common/thread-local-storage.h",
         "src/common/scoped-modification.h",
         "src/common/simd128.h",
-        "src/common/synchronization-point-support.cc",
-        "src/common/synchronization-point-support.h",
         "src/compiler-dispatcher/lazy-compile-dispatcher.cc",
         "src/compiler-dispatcher/lazy-compile-dispatcher.h",
         "src/compiler-dispatcher/optimizing-compile-dispatcher.cc",
@@ -1790,8 +1798,6 @@ filegroup(
         "src/execution/simulator-base.h",
         "src/execution/stack-guard.cc",
         "src/execution/stack-guard.h",
-        "src/execution/thread-id.cc",
-        "src/execution/thread-id.h",
         "src/execution/thread-local-top.cc",
         "src/execution/thread-local-top.h",
         "src/execution/tiering-manager.cc",
@@ -2008,9 +2014,6 @@ filegroup(
         "src/heap/parked-scope.h",
         "src/heap/pending-allocations.cc",
         "src/heap/pending-allocations.h",
-        "src/heap/pretenuring-handler.cc",
-        "src/heap/pretenuring-handler.h",
-        "src/heap/pretenuring-handler-inl.h",
         "src/heap/read-only-heap.cc",
         "src/heap/read-only-heap.h",
         "src/heap/read-only-heap-inl.h",
@@ -2297,9 +2300,6 @@ filegroup(
         "src/objects/js-regexp-string-iterator-inl.h",
         "src/objects/js-shadow-realm.h",
         "src/objects/js-shadow-realm-inl.h",
-        "src/objects/js-shared-array.h",
-        "src/objects/js-struct.cc",
-        "src/objects/js-struct.h",
         # Temporal is currently gn-only
         # "src/objects/js-temporal-objects.cc",
         # "src/objects/js-temporal-objects.h",
@@ -2320,6 +2320,8 @@ filegroup(
         "src/objects/lookup-cache.h",
         "src/objects/lookup-cache-inl.h",
         "src/objects/lookup-inl.h",
+        "src/objects/lookup-table.h",
+        "src/objects/lookup-table-inl.h",
         "src/objects/managed.cc",
         "src/objects/managed.h",
         "src/objects/managed-inl.h",
@@ -3735,8 +3737,6 @@ filegroup(
         "src/compiler/turboshaft/phase.h",
         "src/compiler/turboshaft/pipelines.cc",
         "src/compiler/turboshaft/pipelines.h",
-        "src/compiler/turboshaft/pretenuring-propagation-reducer.cc",
-        "src/compiler/turboshaft/pretenuring-propagation-reducer.h",
         "src/compiler/turboshaft/reducer-traits.h",
         "src/compiler/turboshaft/register-allocation-phase.h",
         "src/compiler/turboshaft/representations.cc",
@@ -4995,6 +4995,7 @@ v8_library(
         "@abseil-cpp//absl/container:flat_hash_map",
         "@abseil-cpp//absl/container:flat_hash_set",
         "@abseil-cpp//absl/functional:overload",
+        "@boringssl//:crypto",
         "@highway//:hwy",
     ],
 )

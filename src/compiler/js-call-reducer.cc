@@ -5337,6 +5337,10 @@ Reduction JSCallReducer::ReduceJSCall(Node* node) {
     feedback_target = feedback.AsCall().target();
   } else {
     DCHECK_EQ(p.feedback_relation(), CallFeedbackRelation::kReceiver);
+    DCHECK_EQ(feedback.AsCall().call_feedback_content(),
+              CallFeedbackContent::kReceiver);
+    DCHECK(feedback.AsCall().target().has_value() &&
+           feedback.AsCall().target()->map(broker()).is_callable());
     feedback_target = native_context().function_prototype_apply(broker());
   }
 
@@ -5359,6 +5363,9 @@ Reduction JSCallReducer::ReduceJSCall(Node* node) {
     // Try to further reduce the JSCall {node}.
     return Changed(node).FollowedBy(ReduceJSCall(node));
   } else if (feedback_target.has_value() && feedback_target->IsFeedbackCell()) {
+    DCHECK_EQ(p.feedback_relation(), CallFeedbackRelation::kTarget);
+    DCHECK_EQ(feedback.AsCall().call_feedback_content(),
+              CallFeedbackContent::kTarget);
     FeedbackCellRef feedback_cell = feedback_target.value().AsFeedbackCell();
     // TODO(neis): This check seems unnecessary.
     if (feedback_cell.feedback_vector(broker()).has_value()) {
@@ -5961,9 +5968,9 @@ Reduction JSCallReducer::ReduceJSConstruct(Node* node) {
     OptionalHeapObjectRef feedback_target = feedback.AsCall().target();
     if (feedback_target.has_value() && feedback_target->IsAllocationSite()) {
       // The feedback is an AllocationSite, which means we have called the
-      // Array function and collected transition (and pretenuring) feedback
-      // for the resulting arrays.  This has to be kept in sync with the
-      // implementation in Ignition.
+      // Array function and collected transition feedback for the resulting
+      // arrays.  This has to be kept in sync with the implementation in
+      // Ignition.
 
       Node* array_function = jsgraph()->ConstantNoHole(
           native_context().array_function(broker()), broker());

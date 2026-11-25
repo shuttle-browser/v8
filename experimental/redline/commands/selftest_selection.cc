@@ -30,6 +30,7 @@
 #include "experimental/redline/engine/stages.h"
 #include "experimental/redline/fast/parser.h"
 #include "experimental/redline/fast/printer.h"
+#include "experimental/redline/generators/codegen.h"
 #include "experimental/redline/generators/generator.h"
 #include "experimental/redline/mutators/mutator.h"
 
@@ -299,9 +300,33 @@ std::string FirstDifference(const std::string& expected,
                       line_at(actual, i).c_str());
 }
 
+// Removes the spaces and tabs at the end of each line. Gerrit marks trailing
+// whitespace, so the golden files must not have it.
+std::string StripTrailingWhitespace(const std::string& text) {
+  std::string out;
+  out.reserve(text.size());
+  size_t start = 0;
+  while (start < text.size()) {
+    size_t newline = text.find('\n', start);
+    size_t end = newline == std::string::npos ? text.size() : newline;
+    size_t last = end;
+    while (last > start && (text[last - 1] == ' ' || text[last - 1] == '\t')) {
+      last--;
+    }
+    out.append(text, start, last - start);
+    if (newline == std::string::npos) {
+      break;
+    }
+    out += '\n';
+    start = newline + 1;
+  }
+  return out;
+}
+
 void CompareOrWrite(Checker* checker, const std::string& check_name,
-                    const std::string& path, const std::string& trace,
+                    const std::string& path, const std::string& raw_trace,
                     bool write_golden) {
+  const std::string trace = StripTrailingWhitespace(raw_trace);
   std::string error;
   if (write_golden) {
     bool ok = WriteStringToFile(path, trace, &error);
@@ -405,26 +430,28 @@ void CheckStageConfig(Checker* checker) {
     FuzzConfig config;
     std::string error = load(
         R"({"consecutive_mutations": 9,
-                "stages": {"prefix": {"min_values": 3, "extra_values": 1},
-                           "mutate": {"consecutive": 2, "rounds": 1, "log": "events",
+                "stages": {"prefix": {"min_values": 3, "extra_values": 1, "from_scratch": false},
+                           "mutate": {"consecutive": 2, "rounds": 1, "scratch_codegen": 2, "log": "events",
                                       "capture": {"on": "timeout,invalid", "mutators": ["Input"], "max": 3}},
                            "check": {"min_reruns": 2, "max_reruns": 8, "capture": {"on": ["flaky"]}},
                            "minimize": {"enabled": false, "max_tests": 12},
                            "publish": {"save_corpus": false, "stats": false}}})",
         &config);
-    bool ok =
-        error.empty() && config.prefix_min_values == 3 &&
-        config.prefix_extra_values == 1 && config.consecutive_mutations == 2 &&
-        config.mutation_rounds == 1 && config.stage(Stage::kMutate).events &&
-        config.stage(Stage::kMutate).capture.on.size() == 2 &&
-        config.stage(Stage::kMutate).capture.mutators ==
-            std::vector<std::string>{"Input"} &&
-        config.stage(Stage::kMutate).capture.max == 3 &&
-        config.min_reruns == 2 && config.max_reruns == 8 &&
-        config.stage(Stage::kCheck)
-            .capture.Matches(CaptureTrigger::kFlaky, "") &&
-        !config.minimize && config.minimizer.max_tests == 12 &&
-        !config.save_corpus && !config.stage(Stage::kPublish).stats;
+    bool ok = error.empty() && config.prefix_min_values == 3 &&
+              config.prefix_extra_values == 1 && !config.prefix_from_scratch &&
+              config.consecutive_mutations == 2 &&
+              config.mutation_rounds == 1 &&
+              config.scratch_codegen_links == 2 &&
+              config.stage(Stage::kMutate).events &&
+              config.stage(Stage::kMutate).capture.on.size() == 2 &&
+              config.stage(Stage::kMutate).capture.mutators ==
+                  std::vector<std::string>{"Input"} &&
+              config.stage(Stage::kMutate).capture.max == 3 &&
+              config.min_reruns == 2 && config.max_reruns == 8 &&
+              config.stage(Stage::kCheck)
+                  .capture.Matches(CaptureTrigger::kFlaky, "") &&
+              !config.minimize && config.minimizer.max_tests == 12 &&
+              !config.save_corpus && !config.stage(Stage::kPublish).stats;
     checker->Check(
         "stages: block sets the stage parameters and wins over flat keys", ok,
         error.empty() ? "" : error);
@@ -434,6 +461,8 @@ void CheckStageConfig(Checker* checker) {
     bool round_trip =
         JsonValue::Parse(config.ToJson(), &again, &parse_error) &&
         again.Get("stages").Get("mutate").GetInt("consecutive", 0) == 2 &&
+        again.Get("stages").Get("mutate").GetInt("scratch_codegen", 0) == 2 &&
+        !again.Get("stages").Get("prefix").GetBool("from_scratch", true) &&
         again.Get("stages").Get("mutate").Get("capture").Get("on").is_array() &&
         !again.Get("stages").Get("minimize").GetBool("enabled", true);
     checker->Check(
@@ -764,6 +793,41 @@ void CheckConfigDump(Checker* checker) {
   TunableRegistry::Instance().Reset();
 }
 
+// A --config flag with the two d8 keys, for the checks of the d8 flags.
+constexpr const char* kD8ArgsConfig =
+    R"(--config={"d8_args": ["--file-a"], "d8_extra_args": ["--extra-a"]})";
+
+// Loads the configuration of `redline fuzz ARGS` and returns its d8 flags,
+// with a space between two flags. If the configuration is not correct, it
+// returns the error.
+std::string LoadedD8Args(std::initializer_list<std::string> args) {
+  std::vector<const char*> argv = {"redline", "fuzz"};
+  for (const std::string& arg : args) {
+    argv.push_back(arg.c_str());
+  }
+  Flags flags = Flags::Parse(static_cast<int>(argv.size()), argv.data(), 2);
+  FuzzConfig config;
+  std::string error;
+  if (!FuzzConfig::Load(flags, &config, &error, /*for_run=*/false)) {
+    return "error: " + error;
+  }
+  std::string joined;
+  for (const std::string& arg : config.target.args) {
+    joined += (joined.empty() ? "" : " ") + arg;
+  }
+  return joined;
+}
+
+// The flag --d8-args replaces the d8_args key of the configuration. The
+// d8_extra_args key of the configuration stays after the flags of --d8-args.
+void CheckD8ArgLayers(Checker* checker) {
+  std::string got = LoadedD8Args({kD8ArgsConfig, "--d8-args=--base-a --base-b",
+                                  "--d8-extra-args=--extra-b"});
+  checker->Check("config: --d8-args keeps the d8_extra_args of --config",
+                 got == "--base-a --base-b --extra-a --extra-b", got);
+  TunableRegistry::Instance().Reset();
+}
+
 // The "init" and "accept" blocks and stages.minimize.reducers: values land
 // in their fields, mistakes are reported.
 void CheckStrategyBlocks(Checker* checker) {
@@ -967,6 +1031,49 @@ void CheckEdgeCases(Checker* checker) {
         "random: full int64 Range and trailing zero weight in Weighted",
         weighted_ok);
   }
+  // CodeGen recursion cap under adversarial tunable settings.
+  {
+    TunableRegistry& reg = TunableRegistry::Instance();
+    std::string err;
+    bool set_ok = reg.Set("codegen.argument.reuse_chance", 0.0, &err) &&
+                  reg.Set("codegen.value.variable_chance", 0.0, &err) &&
+                  reg.Set("codegen.argument.optional_stop_chance", 0.0, &err) &&
+                  reg.Set("codegen.expression.max_depth", 16.0, &err) &&
+                  reg.Set("codegen.argument.max_depth", 16.0, &err) &&
+                  reg.Set("codegen.max_expr_depth", 10.0, &err);
+    std::unique_ptr<GeneratorSet> generators = GeneratorSet::CreateDefault();
+    const Environment& env = Environment::Default();
+    Random rng(12345);
+    bool depth_ok = set_ok;
+    for (int i = 0; i < 300 && depth_ok; i++) {
+      auto tree = std::make_unique<fast::Tree>();
+      tree->set_root(tree->New<fast::Program>());
+      Builder builder(tree.get(), &rng);
+      GenContext ctx(builder, *generators, env);
+      CodeGen cg(ctx);
+      fast::Expression* e1 = cg.Expression(0);
+      fast::Expression* e2 = cg.BuiltinCall();
+      fast::Expression* e3 = cg.Construct();
+      if (ctx.expr_depth != 0 || e1 == nullptr || e2 == nullptr ||
+          e3 == nullptr) {
+        depth_ok = false;
+        break;
+      }
+      tree->root()->body.push_back(cg.Stmt(e1));
+      tree->root()->body.push_back(cg.Stmt(e2));
+      tree->root()->body.push_back(cg.Stmt(e3));
+      fast::ParseError parse_err;
+      if (fast::Parser::ParseScript(fast::Print(tree->root()),
+                                    fast::ParseOptions(),
+                                    &parse_err) == nullptr) {
+        err = parse_err.message;
+        depth_ok = false;
+      }
+    }
+    reg.Reset();
+    checker->Check("codegen: expression recursion depth stays bounded",
+                   depth_ok, err);
+  }
 }
 
 }  // namespace
@@ -1019,6 +1126,7 @@ void RunSelectionChecks(Checker* checker, const std::string& testdata_dir,
   }
   CheckTunables(checker);
   CheckConfigDump(checker);
+  CheckD8ArgLayers(checker);
   CheckAdaptiveWindow(checker);
   CheckAmplifyConfig(checker);
   CheckWrapInTry(checker);
@@ -1081,6 +1189,34 @@ void RunPresetChecks(Checker* checker) {
     bool ok = FuzzConfig::Load(flags, &config, &error, /*for_run=*/false);
     checker->Check(("presets: " + BaseName(path) + " loads").c_str(), ok,
                    error);
+    // The flag --d8-args keeps the d8_extra_args of the preset. A d8_args
+    // key in --config removes them.
+    std::string text;
+    JsonValue json;
+    if (!ok || !ReadFileToString(path, &text, &error) ||
+        !JsonValue::Parse(text, &json, &error) ||
+        !json.Get("d8_extra_args").is_array() ||
+        json.Get("d8_extra_args").as_array().empty()) {
+      continue;
+    }
+    std::string preset_flags;
+    for (const JsonValue& flag : json.Get("d8_extra_args").as_array()) {
+      if (flag.is_string()) {
+        preset_flags += " " + flag.as_string();
+      }
+    }
+    std::string got =
+        LoadedD8Args({arg, "--d8-args=--base-a", "--d8-extra-args=--extra-b"});
+    checker->Check(
+        ("presets: --d8-args keeps the d8_extra_args of " + BaseName(path))
+            .c_str(),
+        got == "--base-a" + preset_flags + " --extra-b", got);
+    got = LoadedD8Args({arg, kD8ArgsConfig, "--d8-args=--base-a",
+                        "--d8-extra-args=--extra-b"});
+    checker->Check(("presets: a d8_args key removes the d8_extra_args of " +
+                    BaseName(path))
+                       .c_str(),
+                   got == "--base-a --extra-a --extra-b", got);
   }
   TunableRegistry::Instance().Reset();
 }

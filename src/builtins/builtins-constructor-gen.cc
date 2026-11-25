@@ -358,23 +358,7 @@ TNode<JSObject> ConstructorBuiltinsAssembler::FastNewObject(
       offsetof(Map, constructor_or_back_pointer_or_native_context_));
   GotoIf(TaggedNotEqual(target, new_target_constructor), call_runtime);
 
-  TVARIABLE(HeapObject, properties);
-
-  Label instantiate_map(this), allocate_properties(this);
-  GotoIf(IsDictionaryMap(initial_map), &allocate_properties);
-  {
-    properties = EmptyFixedArrayConstant();
-    Goto(&instantiate_map);
-  }
-  BIND(&allocate_properties);
-  {
-    properties =
-        AllocatePropertyDictionary(PropertyDictionary::kInitialCapacity);
-    Goto(&instantiate_map);
-  }
-
-  BIND(&instantiate_map);
-  return AllocateJSObjectFromMap(initial_map, properties.value(), std::nullopt,
+  return AllocateJSObjectFromMap(initial_map, std::nullopt, std::nullopt,
                                  AllocationFlag::kNone, kWithSlackTracking);
 }
 
@@ -585,13 +569,13 @@ TNode<JSArray> ConstructorBuiltinsAssembler::CreateEmptyArrayLiteral(
   TNode<IntPtrT> zero_intptr = IntPtrConstant(0);
   TNode<Smi> zero = SmiConstant(0);
   Comment("Allocate JSArray");
-  std::optional<TNode<AllocationSite>> site =
-      V8_ALLOCATION_SITE_TRACKING_BOOL
-          ? std::make_optional(allocation_site.value())
-          : std::nullopt;
-  TNode<JSArray> result = AllocateJSArray(GetInitialFastElementsKind(),
-                                          array_map, zero_intptr, zero, site);
-
+  TNode<JSArray> result = AllocateJSArray(
+      GetInitialFastElementsKind(), array_map, zero_intptr, zero, std::nullopt);
+  if (V8_ALLOCATION_SITE_TRACKING_BOOL) {
+    GotoIf(ElementsKindEqual(kind, Int32Constant(TERMINAL_FAST_ELEMENTS_KIND)),
+           &done);
+    RecordAllocationSiteInCache(result, allocation_site.value());
+  }
   Goto(&done);
   BIND(&done);
 
@@ -607,12 +591,12 @@ TNode<HeapObject> ConstructorBuiltinsAssembler::CreateShallowObjectLiteral(
 
   TNode<AllocationSite> allocation_site = CAST(maybe_allocation_site);
   TNode<JSObject> boilerplate = LoadBoilerplate(allocation_site);
-  return CreateShallowObjectLiteral(allocation_site, boilerplate, call_runtime);
+  return CreateShallowObjectLiteral(boilerplate, call_runtime);
 }
 
 TNode<HeapObject> ConstructorBuiltinsAssembler::CreateShallowObjectLiteral(
-    TNode<AllocationSite> allocation_site, TNode<JSObject> boilerplate,
-    Label* call_runtime, bool bailout_if_dictionary_properties) {
+    TNode<JSObject> boilerplate, Label* call_runtime,
+    bool bailout_if_dictionary_properties) {
   TNode<Map> boilerplate_map = LoadMap(boilerplate);
   CSA_DCHECK(this, IsJSObjectMap(boilerplate_map));
 
@@ -680,20 +664,9 @@ TNode<HeapObject> ConstructorBuiltinsAssembler::CreateShallowObjectLiteral(
   static_assert(JSObject::kMaxInstanceSize < kMaxRegularHeapObjectSize);
   TNode<IntPtrT> instance_size =
       TimesTaggedSize(LoadMapInstanceSizeInWords(boilerplate_map));
-  TNode<IntPtrT> aligned_instance_size =
-      AlignToAllocationAlignment(instance_size);
-  TNode<IntPtrT> allocation_size = instance_size;
-  bool needs_allocation_memento = v8_flags.allocation_site_pretenuring;
-  if (needs_allocation_memento) {
-    DCHECK(V8_ALLOCATION_SITE_TRACKING_BOOL);
-    // Prepare for inner-allocating the AllocationMemento.
-    allocation_size = IntPtrAdd(aligned_instance_size,
-                                IntPtrConstant(ALIGN_TO_ALLOCATION_ALIGNMENT(
-                                    sizeof(AllocationMemento))));
-  }
 
   TNode<HeapObject> copy =
-      UncheckedCast<HeapObject>(AllocateInNewSpace(allocation_size));
+      UncheckedCast<HeapObject>(AllocateInNewSpace(instance_size));
   {
     Comment("Initialize Literal Copy");
     // Initialize Object fields.
@@ -702,12 +675,6 @@ TNode<HeapObject> ConstructorBuiltinsAssembler::CreateShallowObjectLiteral(
         copy, offsetof(JSObject, properties_or_hash_), var_properties.value());
     StoreObjectFieldNoWriteBarrier(copy, offsetof(JSObject, elements_),
                                    var_elements.value());
-  }
-
-  // Initialize the AllocationMemento before potential GCs due to heap number
-  // allocation when copying the in-object properties.
-  if (needs_allocation_memento) {
-    InitializeAllocationMemento(copy, aligned_instance_size, allocation_site);
   }
 
   {

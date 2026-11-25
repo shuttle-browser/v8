@@ -427,6 +427,9 @@ declare_args() {
   # as the backing store for all dictionary mode objects.
   v8_enable_swiss_name_dictionary = false
 
+  # Enable hash lookup table in DescriptorArray instead of binary search.
+  v8_enable_descriptor_array_lookup_table = false
+
   # If enabled then macro definitions that are used in externally visible
   # header files are placed in a separate header file v8-gn.h.
   v8_generate_external_defines_header = false
@@ -488,6 +491,12 @@ declare_args() {
   # Enable Maglev's graph printer.
   # Sets -DV8_ENABLE_MAGLEV_GRAPH_PRINTER.
   v8_enable_maglev_graph_printer = !build_with_chromium
+
+  # Use a Copy-on-Write B+Tree map in Maglev KnownNodeAspects.
+  # TODO(leszeks): Remove the ZoneMap fallback shim and this build flag once the
+  # B+Tree rollout is complete.
+  # Sets -DV8_ENABLE_MAGLEV_KNA_BTREE.
+  v8_enable_maglev_kna_btree = true
 
   # Enable slow tracing, e.g., tracing on every instruction or Turbofan node.
   # Sets -DV8_ENABLE_SLOW_TRACING.
@@ -853,9 +862,9 @@ if (v8_builtins_profiling_log_file == "default") {
     } else {
       pgo_profile_suffix = ""
     }
-    if ((v8_current_cpu == "x64" || v8_current_cpu == "arm64") &&
-        v8_enable_pointer_compression && v8_enable_external_code_space &&
-        v8_enable_sandbox) {
+    if ((v8_current_cpu == "x64" || v8_current_cpu == "arm64" ||
+         v8_current_cpu == "loong64") && v8_enable_pointer_compression &&
+        v8_enable_external_code_space && v8_enable_sandbox) {
       # Note, currently x64 profile can be applied to arm64 but not the other
       # way round.
       v8_builtins_profiling_log_file =
@@ -964,7 +973,7 @@ assert(!v8_enable_cet_shadow_stack ||
        "CET shadow stack is supported only on x64 Windows")
 
 if (v8_enable_sticky_mark_bits) {
-  # To support sticky mark bits, pretenured allocations must be allocated from
+  # To support sticky mark bits, old-space allocations must be allocated from
   # a separate free-list and the atomic pause (or the sweeper) must fix up the
   # mark bits.
   assert(!v8_enable_black_allocated_pages,
@@ -1563,6 +1572,9 @@ config("features") {
   if (v8_fuzzilli) {
     defines += [ "V8_FUZZILLI" ]
   }
+  if (v8_redline) {
+    defines += [ "V8_REDLINE" ]
+  }
   if (v8_enable_builtins_profiling) {
     defines += [ "V8_ENABLE_BUILTINS_PROFILING" ]
   }
@@ -1616,6 +1628,9 @@ config("features") {
   }
   if (v8_enable_swiss_name_dictionary) {
     defines += [ "V8_ENABLE_SWISS_NAME_DICTIONARY" ]
+  }
+  if (v8_enable_descriptor_array_lookup_table) {
+    defines += [ "V8_ENABLE_DESCRIPTOR_ARRAY_LOOKUP_TABLE" ]
   }
   if (v8_enable_system_instrumentation) {
     defines += [ "V8_ENABLE_SYSTEM_INSTRUMENTATION" ]
@@ -1689,6 +1704,9 @@ config("features") {
   }
   if (v8_enable_maglev_graph_printer) {
     defines += [ "V8_ENABLE_MAGLEV_GRAPH_PRINTER" ]
+  }
+  if (v8_enable_maglev_kna_btree) {
+    defines += [ "V8_ENABLE_MAGLEV_KNA_BTREE" ]
   }
   if (v8_enable_slow_tracing) {
     defines += [ "V8_ENABLE_SLOW_TRACING" ]
@@ -1843,7 +1861,7 @@ config("toolchain") {
     if (riscv_use_zicfiss) {
       defines += [ "V8_ENABLE_RISCV_SHADOW_STACK" ]
     }
-    if (riscv_profile == "rva23u64") {
+    if (riscv_profile == "rva23u64" || v8_target_is_simulator) {
       defines += [ "CAN_USE_RVA23U64_INSTRUCTIONS" ]
     }
     if (riscv_use_zicond) {
@@ -2424,8 +2442,6 @@ torque_files = [
   "src/objects/js-regexp-string-iterator.tq",
   "src/objects/js-regexp.tq",
   "src/objects/js-shadow-realm.tq",
-  "src/objects/js-shared-array.tq",
-  "src/objects/js-struct.tq",
   "src/objects/js-weak-refs.tq",
   "src/objects/literal-objects.tq",
   "src/objects/managed.tq",
@@ -3016,23 +3032,23 @@ v8_cluster_source_set("torque_generated_initializers") {
   generated_sources = true
 
   deps = [
-    ":generate_bytecode_builtins_list",
-    ":run_torque",
     ":v8_base_without_compiler",
     ":v8_internal_headers",
     ":v8_maybe_ecma402_icu4x",
     ":v8_maybe_temporal",
     ":v8_tracing",
   ]
-  if (v8_enable_experimental_tq_to_tsa) {
-    deps += [ ":run_torque_to_tsa" ]
-  }
 
   public_deps = [
+    ":generate_bytecode_builtins_list",
+    ":run_torque",
     ":torque_runtime_support",
     ":v8_abseil",
     ":v8_maybe_icu",
   ]
+  if (v8_enable_experimental_tq_to_tsa) {
+    public_deps += [ ":run_torque_to_tsa" ]
+  }
 
   sources = torque_csa_cc_files + [
               "$target_gen_dir/torque-generated/bit-field-asserts.cc",
@@ -3276,7 +3292,6 @@ template("run_mksnapshot") {
                                         "root_out_dir") + "/mksnapshot",
                          root_build_dir),
       "--turbo_instruction_scheduling",
-      "--turbo-always-optimize-spills",
 
       # In cross builds, the snapshot may be generated for both the host and
       # target toolchains.  The same host binary is used to generate both, so
@@ -4297,7 +4312,6 @@ v8_header_set("v8_internal_headers") {
     "src/common/ptr-compr.h",
     "src/common/scoped-modification.h",
     "src/common/simd128.h",
-    "src/common/synchronization-point-support.h",
     "src/common/thread-local-storage.h",
     "src/compiler-dispatcher/lazy-compile-dispatcher.h",
     "src/compiler-dispatcher/optimizing-compile-dispatcher.h",
@@ -4485,7 +4499,6 @@ v8_header_set("v8_internal_headers") {
     "src/compiler/turboshaft/opmasks.h",
     "src/compiler/turboshaft/phase.h",
     "src/compiler/turboshaft/pipelines.h",
-    "src/compiler/turboshaft/pretenuring-propagation-reducer.h",
     "src/compiler/turboshaft/random-rescheduling-phase.h",
     "src/compiler/turboshaft/reducer-traits.h",
     "src/compiler/turboshaft/register-allocation-phase.h",
@@ -4592,7 +4605,6 @@ v8_header_set("v8_internal_headers") {
     "src/execution/simulator-base.h",
     "src/execution/simulator.h",
     "src/execution/stack-guard.h",
-    "src/execution/thread-id.h",
     "src/execution/thread-local-top.h",
     "src/execution/tiering-manager.h",
     "src/execution/v8threads.h",
@@ -4731,8 +4743,6 @@ v8_header_set("v8_internal_headers") {
     "src/heap/parked-scope-inl.h",
     "src/heap/parked-scope.h",
     "src/heap/pending-allocations.h",
-    "src/heap/pretenuring-handler-inl.h",
-    "src/heap/pretenuring-handler.h",
     "src/heap/read-only-heap-inl.h",
     "src/heap/read-only-heap.h",
     "src/heap/read-only-promotion.h",
@@ -4927,8 +4937,6 @@ v8_header_set("v8_internal_headers") {
     "src/objects/js-segments.h",
     "src/objects/js-shadow-realm-inl.h",
     "src/objects/js-shadow-realm.h",
-    "src/objects/js-shared-array.h",
-    "src/objects/js-struct.h",
     "src/objects/js-temporal-helpers.h",
     "src/objects/js-weak-refs-inl.h",
     "src/objects/js-weak-refs.h",
@@ -4938,6 +4946,8 @@ v8_header_set("v8_internal_headers") {
     "src/objects/lookup-cache-inl.h",
     "src/objects/lookup-cache.h",
     "src/objects/lookup-inl.h",
+    "src/objects/lookup-table-inl.h",
+    "src/objects/lookup-table.h",
     "src/objects/lookup.h",
     "src/objects/managed-inl.h",
     "src/objects/managed-type-id.h",
@@ -6120,7 +6130,6 @@ v8_compiler_sources = [
   "src/compiler/turboshaft/operations.cc",
   "src/compiler/turboshaft/phase.cc",
   "src/compiler/turboshaft/pipelines.cc",
-  "src/compiler/turboshaft/pretenuring-propagation-reducer.cc",
   "src/compiler/turboshaft/random-rescheduling-phase.cc",
   "src/compiler/turboshaft/representations.cc",
   "src/compiler/turboshaft/sidetable.cc",
@@ -6289,6 +6298,8 @@ exclude_from_compiler_cluster = [
                                         # 'interpreter::Register'.
   "src/compiler/heap-refs.cc",  # Is64() function.
   "src/compiler/wasm-load-elimination.cc",  # MayAlias.
+  "src/compiler/backend/move-optimizer.cc",  # Unqualified Assembler on arm64
+                                             # vs. using namespace turboshaft.
 ]
 
 if (v8_enable_builtins_block_position) {
@@ -6428,6 +6439,7 @@ v8_cluster_source_set("v8_base_without_compiler") {
     "src/objects/js-display-names.cc",  # CheckCalendar.
     "src/objects/js-list-format.cc",
     "src/objects/js-number-format.cc",  # Style, also big.
+    "src/objects/js-plural-rules-internal.cc",  # CreateDataPropertyForOptions.
     "src/objects/js-temporal-objects.cc",  # Unit, also big.
     "src/runtime/runtime-test-wasm.cc",  # WasmStackSize.
     "src/sandbox/external-pointer-table.cc",  # entry_spacer.
@@ -6476,10 +6488,8 @@ v8_cluster_source_set("v8_base_without_compiler") {
     "src/builtins/builtins-reflect.cc",
     "src/builtins/builtins-regexp.cc",
     "src/builtins/builtins-shadow-realm.cc",
-    "src/builtins/builtins-shared-array.cc",
     "src/builtins/builtins-sharedarraybuffer.cc",
     "src/builtins/builtins-string.cc",
-    "src/builtins/builtins-struct.cc",
     "src/builtins/builtins-symbol.cc",
     "src/builtins/builtins-trace.cc",
     "src/builtins/builtins-typed-array.cc",
@@ -6518,7 +6528,6 @@ v8_cluster_source_set("v8_base_without_compiler") {
     "src/common/assert-scope.cc",
     "src/common/code-memory-access.cc",
     "src/common/ptr-compr.cc",
-    "src/common/synchronization-point-support.cc",
     "src/compiler-dispatcher/lazy-compile-dispatcher.cc",
     "src/compiler-dispatcher/optimizing-compile-dispatcher.cc",
     "src/compiler/linkage.cc",
@@ -6565,7 +6574,6 @@ v8_cluster_source_set("v8_base_without_compiler") {
     "src/execution/protectors.cc",
     "src/execution/simulator-base.cc",
     "src/execution/stack-guard.cc",
-    "src/execution/thread-id.cc",
     "src/execution/thread-local-top.cc",
     "src/execution/tiering-manager.cc",
     "src/execution/v8threads.cc",
@@ -6640,7 +6648,6 @@ v8_cluster_source_set("v8_base_without_compiler") {
     "src/heap/object-stats.cc",
     "src/heap/paged-spaces.cc",
     "src/heap/pending-allocations.cc",
-    "src/heap/pretenuring-handler.cc",
     "src/heap/read-only-heap.cc",
     "src/heap/read-only-promotion.cc",
     "src/heap/read-only-spaces.cc",
@@ -6741,7 +6748,6 @@ v8_cluster_source_set("v8_base_without_compiler") {
     "src/objects/js-segment-iterator.cc",
     "src/objects/js-segmenter.cc",
     "src/objects/js-segments.cc",
-    "src/objects/js-struct.cc",
     "src/objects/js-temporal-helpers.cc",
     "src/objects/js-weak-refs.cc",
     "src/objects/keys.cc",
@@ -7412,6 +7418,15 @@ v8_cluster_source_set("v8_base_without_compiler") {
     "//third_party/highway:libhwy",
   ]
 
+  if (current_cpu != "ppc64" && current_cpu != "s390x" &&
+      current_cpu != "loong64") {
+    if (defined(build_with_node) && build_with_node) {
+      deps += [ "$node_openssl_path" ]
+    } else {
+      deps += [ "//third_party/boringssl" ]
+    }
+  }
+
   # With checked-in headers, link generated definitions through :v8_base.
   # A dependency here would make every compile wait for run_torque.
   if (!v8_use_checked_in_generated_headers) {
@@ -7445,6 +7460,10 @@ v8_cluster_source_set("v8_base_without_compiler") {
   if (v8_fuzzilli) {
     sources += [ "src/fuzzilli/fuzzilli.cc" ]
     public_deps += [ ":fuzzilli_cov" ]
+  }
+
+  if (v8_redline) {
+    public_deps += [ "experimental/redline/d8:v8_redline" ]
   }
 
   if (v8_dumpling) {
@@ -7737,8 +7756,6 @@ v8_component("v8_libbase") {
     "src/base/numbers/fast-dtoa.h",
     "src/base/numbers/fixed-dtoa.cc",
     "src/base/numbers/fixed-dtoa.h",
-    "src/base/numbers/strtod.cc",
-    "src/base/numbers/strtod.h",
     "src/base/numerics/angle_conversions.h",
     "src/base/numerics/basic_ops_impl.h",
     "src/base/numerics/byte_conversions.h",
@@ -7798,6 +7815,8 @@ v8_component("v8_libbase") {
     "src/base/strings.cc",
     "src/base/strings.h",
     "src/base/strong-alias.h",
+    "src/base/synchronization-point-support.cc",
+    "src/base/synchronization-point-support.h",
     "src/base/sys-info.cc",
     "src/base/sys-info.h",
     "src/base/template-meta-programming/common.h",
@@ -7805,6 +7824,8 @@ v8_component("v8_libbase") {
     "src/base/template-meta-programming/list.h",
     "src/base/template-meta-programming/string-literal.h",
     "src/base/template-utils.h",
+    "src/base/thread-id.cc",
+    "src/base/thread-id.h",
     "src/base/threaded-list.h",
     "src/base/timezone-cache.h",
     "src/base/types/is-instantiation.h",
@@ -8950,6 +8971,7 @@ group("v8_fuzzers") {
 if (is_component_build) {
   v8_component("v8") {
     sources = [ "src/utils/v8dll-main.cc" ]
+    public = []
 
     deps = [ ":v8_base" ]
 

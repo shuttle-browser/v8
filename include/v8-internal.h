@@ -401,10 +401,10 @@ static_assert(kExternalPointerShiftedTagMask << kExternalPointerTagShift ==
 // that it is smaller than the size of the table.
 using ExternalPointerHandle = uint32_t;
 
-// ExternalPointers point to objects located outside the sandbox. When the V8
-// sandbox is enabled, these are stored on heap as ExternalPointerHandles,
+// ExternalPointers point to objects located outside the V8 heap. When pointer
+// compression is enabled, these are stored on heap as ExternalPointerHandles,
 // otherwise they are simply raw pointers.
-#ifdef V8_ENABLE_SANDBOX
+#ifdef V8_COMPRESS_POINTERS
 using ExternalPointer_t = ExternalPointerHandle;
 #else
 using ExternalPointer_t = Address;
@@ -616,6 +616,7 @@ enum class ManagedTypeId : uint32_t {
   kD8Worker,
   kD8ModuleEmbedderData,
   kD8AsyncHooksWrap,
+  kCodeCacheForTesting,
 };
 
 #define SHARED_MANAGED_TAG_LIST(V) V(WasmFutexManagedObjectWaitListTag)
@@ -648,9 +649,9 @@ enum class ManagedTypeId : uint32_t {
 //
 // External Pointers.
 //
-// When the sandbox is enabled, external pointers are stored in an external
-// pointer table and are referenced from HeapObjects through an index (a
-// "handle"). When stored in the table, the pointers are tagged with per-type
+// When pointer compression is enabled, external pointers are stored in an
+// external pointer table and are referenced from HeapObjects through an index
+// (a "handle"). When stored in the table, the pointers are tagged with per-type
 // tags to prevent type confusion attacks between different external objects.
 //
 // When loading an external pointer, a range of allowed tags can be specified.
@@ -679,14 +680,6 @@ enum class ManagedTypeId : uint32_t {
 // other purpose. This bit also does not collide with the memory tagging
 // extension (MTE) which would use bits [56, 60).
 //
-// External pointer tables are also available even when the sandbox is off but
-// pointer compression is on. In that case, the mechanism can be used to ease
-// alignment requirements as it turns unaligned 64-bit raw pointers into
-// aligned 32-bit indices. To "opt-in" to the external pointer table mechanism
-// for this purpose, instead of using the ExternalPointer accessors one needs to
-// use ExternalPointerHandles directly and use them to access the pointers in an
-// ExternalPointerTable.
-//
 // The tag is limited to 7 bits since it needs to fit together with a marking
 // bit into the unused parts of a 57-bit pointer to support LA57 on x64.
 enum ExternalPointerTag : uint16_t {
@@ -702,8 +695,7 @@ enum ExternalPointerTag : uint16_t {
   // be accessed from multiple threads at the same time. The objects referenced
   // in this way must therefore always be thread-safe.
   kFirstSharedExternalPointerTag,
-  kExternalStringResourceTag = kFirstSharedExternalPointerTag,
-  kExternalStringResourceDataTag,
+  kExternalStringResourceDataTag = kFirstSharedExternalPointerTag,
   kLastSharedExternalPointerTag = kExternalStringResourceDataTag,
 
   // External pointers using these tags are kept in a per-Isolate external
@@ -750,8 +742,6 @@ enum ExternalPointerTag : uint16_t {
 
   kLastMaybeReadOnlyExternalPointerTag = kLastInterceptorInfoExternalPointerTag,
 
-  kWasmStackMemoryTag,
-
 #define AS_ENUM(name) k##name,
   FOREIGN_TAG_LIST(AS_ENUM)
 
@@ -759,6 +749,7 @@ enum ExternalPointerTag : uint16_t {
 
   // External resources whose lifetime is tied to their entry in the
   // external pointer table but which are not referenced via a Managed
+  kWasmStackMemoryTag,
   kArrayBufferExtensionTag,
   kLastManagedResourceTag = kArrayBufferExtensionTag,
 
@@ -994,6 +985,10 @@ class Internals {
   static const int kMapInstanceTypeOffset = 1 * kApiTaggedSize + kApiInt32Size;
   static const int kStringResourceOffset =
       1 * kApiTaggedSize + 2 * kApiInt32Size;
+  // The resource field of an external string references a cppgc object
+  // (ExternalStringResourceWrapper) which stores the resource pointer at this
+  // offset.
+  static const int kExternalStringResourceWrapperResourceOffset = 0;
 
   static const int kOddballKindOffset = 4 * kApiTaggedSize + kApiDoubleSize;
   static const int kJSObjectHeaderSize = 3 * kApiTaggedSize;
@@ -1113,8 +1108,10 @@ class Internals {
       kContinuationPreservedEmbedderDataOffset + kApiSystemPointerSize;
   static const int kCurrentMicrotaskNativeContextOffset =
       kCurrentMicrotaskQueueOffset + kApiSystemPointerSize;
-  static const int kIsolateRootsOffset =
+  static const int kAllocationSiteCacheOffset =
       kCurrentMicrotaskNativeContextOffset + kApiSystemPointerSize;
+  static const int kIsolateRootsOffset =
+      kAllocationSiteCacheOffset + kApiSystemPointerSize;
 
 #if V8_TARGET_ARCH_PPC64
   static constexpr int kFrameCPSlotCount = 1;
@@ -1390,7 +1387,7 @@ class Internals {
     return *GetRootSlot(isolate, index);
   }
 
-#ifdef V8_ENABLE_SANDBOX
+#ifdef V8_COMPRESS_POINTERS
   V8_INLINE static Address* GetExternalPointerTableBase(v8::Isolate* isolate) {
     Address addr = reinterpret_cast<Address>(isolate) +
                    kIsolateExternalPointerTableOffset +
@@ -1451,10 +1448,10 @@ class Internals {
   V8_EXPORT static v8::Isolate* GetCurrentIsolate();
 
   V8_INLINE static v8::Isolate* GetCurrentIsolateForSandbox() {
-#ifdef V8_ENABLE_SANDBOX
+#ifdef V8_COMPRESS_POINTERS
     return GetCurrentIsolate();
 #else
-    // Not used in non-sandbox mode.
+    // Not used in non-pointer-compression mode.
     return nullptr;
 #endif
   }
@@ -1463,7 +1460,7 @@ class Internals {
   V8_INLINE static Address ReadExternalPointerField(v8::Isolate* isolate,
                                                     Address heap_object_ptr,
                                                     int offset) {
-#ifdef V8_ENABLE_SANDBOX
+#ifdef V8_COMPRESS_POINTERS
     static_assert(!tag_range.IsEmpty());
     // See src/sandbox/external-pointer-table.h. Logic duplicated here so
     // it can be inlined and doesn't require an additional call.
@@ -1487,13 +1484,13 @@ class Internals {
     return safe_entry;
 #else
     return ReadRawField<Address>(heap_object_ptr, offset);
-#endif  // V8_ENABLE_SANDBOX
+#endif  // V8_COMPRESS_POINTERS
   }
 
   V8_INLINE static Address ReadExternalPointerField(
       v8::Isolate* isolate, Address heap_object_ptr, int offset,
       ExternalPointerTagRange tag_range) {
-#ifdef V8_ENABLE_SANDBOX
+#ifdef V8_COMPRESS_POINTERS
     // See src/sandbox/external-pointer-table.h. Logic duplicated here so
     // it can be inlined and doesn't require an additional call.
     Address* table = IsSharedExternalPointerType(tag_range)
@@ -1517,7 +1514,7 @@ class Internals {
     return safe_entry;
 #else
     return ReadRawField<Address>(heap_object_ptr, offset);
-#endif  // V8_ENABLE_SANDBOX
+#endif  // V8_COMPRESS_POINTERS
   }
 
 #ifdef V8_COMPRESS_POINTERS

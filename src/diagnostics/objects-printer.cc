@@ -12,6 +12,7 @@
 #include "src/base/logging.h"
 #include "src/common/assert-scope.h"
 #include "src/common/globals.h"
+#include "src/common/scoped-modification.h"
 #include "src/diagnostics/disasm.h"
 #include "src/diagnostics/disassembler.h"
 #include "src/execution/frames-inl.h"
@@ -31,7 +32,6 @@
 #include "src/objects/instance-type.h"
 #include "src/objects/js-function-inl.h"
 #include "src/objects/js-objects.h"
-#include "src/objects/js-shared-array.h"
 #include "src/objects/shared-function-info-inl.h"
 #include "src/objects/struct.h"
 #include "src/regexp/regexp.h"
@@ -2407,22 +2407,6 @@ void JSFinalizationRegistry::JSFinalizationRegistryPrint(std::ostream& os) {
   JSObjectPrintBody(os, this);
 }
 
-void JSSharedArray::JSSharedArrayPrint(std::ostream& os) {
-  JSObjectPrintHeader(os, this, "JSSharedArray");
-  if (HeapLayout::InWritableSharedSpace(Tagged<HeapObject>(this))) {
-    os << " (shared)";
-  }
-  JSObjectPrintBody(os, this);
-}
-
-void JSSharedStruct::JSSharedStructPrint(std::ostream& os) {
-  JSObjectPrintHeader(os, this, "JSSharedStruct");
-  if (HeapLayout::InWritableSharedSpace(Tagged<HeapObject>(this))) {
-    os << " (shared)";
-  }
-  JSObjectPrintBody(os, this);
-}
-
 std::ostream& operator<<(std::ostream& os, DisposableStackState state) {
   switch (state) {
     case DisposableStackState::kPending:
@@ -3809,18 +3793,8 @@ void StoreHandler::StoreHandlerPrint(std::ostream& os) {
 
 void AllocationSite::AllocationSitePrint(std::ostream& os) {
   PrintHeader(os, "AllocationSite");
-  if (this->HasWeakNext()) {
-    os << "\n - weak_next: "
-       << Brief(Cast<AllocationSiteWithWeakNext>(this)->weak_next());
-  }
   os << "\n - dependent code: " << Brief(dependent_code());
   os << "\n - nested site: " << Brief(nested_site());
-  os << "\n - memento found count: "
-     << Brief(Smi::FromInt(memento_found_count()));
-  os << "\n - memento create count: "
-     << Brief(Smi::FromInt(memento_create_count()));
-  os << "\n - pretenure decision: "
-     << Brief(Smi::FromInt(pretenure_decision()));
   os << "\n - transition_info: ";
   if (!PointsToLiteral()) {
     ElementsKind kind = GetElementsKind();
@@ -3831,12 +3805,6 @@ void AllocationSite::AllocationSitePrint(std::ostream& os) {
     os << "Object literal with boilerplate " << Brief(boilerplate());
   }
   os << "\n";
-}
-
-void AllocationMemento::AllocationMementoPrint(std::ostream& os) {
-  PrintHeader(os, "AllocationMemento");
-  os << "\n - allocation site: ";
-  GetAllocationSite()->AllocationSitePrint(os);
 }
 
 void ScriptOrModule::ScriptOrModulePrint(std::ostream& os) {
@@ -3948,7 +3916,6 @@ void Script::ScriptPrint(std::ostream& os) {
   os << "\n - name: " << Brief(name());
   os << "\n - line_offset: " << line_offset();
   os << "\n - column_offset: " << column_offset();
-  os << "\n - context data: " << Brief(context_data());
   os << "\n - type: " << static_cast<int>(type());
   os << "\n - line ends: " << Brief(line_ends());
   if (!has_line_ends()) os << " (not set)";
@@ -4324,6 +4291,24 @@ void HeapObject::Print(Tagged<Object> obj, std::ostream& os) {
 
 void HeapObject::HeapObjectShortPrint(std::ostream& os) {
   os << AsHex::Address(this->ptr()) << " ";
+
+#ifdef V8_ENABLE_SANDBOX
+  // ShortPrint of various object types (e.g. JSPrimitiveWrapper, Tuple2, Cell,
+  // PropertyCell, ContextCell, etc.) recursively calls ShortPrint on nested
+  // tagged fields. With in-sandbox memory corruption, an attacker can construct
+  // arbitrarily deep chains or cycles of such objects to exhaust the native
+  // stack during diagnostic printing. Limit the recursion depth to prevent
+  // stack overflows.
+  thread_local int recursion_depth = 0;
+  constexpr int kMaxShortPrintRecursionDepth = 4;
+  if (recursion_depth >= kMaxShortPrintRecursionDepth) {
+    os << "<...>";
+    return;
+  }
+  ScopedModification<int> recursion_guard(&recursion_depth,
+                                          recursion_depth + 1);
+#endif  // V8_ENABLE_SANDBOX
+
 #if V8_ENABLE_WEBASSEMBLY
   if (IsWasmNull(Tagged<HeapObject>(this))) {
     os << "WasmNull";

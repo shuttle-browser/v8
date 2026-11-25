@@ -2113,12 +2113,15 @@ class AssemblerOpInterface : public Next {
                          TaggedBitcastOp::Kind::kind);      \
   }
   DECL_TAGGED_BITCAST(Smi, Word32, kSmi)
-  DECL_TAGGED_BITCAST(Word32, Smi, kSmi)
   DECL_TAGGED_BITCAST(Smi, WordPtr, kSmi)
   DECL_TAGGED_BITCAST(WordPtr, Smi, kSmi)
   DECL_TAGGED_BITCAST(WordPtr, HeapObject, kHeapObject)
   DECL_TAGGED_BITCAST(HeapObject, WordPtr, kHeapObject)
 #undef DECL_TAGGED_BITCAST
+
+  V<Smi> BitcastWord32ToSmi(V<Word32> input) {
+    return BitcastWordPtrToSmi(ChangeUint32ToUintPtr(input));
+  }
   template <typename T = Object>
   V<T> BitcastWordPtrToTagged(ConstOrV<WordPtr> input) {
     return TaggedBitcast(resolve(input), V<WordPtr>::rep, V<T>::rep,
@@ -2577,7 +2580,6 @@ class AssemblerOpInterface : public Next {
         TryChange(input, TryChangeOp::Kind::kind, V<from>::rep, V<to>::rep)); \
   }
 
-  DECL_CHANGE_V(BitcastWord32ToWord64, kBitcast, kNoAssumption, Word32, Word64)
   DECL_CHANGE_V(BitcastFloat32ToWord32, kBitcast, kNoAssumption, Float32,
                 Word32)
   DECL_CHANGE_V(BitcastWord32ToFloat32, kBitcast, kNoAssumption, Word32,
@@ -2797,8 +2799,6 @@ class AssemblerOpInterface : public Next {
     // Do shift on 32bit values if Smis are stored in the lower word.
     if constexpr (Is64() && SmiValuesAre31Bits()) {
       V<Word32> shifted = Word32ShiftLeft(resolve(input), kSmiShiftBits);
-      // In pointer compression, we smi-corrupt. Then, the upper bits are not
-      // important.
       return BitcastWord32ToSmi(shifted);
     } else {
       return BitcastWordPtrToSmi(
@@ -2980,14 +2980,14 @@ class AssemblerOpInterface : public Next {
 
   V<WordPtr> LoadExternalPointerFromObject(V<Object> object, int offset,
                                            ExternalPointerTag tag) {
-#ifdef V8_ENABLE_SANDBOX
+#ifdef V8_COMPRESS_POINTERS
     V<Word32> handle = __ Load(object, LoadOp::Kind::TaggedBase(),
                                MemoryRepresentation::Uint32(), offset);
     return __ LoadExternalPointer(handle, tag);
 #else
     return __ Load(object, LoadOp::Kind::TaggedBase(),
                    MemoryRepresentation::UintPtr(), offset);
-#endif  // V8_ENABLE_SANDBOX
+#endif  // V8_COMPRESS_POINTERS
   }
 
   V<Object> LoadFixedArrayElement(V<FixedArray> array, int index) {
@@ -3190,28 +3190,39 @@ class AssemblerOpInterface : public Next {
     }
     MemoryRepresentation rep =
         MemoryRepresentation::FromMachineType(machine_type);
-#ifdef V8_ENABLE_SANDBOX
-    bool is_sandboxed_external =
+#ifdef V8_COMPRESS_POINTERS
+    bool is_external_pointer_handle =
         access.type.Is(compiler::Type::ExternalPointer());
-    if (is_sandboxed_external) {
-      // Fields for sandboxed external pointer contain a 32-bit handle, not a
+#ifndef V8_ENABLE_SANDBOX
+    // When the sandbox is disabled, SandboxedPointer fields (e.g.
+    // JSTypedArray::external_pointer_ and JSDataView::data_pointer_) are
+    // represented as raw pointers with Type::ExternalPointer() and
+    // kExternalPointerNullTag rather than ExternalPointerTable handles.
+    if (access.external_pointer_tag == kExternalPointerNullTag) {
+      is_external_pointer_handle = false;
+    }
+#endif  // !V8_ENABLE_SANDBOX
+    if (is_external_pointer_handle) {
+      // Fields in the external pointer table contain a 32-bit handle, not a
       // 64-bit raw pointer.
       rep = MemoryRepresentation::Uint32();
     }
-#endif  // V8_ENABLE_SANDBOX
+#endif  // V8_COMPRESS_POINTERS
     LoadOp::Kind kind = LoadOp::Kind::Aligned(access.base_is_tagged);
     if (access.is_immutable) {
       kind = kind.Immutable();
     }
     if (access.shared_base) kind = kind.SharedBase();
     V<Rep> value = Load(object, kind, rep, access.offset);
-#ifdef V8_ENABLE_SANDBOX
-    if (is_sandboxed_external) {
+#ifdef V8_COMPRESS_POINTERS
+    if (is_external_pointer_handle) {
       value = V<Rep>::CastIfNeeded(LoadExternalPointer(
           V<Word32>::CastIfNeeded(value), access.external_pointer_tag));
     }
+#endif  // V8_COMPRESS_POINTERS
+#ifdef V8_ENABLE_SANDBOX
     if (access.is_bounded_size_access) {
-      DCHECK(!is_sandboxed_external);
+      DCHECK(!is_external_pointer_handle);
       value = V<Rep>::CastIfNeeded(
           ShiftRightLogical(V<WordPtr>::CastIfNeeded(value), kBoundedSizeShift,
                             WordRepresentation::WordPtr()));
@@ -3296,7 +3307,9 @@ class AssemblerOpInterface : public Next {
     }
     // External pointer must never be stored by optimized code.
     DCHECK(!access.type.Is(compiler::Type::ExternalPointer()) ||
-           !V8_ENABLE_SANDBOX_BOOL);
+           !COMPRESS_POINTERS_BOOL ||
+           (!V8_ENABLE_SANDBOX_BOOL &&
+            access.external_pointer_tag == kExternalPointerNullTag));
     // SandboxedPointers are not currently stored by optimized code.
     DCHECK(!access.type.Is(compiler::Type::SandboxedPointer()));
 
@@ -3472,11 +3485,11 @@ class AssemblerOpInterface : public Next {
     return __ FinishInitialization(std::move(result));
   }
 
-#if V8_ENABLE_SANDBOX
+#ifdef V8_COMPRESS_POINTERS
   V<WordPtr> LoadExternalPointer(V<Word32> handle, ExternalPointerTag tag) {
     return ReduceIfReachableLoadExternalPointer(handle, tag);
   }
-#endif
+#endif  // V8_COMPRESS_POINTERS
 
 #if V8_ENABLE_WEBASSEMBLY
   void WasmStackCheck(WasmStackCheckOp::Kind kind) {
@@ -4363,7 +4376,7 @@ class AssemblerOpInterface : public Next {
               int line, SourceLocation loc = SourceLocation::CurrentIfDebug()) {
     Isolate* isolate = Asm().data()->isolate();
     DCHECK_NOT_NULL(isolate);
-    DCHECK_EQ(ThreadId::Current(), isolate->thread_id());
+    DCHECK_EQ(base::ThreadId::Current(), isolate->thread_id());
     if (v8_flags.debug_code) {
       Check(condition(), message, file, line, loc);
     }
@@ -4376,7 +4389,7 @@ class AssemblerOpInterface : public Next {
     Isolate* isolate = Asm().data()->isolate();
     USE(isolate);
     DCHECK_NOT_NULL(isolate);
-    DCHECK_EQ(ThreadId::Current(), isolate->thread_id());
+    DCHECK_EQ(base::ThreadId::Current(), isolate->thread_id());
 
     if (message != nullptr) {
       CodeComment({"[ Assert: ", loc}, message);
@@ -4412,7 +4425,7 @@ class AssemblerOpInterface : public Next {
 
     Isolate* isolate = Asm().data()->isolate();
     DCHECK_NOT_NULL(isolate);
-    DCHECK_EQ(ThreadId::Current(), isolate->thread_id());
+    DCHECK_EQ(base::ThreadId::Current(), isolate->thread_id());
     const std::string str = stream.str();
     Handle<String> internalized_string =
         isolate->factory()->InternalizeString(str);
@@ -4665,7 +4678,7 @@ class AssemblerOpInterface : public Next {
         Isolate* isolate = Asm().data()->isolate();
         // If we don't have a broker, we can only allocate the string on the
         // main thread.
-        DCHECK_EQ(ThreadId::Current(), isolate->thread_id());
+        DCHECK_EQ(base::ThreadId::Current(), isolate->thread_id());
         internalized_string = isolate->factory()->InternalizeString(label);
         CanonicalizeEmbeddedBuiltinsConstantIfNeeded(internalized_string);
       }
@@ -4691,7 +4704,7 @@ class AssemblerOpInterface : public Next {
       Isolate* isolate = Asm().data()->isolate();
       // If we don't have a broker, we can only allocate the string on the main
       // thread.
-      DCHECK_EQ(ThreadId::Current(), isolate->thread_id());
+      DCHECK_EQ(base::ThreadId::Current(), isolate->thread_id());
       internalized_string = isolate->factory()->InternalizeString(str);
       CanonicalizeEmbeddedBuiltinsConstantIfNeeded(internalized_string);
     }

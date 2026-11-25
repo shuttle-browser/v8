@@ -506,23 +506,6 @@ LSXSize LaneSizeToLSXSize(LaneSize size) {
     __ dbar(0);                                                          \
   } while (0)
 
-// only use for sub_w and sub_d
-#define ASSEMBLE_ATOMIC_BINOP(load_linked, store_conditional, bin_instr)       \
-  do {                                                                         \
-    Label binop;                                                               \
-    __ Add_d(i.TempRegister(0), i.InputRegister(0), i.InputRegister(1));       \
-    __ dbar(0);                                                                \
-    __ bind(&binop);                                                           \
-    __ load_linked(i.OutputRegister(0), MemOperand(i.TempRegister(0), 0),      \
-                   &trap_pc);                                                  \
-    RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);              \
-    __ bin_instr(i.TempRegister(1), i.OutputRegister(0),                       \
-                 Operand(i.InputRegister(2)));                                 \
-    __ store_conditional(i.TempRegister(1), MemOperand(i.TempRegister(0), 0)); \
-    __ BranchShort(&binop, eq, i.TempRegister(1), Operand(zero_reg));          \
-    __ dbar(0);                                                                \
-  } while (0)
-
 // TODO(LOONG_dev): remove second dbar?
 #define ASSEMBLE_ATOMIC_BINOP_EXT(load_linked, store_conditional, sign_extend, \
                                   size, bin_instr, representation)             \
@@ -1143,11 +1126,17 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
 
       DCHECK(v8_flags.verify_write_barriers);
       Register scratch = i.TempRegister(0);
-      auto ool = zone()->New<OutOfLineVerifySkippedWriteBarrier>(
-          this, object, value, scratch);
-      __ MaybeJumpIfReadOnlyOrSmallSmi(value, ool->exit());
-      __ JumpIfNotSmi(value, ool->entry());
-      __ bind(ool->exit());
+      if (CheckSmiField::decode(instr->opcode())) {
+        __ And(scratch, value, kSmiTagMask);
+        __ Check(eq, AbortReason::kTaggedSignedNotSmi, scratch,
+                 Operand(zero_reg));
+      } else {
+        auto ool = zone()->New<OutOfLineVerifySkippedWriteBarrier>(
+            this, object, value, scratch);
+        __ MaybeJumpIfReadOnlyOrSmallSmi(value, ool->exit());
+        __ JumpIfNotSmi(value, ool->entry());
+        __ bind(ool->exit());
+      }
 
       MacroAssemblerBase::BlockTrampolinePoolScope block_trampoline_pool(
           masm());
@@ -1170,18 +1159,20 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
       DCHECK_NE(mode, RecordWriteMode::kValueIsTrustedPointer);
       Register object = i.InputRegister(0);
       Register offset = i.InputRegister(1);
-      Register value = i.InputRegister(2);
+      Register value = i.InputOrZeroRegister(2);
+      Register scratch = i.TempRegister(0);
 
       auto ool = zone()->New<OutOfLineRecordWrite>(
           this, object, Operand(offset), value, mode, DetermineStubCallMode());
-      MemOperand dst_op = MemOperand(object, offset);
-      __ dbar(0);
+      __ Add_d(scratch, object, offset);
+
+      RecordTrapInfoIfNeeded(zone(), this, opcode, instr, __ pc_offset());
+      DCHECK(!AreAliased(zero_reg, value, scratch));
       if (COMPRESS_POINTERS_BOOL) {
-        __ St_w(value, dst_op, &trap_pc);
+        __ amswap_db_w(zero_reg, value, scratch);
       } else {
-        __ St_d(value, dst_op, &trap_pc);
+        __ amswap_db_d(zero_reg, value, scratch);
       }
-      RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
       // Skip the write barrier if the value is a Smi. However, this is only
       // valid if the value isn't an indirect pointer. Otherwise the value will
       // be a pointer table index, which will always look like a Smi (but
@@ -1196,28 +1187,32 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
     }
     case kArchAtomicStoreSkippedWriteBarrier: {
       DCHECK_EQ(AddressingModeField::decode(instr->opcode()), kMode_MRR);
+      MacroAssembler::BlockTrampolinePoolScope block_trampoline_pool(masm());
       Register object = i.InputRegister(0);
       Register offset = i.InputRegister(1);
-      Register value = i.InputRegister(2);
+      Register value = i.InputOrZeroRegister(2);
       Register temp = i.TempRegister(0);
-      __ Add_d(temp, object, offset);
 
       DCHECK(v8_flags.verify_write_barriers);
-      Register scratch = i.TempRegister(1);
-      auto ool = zone()->New<OutOfLineVerifySkippedWriteBarrier>(
-          this, object, value, scratch);
-      __ MaybeJumpIfReadOnlyOrSmallSmi(value, ool->exit());
-      __ JumpIfNotSmi(value, ool->entry());
-      __ bind(ool->exit());
-
-      MacroAssemblerBase::BlockTrampolinePoolScope block_trampoline_pool(
-          masm());
-      if (COMPRESS_POINTERS_BOOL) {
-        __ St_w(value, MemOperand(temp, 0), &trap_pc);
+      if (CheckSmiField::decode(instr->opcode())) {
+        __ And(temp, value, kSmiTagMask);
+        __ Check(eq, AbortReason::kTaggedSignedNotSmi, temp, Operand(zero_reg));
       } else {
-        __ St_d(value, MemOperand(temp, 0), &trap_pc);
+        auto ool = zone()->New<OutOfLineVerifySkippedWriteBarrier>(this, object,
+                                                                   value, temp);
+        __ MaybeJumpIfReadOnlyOrSmallSmi(value, ool->exit());
+        __ JumpIfNotSmi(value, ool->entry());
+        __ bind(ool->exit());
       }
-      RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
+
+      DCHECK(!AreAliased(zero_reg, value, temp));
+      __ Add_d(temp, object, offset);
+      RecordTrapInfoIfNeeded(zone(), this, opcode, instr, __ pc_offset());
+      if (COMPRESS_POINTERS_BOOL) {
+        __ amswap_db_w(zero_reg, value, temp);
+      } else {
+        __ amswap_db_d(zero_reg, value, temp);
+      }
       break;
     }
     case kArchStoreTrustedWithWriteBarrier: {
@@ -1557,6 +1552,18 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
       break;
     case kLoong64Clz_d:
       __ clz_d(i.OutputRegister(), i.InputRegister(0));
+      break;
+    case kLoong64Ctz_w:
+      __ ctz_w(i.OutputRegister(), i.InputRegister(0));
+      break;
+    case kLoong64Ctz_d:
+      __ ctz_d(i.OutputRegister(), i.InputRegister(0));
+      break;
+    case kLoong64Popcnt_w:
+      __ Popcnt_w(i.OutputRegister(), i.InputRegister(0));
+      break;
+    case kLoong64Popcnt_d:
+      __ Popcnt_d(i.OutputRegister(), i.InputRegister(0));
       break;
     case kLoong64Sll_w:
       if (instr->InputAt(1)->IsRegister()) {
@@ -2221,7 +2228,16 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
           __ Vld(i.OutputSimd128Register(), MemOperand(fp, offset));
         }
       } else {
-        __ Ld_d(i.OutputRegister(0), MemOperand(fp, offset));
+        LocationOperand* op = LocationOperand::cast(instr->OutputAt(0));
+        if (op->representation() == MachineRepresentation::kWord32 ||
+            op->representation() == MachineRepresentation::kCompressed ||
+            op->representation() == MachineRepresentation::kCompressedPointer) {
+          // Like AssembleMove, use a sign-extending load for 32-bit slots so
+          // that the register keeps the loong64 sign-extension invariant.
+          __ Ld_w(i.OutputRegister(0), MemOperand(fp, offset));
+        } else {
+          __ Ld_d(i.OutputRegister(0), MemOperand(fp, offset));
+        }
       }
       break;
     }
@@ -2240,7 +2256,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
           __ Fst_d(i.InputDoubleRegister(0), MemOperand(sp, i.InputInt32(1)));
         }
       } else {
-        __ St_d(i.InputRegister(0), MemOperand(sp, i.InputInt32(1)));
+        __ St_d(i.InputOrZeroRegister(0), MemOperand(sp, i.InputInt32(1)));
       }
       break;
     }
@@ -2546,74 +2562,50 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
     }
     case kLoong64S128Load8x8S: {
       CpuFeatureScope lsx_scope(masm(), LSX);
-      UseScratchRegisterScope temps(masm());
-      Register TmpReg = temps.Acquire();
-      Simd128Register scratch = kSimd128ScratchReg;
       Simd128Register dst = i.OutputSimd128Register();
-      __ Ld_d(TmpReg, i.MemoryOperand(), &trap_pc);
+      __ Fld_d(FPURegister::from_code(dst.code()), i.MemoryOperand(), &trap_pc);
       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
-      __ vreplgr2vr_d(scratch, TmpReg);
-      __ vexth_h_b(dst, scratch);
+      __ vsllwil_h_b(dst, dst, 0);
       break;
     }
     case kLoong64S128Load8x8U: {
       CpuFeatureScope lsx_scope(masm(), LSX);
-      UseScratchRegisterScope temps(masm());
-      Register TmpReg = temps.Acquire();
       Simd128Register dst = i.OutputSimd128Register();
-      __ vxor_v(kSimd128RegZero, kSimd128RegZero, kSimd128RegZero);
-      __ Ld_d(TmpReg, i.MemoryOperand(), &trap_pc);
+      __ Fld_d(FPURegister::from_code(dst.code()), i.MemoryOperand(), &trap_pc);
       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
-      __ vreplgr2vr_d(dst, TmpReg);
-      __ vilvl_b(dst, kSimd128RegZero, dst);
+      __ vsllwil_hu_bu(dst, dst, 0);
       break;
     }
     case kLoong64S128Load16x4S: {
       CpuFeatureScope lsx_scope(masm(), LSX);
-      UseScratchRegisterScope temps(masm());
-      Register TmpReg = temps.Acquire();
-      Simd128Register scratch = kSimd128ScratchReg;
       Simd128Register dst = i.OutputSimd128Register();
-      __ Ld_d(TmpReg, i.MemoryOperand(), &trap_pc);
+      __ Fld_d(FPURegister::from_code(dst.code()), i.MemoryOperand(), &trap_pc);
       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
-      __ vreplgr2vr_d(scratch, TmpReg);
-      __ vexth_w_h(dst, scratch);
+      __ vsllwil_w_h(dst, dst, 0);
       break;
     }
     case kLoong64S128Load16x4U: {
       CpuFeatureScope lsx_scope(masm(), LSX);
-      UseScratchRegisterScope temps(masm());
-      Register TmpReg = temps.Acquire();
       Simd128Register dst = i.OutputSimd128Register();
-      __ vxor_v(kSimd128RegZero, kSimd128RegZero, kSimd128RegZero);
-      __ Ld_d(TmpReg, i.MemoryOperand(), &trap_pc);
+      __ Fld_d(FPURegister::from_code(dst.code()), i.MemoryOperand(), &trap_pc);
       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
-      __ vreplgr2vr_d(dst, TmpReg);
-      __ vilvl_h(dst, kSimd128RegZero, dst);
+      __ vsllwil_wu_hu(dst, dst, 0);
       break;
     }
     case kLoong64S128Load32x2S: {
       CpuFeatureScope lsx_scope(masm(), LSX);
-      UseScratchRegisterScope temps(masm());
-      Register TmpReg = temps.Acquire();
       Simd128Register dst = i.OutputSimd128Register();
-      Simd128Register scratch = kSimd128ScratchReg;
-      __ Ld_d(TmpReg, i.MemoryOperand(), &trap_pc);
+      __ Fld_d(FPURegister::from_code(dst.code()), i.MemoryOperand(), &trap_pc);
       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
-      __ vreplgr2vr_d(scratch, TmpReg);
-      __ vexth_d_w(dst, scratch);
+      __ vsllwil_d_w(dst, dst, 0);
       break;
     }
     case kLoong64S128Load32x2U: {
       CpuFeatureScope lsx_scope(masm(), LSX);
-      UseScratchRegisterScope temps(masm());
-      Register TmpReg = temps.Acquire();
       Simd128Register dst = i.OutputSimd128Register();
-      __ vxor_v(kSimd128RegZero, kSimd128RegZero, kSimd128RegZero);
-      __ Ld_d(TmpReg, i.MemoryOperand(), &trap_pc);
+      __ Fld_d(FPURegister::from_code(dst.code()), i.MemoryOperand(), &trap_pc);
       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);
-      __ vreplgr2vr_d(dst, TmpReg);
-      __ vilvl_w(dst, kSimd128RegZero, dst);
+      __ vsllwil_du_wu(dst, dst, 0);
       break;
     }
     case kLoong64S128Load32Zero: {
@@ -4032,6 +4024,36 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
       __ vinsgr2vr_b(dst, i.InputRegister(2), i.InputInt8(1));
       break;
     }
+    case kLoong64I8x16MoveLane: {
+      CpuFeatureScope lsx_scope(masm(), LSX);
+      // ui8[7:4]: dest lane. ui8[3:0]: src lane.
+      __ vextrins_b(i.OutputSimd128Register(), i.InputSimd128Register(1),
+                    (i.InputInt32(3) << 4) | i.InputInt32(2));
+      break;
+    }
+    case kLoong64I16x8MoveLane: {
+      CpuFeatureScope lsx_scope(masm(), LSX);
+      // Ditto.
+      __ vextrins_h(i.OutputSimd128Register(), i.InputSimd128Register(1),
+                    (i.InputInt32(3) << 4) | i.InputInt32(2));
+      break;
+    }
+    case kLoong64I32x4MoveLane:
+    case kLoong64F32x4MoveLane: {
+      CpuFeatureScope lsx_scope(masm(), LSX);
+      // Ditto.
+      __ vextrins_w(i.OutputSimd128Register(), i.InputSimd128Register(1),
+                    (i.InputInt32(3) << 4) | i.InputInt32(2));
+      break;
+    }
+    case kLoong64I64x2MoveLane:
+    case kLoong64F64x2MoveLane: {
+      CpuFeatureScope lsx_scope(masm(), LSX);
+      // Ditto.
+      __ vextrins_d(i.OutputSimd128Register(), i.InputSimd128Register(1),
+                    (i.InputInt32(3) << 4) | i.InputInt32(2));
+      break;
+    }
     case kLoong64I8x16Shl: {
       CpuFeatureScope lsx_scope(masm(), LSX);
       if (instr->InputAt(1)->IsRegister()) {
@@ -4290,7 +4312,11 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
     case kAtomicSubWord32:
       switch (AtomicWidthField::decode(opcode)) {
         case AtomicWidth::kWord32:
-          ASSEMBLE_ATOMIC_BINOP(Ll_w, Sc_w, Sub_w);
+          __ Add_d(i.TempRegister(0), i.InputRegister(0), i.InputRegister(1));
+          __ Sub_w(i.TempRegister(1), zero_reg, Operand(i.InputRegister(2)));
+          RecordTrapInfoIfNeeded(zone(), this, opcode, instr, __ pc_offset());
+          __ amadd_db_w(i.OutputRegister(0), i.TempRegister(1),
+                        i.TempRegister(0));
           break;
         case AtomicWidth::kWord64:
           ASSEMBLE_ATOMIC_BINOP_EXT(Ll_d, Sc_d, false, 32, Sub_d, 64);
@@ -4389,7 +4415,10 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
 #undef ATOMIC_BINOP_CASE
 
     case kLoong64Word64AtomicSubUint64:
-      ASSEMBLE_ATOMIC_BINOP(Ll_d, Sc_d, Sub_d);
+      __ Add_d(i.TempRegister(0), i.InputRegister(0), i.InputRegister(1));
+      __ Sub_d(i.TempRegister(1), zero_reg, Operand(i.InputRegister(2)));
+      RecordTrapInfoIfNeeded(zone(), this, opcode, instr, __ pc_offset());
+      __ amadd_db_d(i.OutputRegister(0), i.TempRegister(1), i.TempRegister(0));
       break;
     case kLoong64Word64AtomicAddUint64:
       __ Add_d(i.TempRegister(0), i.InputRegister(0), i.InputRegister(1));
@@ -5377,6 +5406,7 @@ void CodeGenerator::Pop(InstructionOperand* dest, MachineRepresentation rep) {
     __ Add_d(sp, sp, Operand(dropped_slots * kSystemPointerSize));
   }
   temp_slots_ -= dropped_slots;
+  DCHECK_GE(temp_slots_, 0);
 }
 
 void CodeGenerator::PopTempStackSlots() {
@@ -5568,6 +5598,15 @@ void CodeGenerator::AssembleMove(InstructionOperand* source,
   } else if (source->IsConstant()) {
     Constant src = g.ToConstant(source);
     if (destination->IsRegister() || destination->IsStackSlot()) {
+      // A relocatable constant (e.g. a Wasm canonical signature id) is a
+      // placeholder that is patched later, so it must be materialized even
+      // when its value is zero.
+      if (destination->IsStackSlot() && RelocInfo::IsNoInfo(src.rmode()) &&
+          ((src.type() == Constant::kInt32 && src.ToInt32() == 0) ||
+           (src.type() == Constant::kInt64 && src.ToInt64() == 0))) {
+        __ St_d(zero_reg, g.ToMemOperand(destination));
+        return;
+      }
       UseScratchRegisterScope temps(masm());
       Register scratch = temps.Acquire();
       Register dst =
@@ -5708,7 +5747,14 @@ void CodeGenerator::AssembleSwap(InstructionOperand* source,
       DCHECK(destination->IsStackSlot());
       MemOperand dst = g.ToMemOperand(destination);
       __ mov(scratch, src);
-      __ Ld_d(src, dst);
+      // Like AssembleMove, never load a 32-bit stack slot into a Word32
+      // register with a 64-bit load: the register must keep the loong64
+      // sign-extension invariant even if the slot's upper half is dirty.
+      if (Use32BitMove(source, destination)) {
+        __ Ld_w(src, dst);
+      } else {
+        __ Ld_d(src, dst);
+      }
       __ St_d(scratch, dst);
     }
   } else if (source->IsStackSlot()) {
@@ -5795,7 +5841,6 @@ void CodeGenerator::AssembleJumpTable(base::Vector<Label*> targets) {
 
 #undef ASSEMBLE_ATOMIC_LOAD_INTEGER
 #undef ASSEMBLE_ATOMIC_STORE_INTEGER
-#undef ASSEMBLE_ATOMIC_BINOP
 #undef ASSEMBLE_ATOMIC_BINOP_EXT
 #undef ASSEMBLE_ATOMIC_EXCHANGE_INTEGER
 #undef ASSEMBLE_ATOMIC_EXCHANGE_INTEGER_EXT

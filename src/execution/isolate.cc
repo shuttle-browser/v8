@@ -68,6 +68,7 @@
 #include "src/flags/flags.h"
 #include "src/handles/global-handles-inl.h"
 #include "src/handles/persistent-handles.h"
+#include "src/heap/cppgc-js/cpp-heap.h"
 #include "src/heap/heap-inl.h"
 #include "src/heap/heap-verifier.h"
 #include "src/heap/local-heap-inl.h"
@@ -87,6 +88,7 @@
 #include "src/logging/runtime-call-stats-scope.h"
 #include "src/numbers/hash-seed-inl.h"
 #include "src/objects/abstract-code-inl.h"
+#include "src/objects/allocation-site.h"
 #include "src/objects/backing-store.h"
 #include "src/objects/call-site-info-inl.h"
 #include "src/objects/feedback-vector.h"
@@ -97,7 +99,6 @@
 #include "src/objects/js-array-inl.h"
 #include "src/objects/js-function.h"
 #include "src/objects/js-generator-inl.h"
-#include "src/objects/js-struct.h"
 #include "src/objects/js-weak-refs-inl.h"
 #include "src/objects/managed-inl.h"
 #include "src/objects/module-inl.h"
@@ -606,7 +607,7 @@ std::atomic<int> isolate_counter{0};
 
 Isolate::PerIsolateThreadData*
 Isolate::FindOrAllocatePerThreadDataForThisThread() {
-  ThreadId thread_id = ThreadId::Current();
+  base::ThreadId thread_id = base::ThreadId::Current();
   PerIsolateThreadData* per_thread = nullptr;
   {
     base::MutexGuard lock_guard(&thread_data_table_mutex_);
@@ -624,7 +625,7 @@ Isolate::FindOrAllocatePerThreadDataForThisThread() {
 }
 
 void Isolate::DiscardPerThreadDataForThisThread() {
-  ThreadId thread_id = ThreadId::TryGetCurrent();
+  base::ThreadId thread_id = base::ThreadId::TryGetCurrent();
   if (thread_id.IsValid()) {
     DCHECK_NE(thread_manager_->mutex_owner_.load(std::memory_order_relaxed),
               thread_id);
@@ -638,12 +639,12 @@ void Isolate::DiscardPerThreadDataForThisThread() {
 }
 
 Isolate::PerIsolateThreadData* Isolate::FindPerThreadDataForThisThread() {
-  ThreadId thread_id = ThreadId::Current();
+  base::ThreadId thread_id = base::ThreadId::Current();
   return FindPerThreadDataForThread(thread_id);
 }
 
 Isolate::PerIsolateThreadData* Isolate::FindPerThreadDataForThread(
-    ThreadId thread_id) {
+    base::ThreadId thread_id) {
   PerIsolateThreadData* per_thread = nullptr;
   {
     base::MutexGuard lock_guard(&thread_data_table_mutex_);
@@ -1152,7 +1153,8 @@ class CallSiteBuilder {
   bool IsStrictFrame(DirectHandle<JSFunction> function) {
     if (!encountered_strict_function_) {
       encountered_strict_function_ =
-          is_strict(function->shared()->language_mode());
+          is_strict(function->shared()->language_mode()) ||
+          function->shared()->IsApiFunction();
     }
     return encountered_strict_function_;
   }
@@ -2390,7 +2392,7 @@ class MinimalStackPrinter {
 }  // namespace
 
 std::string Isolate::BuildMinimalStack(size_t max_length) {
-  DCHECK_EQ(thread_id(), ThreadId::Current());
+  DCHECK_EQ(thread_id(), base::ThreadId::Current());
   DisallowGarbageCollection no_gc;
   HandleScope scope(this);
 
@@ -2599,6 +2601,19 @@ void Isolate::CancelTerminateExecution() {
   if (!is_execution_terminating()) return;
   clear_internal_exception();
   if (try_catch_handler()) try_catch_handler()->ResetInternal();
+}
+
+bool Isolate::CheckTerminationAfterCallback() {
+  if (has_exception()) {
+    DCHECK_IMPLIES(v8_flags.strict_termination_checks,
+                   is_execution_terminating());
+    return true;
+  }
+  if (debug()->IsRestartFrameScheduled()) {
+    TerminateExecution();
+    return true;
+  }
+  return false;
 }
 
 void Isolate::RequestInterrupt(InterruptCallback callback, void* data) {
@@ -3582,13 +3597,13 @@ void Isolate::PrintCurrentStackTrace(
                               SKIP_NONE, factory()->undefined_value());
   frames = CallSiteInfo::ExpandDeferredFrames(this, frames);
 
-  IncrementalStringBuilder builder(this);
   uint32_t frame_count =
       frames->ulength().value() / CallSiteInfo::Fields::kCount;
   for (uint32_t i = 0; i < frame_count; ++i) {
     DirectHandle<CallSiteInfo> frame =
         CallSiteInfo::ConstructFromRawData(this, frames, i);
 
+    bool include_frame = true;
     if (should_include_frame_callback) {
       Tagged<Object> raw_script_name = frame->GetScriptNameOrSourceURL();
       v8::Local<v8::String> script_name_local;
@@ -3601,21 +3616,24 @@ void Isolate::PrintCurrentStackTrace(
       } else {
         script_name_local = v8::String::Empty(v8_isolate);
       }
-
-      if (should_include_frame_callback(v8_isolate, script_name_local)) {
-        SerializeCallSiteInfo(this, frame, &builder);
-      } else {
-        builder.AppendString("<redacted>");
-      }
-    } else {
-      SerializeCallSiteInfo(this, frame, &builder);
+      include_frame =
+          should_include_frame_callback(v8_isolate, script_name_local);
     }
 
-    if (i != frame_count - 1) builder.AppendCharacter('\n');
-  }
+    if (include_frame) {
+      DirectHandle<String> serialized_frame;
+      if (SerializeCallSiteInfo(this, frame, kDontThrow)
+              .ToHandle(&serialized_frame)) {
+        serialized_frame->PrintOn(out);
+      } else {
+        out << "<error>";
+      }
+    } else {
+      out << "<redacted>";
+    }
 
-  DirectHandle<String> stack_trace = builder.Finish().ToHandleChecked();
-  stack_trace->PrintOn(out);
+    if (i != frame_count - 1) out << '\n';
+  }
 }
 
 bool Isolate::ComputeLocation(MessageLocation* target) {
@@ -4675,11 +4693,14 @@ Isolate::SwitchStacks<wasm::JumpBuffer::Retired, wasm::JumpBuffer::Inactive>(
     Address pc);
 
 void Isolate::RetireWasmStack(wasm::StackMemory* stack) {
+  // Clear the owning {WasmStackObject}'s external pointer to prevent a UAF.
+#ifdef V8_ENABLE_SANDBOX
+  stack->ClearExternalPointerTableEntry();
+#else
   if (!stack->stack_obj().is_null()) {
-    // Clear the owning {WasmStackObject}'s external pointer to prevent a UAF.
     stack->stack_obj()->set_stack(this, nullptr);
-    stack->set_stack_obj({});
   }
+#endif
   size_t index = stack->index();
   // We can only return from a stack that was still in the global list.
   DCHECK_LT(index, wasm_stacks().size());
@@ -4710,7 +4731,7 @@ Isolate::PerIsolateThreadData::~PerIsolateThreadData() {
 }
 
 Isolate::PerIsolateThreadData* Isolate::ThreadDataTable::Lookup(
-    ThreadId thread_id) {
+    base::ThreadId thread_id) {
   auto t = table_.find(thread_id);
   if (t == table_.end()) return nullptr;
   return t->second;
@@ -4784,7 +4805,7 @@ void Isolate::Deinitialize(Isolate* isolate) {
   PerIsolateThreadData* saved_data = isolate->CurrentPerIsolateThreadData();
   Isolate* saved_isolate = isolate->TryGetCurrent();
   SetIsolateThreadLocals(isolate, nullptr);
-  isolate->set_thread_id(ThreadId::Current());
+  isolate->set_thread_id(base::ThreadId::Current());
   isolate->heap()->SetStackStart();
 
   isolate->Deinit();
@@ -4892,15 +4913,17 @@ Isolate::Isolate(IsolateGroup* isolate_group)
 }
 
 void Isolate::CheckIsolateLayout() {
-#ifdef V8_ENABLE_SANDBOX
+#ifdef V8_COMPRESS_POINTERS
   static_assert(static_cast<int>(ExternalPointerTable::BaseOffset()) ==
                 Internals::kExternalEntityTableBasePointerOffset);
+  static_assert(static_cast<int>(sizeof(ExternalPointerTable)) ==
+                Internals::kExternalEntityTableSize);
+#endif
+#ifdef V8_ENABLE_SANDBOX
   static_assert(static_cast<int>(TrustedPointerTable::BaseOffset()) ==
                 Internals::kExternalEntityTableBasePointerOffset);
   static_assert(static_cast<int>(JSDispatchTable::BaseOffset()) ==
                 Internals::kExternalEntityTableBasePointerOffset);
-  static_assert(static_cast<int>(sizeof(ExternalPointerTable)) ==
-                Internals::kExternalEntityTableSize);
   static_assert(static_cast<int>(sizeof(TrustedPointerTable)) ==
                 Internals::kExternalEntityTableSize);
   static_assert(static_cast<int>(sizeof(JSDispatchTable)) ==
@@ -5301,10 +5324,6 @@ void Isolate::Deinit() {
     DCHECK_NULL(string_forwarding_table_.get());
   }
 
-  if (!is_shared_space_isolate()) {
-    DCHECK_NULL(shared_struct_type_registry_.get());
-  }
-
 #ifdef V8_COMPRESS_POINTERS
   external_pointer_table().TearDownSpace(
       heap()->young_external_pointer_space());
@@ -5411,12 +5430,17 @@ Isolate::~Isolate() {
   delete descriptor_lookup_cache_;
   descriptor_lookup_cache_ = nullptr;
 
+  delete isolate_data_.allocation_site_cache();
+  isolate_data_.set_allocation_site_cache(nullptr);
+
   delete load_stub_cache_;
   load_stub_cache_ = nullptr;
   delete store_stub_cache_;
   store_stub_cache_ = nullptr;
   delete define_own_stub_cache_;
   define_own_stub_cache_ = nullptr;
+  delete has_stub_cache_;
+  has_stub_cache_ = nullptr;
 
   delete materialized_object_store_;
   materialized_object_store_ = nullptr;
@@ -5986,43 +6010,44 @@ static std::string ToHexString(uintptr_t address) {
 }  // namespace
 
 void Isolate::AddCrashKeysForIsolateAndHeapPointers() {
-  DCHECK_NOT_NULL(add_crash_key_callback_);
+  if (!V8::HasCrashKeyCallbacks()) return;
 
-  const uintptr_t isolate_address = reinterpret_cast<uintptr_t>(this);
-  add_crash_key_callback_(v8::CrashKeyId::kIsolateAddress,
-                          ToHexString(isolate_address));
+  static base::LazyMutex crash_key_mutex = LAZY_MUTEX_INITIALIZER;
+  base::MutexGuard guard(crash_key_mutex.Pointer());
 
-  const uintptr_t ro_space_firstpage_address =
-      heap()->read_only_space()->FirstPageAddress();
-  add_crash_key_callback_(v8::CrashKeyId::kReadonlySpaceFirstPageAddress,
-                          ToHexString(ro_space_firstpage_address));
+#define SET_CRASH_KEY(key_name, value)                        \
+  do {                                                        \
+    static CrashKey key =                                     \
+        V8::AllocateCrashKey(key_name, CrashKeySize::Size32); \
+    V8::SetCrashKey(key, ToHexString(value));                 \
+  } while (false)
 
-  const uintptr_t old_space_firstpage_address =
-      heap()->old_space()->FirstPageAddress();
-  add_crash_key_callback_(v8::CrashKeyId::kOldSpaceFirstPageAddress,
-                          ToHexString(old_space_firstpage_address));
+  SET_CRASH_KEY("v8_isolate_address", reinterpret_cast<uintptr_t>(this));
+  SET_CRASH_KEY("v8_ro_space_firstpage_address",
+                heap()->read_only_space()->FirstPageAddress());
+  SET_CRASH_KEY("v8_old_space_firstpage_address",
+                heap()->old_space()->FirstPageAddress());
 
   if (heap()->code_range_base()) {
-    const uintptr_t code_range_base_address = heap()->code_range_base();
-    add_crash_key_callback_(v8::CrashKeyId::kCodeRangeBaseAddress,
-                            ToHexString(code_range_base_address));
+    SET_CRASH_KEY("v8_code_range_base_address", heap()->code_range_base());
   }
 
   if (heap()->code_space()->first_page()) {
-    const uintptr_t code_space_firstpage_address =
-        heap()->code_space()->FirstPageAddress();
-    add_crash_key_callback_(v8::CrashKeyId::kCodeSpaceFirstPageAddress,
-                            ToHexString(code_space_firstpage_address));
+    SET_CRASH_KEY("v8_code_space_firstpage_address",
+                  heap()->code_space()->FirstPageAddress());
   }
-  const v8::StartupData* data = Snapshot::DefaultSnapshotBlob();
-  // TODO(cbruni): Implement strategy to infrequently collect this.
-  const uint32_t v8_snapshot_checksum_calculated = 0;
-  add_crash_key_callback_(v8::CrashKeyId::kSnapshotChecksumCalculated,
-                          ToHexString(v8_snapshot_checksum_calculated));
-  const uint32_t v8_snapshot_checksum_expected =
-      Snapshot::GetExpectedChecksum(data);
-  add_crash_key_callback_(v8::CrashKeyId::kSnapshotChecksumExpected,
-                          ToHexString(v8_snapshot_checksum_expected));
+
+  if (snapshot_available()) {
+    // TODO(cbruni): Implement strategy to infrequently collect this.
+    const uint32_t v8_snapshot_checksum_calculated = 0;
+    SET_CRASH_KEY("v8_snapshot_checksum_calculated",
+                  v8_snapshot_checksum_calculated);
+    const uint32_t v8_snapshot_checksum_expected =
+        Snapshot::GetExpectedChecksum(snapshot_blob());
+    SET_CRASH_KEY("v8_snapshot_checksum_expected",
+                  v8_snapshot_checksum_expected);
+  }
+#undef SET_CRASH_KEY
 }
 
 void Isolate::InitializeCodeRanges() {
@@ -6238,12 +6263,14 @@ bool Isolate::Init(SnapshotData* startup_snapshot_data,
 
   compilation_cache_ = new CompilationCache(this);
   descriptor_lookup_cache_ = new DescriptorLookupCache();
+  isolate_data_.set_allocation_site_cache(new AllocationSiteCache());
   global_handles_ = new GlobalHandles(this);
   eternal_handles_ = new EternalHandles();
   bootstrapper_ = new Bootstrapper(this);
   load_stub_cache_ = new StubCache(this);
   store_stub_cache_ = new StubCache(this);
   define_own_stub_cache_ = new StubCache(this);
+  has_stub_cache_ = new StubCache(this);
   materialized_object_store_ = new MaterializedObjectStore(this);
   regexp_stack_ = regexp::Stack::New();
   isolate_data_.set_regexp_static_result_offsets_vector(
@@ -6318,7 +6345,7 @@ bool Isolate::Init(SnapshotData* startup_snapshot_data,
       use_shared_space_isolate->heap()
           ->incremental_marking()
           ->IsMajorMarking()) {
-    heap_.SetIsMarkingFlag(true);
+    heap_.SetIsSharedMarkingFlag(true);
   }
 
   // Set up the object heap.
@@ -6574,9 +6601,6 @@ bool Isolate::Init(SnapshotData* startup_snapshot_data,
   }
   InitializeBuiltinJSDispatchTable();
   if (DEBUG_BOOL) VerifyStaticRoots();
-  load_stub_cache_->Initialize();
-  store_stub_cache_->Initialize();
-  define_own_stub_cache_->Initialize();
   interpreter_->Initialize();
   heap_.NotifyDeserializationComplete();
 
@@ -6647,22 +6671,11 @@ bool Isolate::Init(SnapshotData* startup_snapshot_data,
     SLOW_DCHECK(SharedFunctionInfo::UniqueIdsAreUnique(this));
   }
 
-  if (v8_flags.harmony_struct) {
-    // Initialize or get the struct type registry shared by all isolates.
-    if (is_shared_space_isolate()) {
-      shared_struct_type_registry_ =
-          std::make_unique<SharedStructTypeRegistry>();
-    } else {
-      DCHECK_NOT_NULL(shared_struct_type_registry());
-    }
-  }
-
   // A read-only heap deserialized from a snapshot was already protected when
   // it was set up. One created from scratch only has its holes now.
   if (create_heap_objects) read_only_heap()->DecommitGuardRegions(this);
 
-  // Isolate initialization allocates long living objects that should be
-  // pretenured to old space.
+  // Isolate initialization allocates long-lived objects directly in old space.
   DCHECK_IMPLIES(heap()->new_space(), heap()->new_space()->Size() == 0);
   DCHECK_IMPLIES(heap()->new_lo_space(), heap()->new_lo_space()->Size() == 0);
   DCHECK_EQ(heap()->gc_count(), kInitialGCEpoch);
@@ -6678,6 +6691,12 @@ bool Isolate::Init(SnapshotData* startup_snapshot_data,
   PerfettoLogger::RegisterIsolate(this);
 #endif  // defined(V8_USE_PERFETTO)
 
+  // Crash keys are process-wide; only record pointer crash keys for the main
+  // isolate so worker isolates do not overwrite them.
+  if (isolate_group()->main_isolate() == this) {
+    AddCrashKeysForIsolateAndHeapPointers();
+  }
+
   initialized_ = true;
 
   return true;
@@ -6689,7 +6708,7 @@ void Isolate::Enter() {
 
 #ifdef V8_ENABLE_CHECKS
   // No different thread must have entered the isolate. Allow re-entering.
-  ThreadId thread_id = ThreadId::Current();
+  base::ThreadId thread_id = base::ThreadId::Current();
   if (current_thread_id_.IsValid()) {
     CHECK_EQ(current_thread_id_, thread_id);
   } else {
@@ -6711,7 +6730,7 @@ void Isolate::Enter() {
       DCHECK_NOT_NULL(entry_stack);
       DCHECK(entry_stack->previous_thread_data == nullptr ||
              entry_stack->previous_thread_data->thread_id() ==
-                 ThreadId::Current());
+                 base::ThreadId::Current());
       // Same thread re-enters the isolate, no need to re-init anything.
       entry_stack->entry_count++;
       return;
@@ -6737,12 +6756,14 @@ void Isolate::Exit() {
   DCHECK_NOT_NULL(current_entry_stack);
   DCHECK(current_entry_stack->previous_thread_data == nullptr ||
          current_entry_stack->previous_thread_data->thread_id() ==
-             ThreadId::Current());
+             base::ThreadId::Current());
 
 #ifdef V8_ENABLE_CHECKS
   // The current thread must have entered the isolate.
-  CHECK_EQ(current_thread_id_, ThreadId::Current());
-  if (--current_thread_counter_ == 0) current_thread_id_ = ThreadId::Invalid();
+  CHECK_EQ(current_thread_id_, base::ThreadId::Current());
+  if (--current_thread_counter_ == 0) {
+    current_thread_id_ = base::ThreadId::Invalid();
+  }
 #endif
 
   if (--current_entry_stack->entry_count > 0) return;
@@ -6853,7 +6874,7 @@ void Isolate::DumpAndResetStats() {
 
 void Isolate::DumpAndResetBuiltinsProfileData() {
   if (BasicBlockProfiler::Get()->HasData(this)) {
-#ifndef V8_FUZZILLI
+#if !defined(V8_FUZZILLI) && !defined(V8_REDLINE)
     if (v8_flags.turbo_profiling_output) {
       FILE* f = std::fopen(v8_flags.turbo_profiling_output, "w");
       if (f == nullptr) {
@@ -6866,7 +6887,7 @@ void Isolate::DumpAndResetBuiltinsProfileData() {
       StdoutStream out;
       BasicBlockProfiler::Get()->Print(this, out);
     }
-#endif  // !V8_FUZZILLI
+#endif  // !defined(V8_FUZZILLI) && !defined(V8_REDLINE)
     BasicBlockProfiler::Get()->ResetCounts(this);
   }
 }
@@ -7673,13 +7694,6 @@ FilterETWSessionByURLResult Isolate::RunFilterETWSessionByURLCallback(
 
 #endif  // V8_ENABLE_ETW_STACK_WALKING
 
-void Isolate::SetAddCrashKeyCallback(AddCrashKeyCallback callback) {
-  add_crash_key_callback_ = callback;
-
-  // Log the initial set of data.
-  AddCrashKeysForIsolateAndHeapPointers();
-}
-
 void Isolate::SetCrashKeyStringCallbacks(
     AllocateCrashKeyStringCallback allocate_callback,
     SetCrashKeyStringCallback set_callback) {
@@ -7688,12 +7702,16 @@ void Isolate::SetCrashKeyStringCallbacks(
 }
 
 bool Isolate::HasCrashKeyStringCallbacks() {
+  if (V8::HasCrashKeyCallbacks()) return true;
   DCHECK_EQ(static_cast<bool>(allocate_crash_key_string_callback_),
             static_cast<bool>(set_crash_key_string_callback_));
   return static_cast<bool>(allocate_crash_key_string_callback_);
 }
 
 CrashKey Isolate::AllocateCrashKeyString(const char key[], CrashKeySize size) {
+  if (V8::HasCrashKeyCallbacks()) {
+    return V8::AllocateCrashKey(key, size);
+  }
   CHECK(HasCrashKeyStringCallbacks());
 #if DEBUG
   // Keys are limited in their length, see
@@ -7713,6 +7731,11 @@ CrashKey Isolate::AddCrashKeyString(const char key[], CrashKeySize size,
 }
 
 void Isolate::SetCrashKeyString(CrashKey key, std::string_view value) {
+  if (!key) return;
+  if (V8::HasCrashKeyCallbacks()) {
+    V8::SetCrashKey(key, value);
+    return;
+  }
   if (!set_crash_key_string_callback_) return;
   set_crash_key_string_callback_(key, value);
 }
@@ -8035,16 +8058,10 @@ void Isolate::DetachGlobal(DirectHandle<NativeContext> env) {
     DCHECK(!global_proxy_for_api->IsDetachedFrom(env->global_object()));
   }
 
-  ReadOnlyRoots roots(this);
   DirectHandle<JSGlobalProxy> global_proxy(env->global_proxy(), this);
-  // NOTE: Turbofan's JSNativeContextSpecialization and Maglev depend on
-  // DetachGlobal causing a map change.
-  JSObject::ForceSetPrototype(this, global_proxy, factory()->null_value());
-  // Detach the global object from the native context by making its map
-  // contextless (use the global metamap instead of the contextful one).
-  global_proxy->map()->set_map(this, roots.meta_map());
-  global_proxy->map()->set_constructor_or_back_pointer(roots.null_value(),
-                                                       kRelaxedStore);
+  JSGlobalProxy::MigrateToContextlessMap(
+      this, global_proxy, factory()->null_value(), factory()->null_value(),
+      "DetachGlobal");
   if (v8_flags.track_detached_contexts) AddDetachedContext(env);
   DCHECK(global_proxy->IsDetached());
   env->set_microtask_queue(this, nullptr);
@@ -8203,11 +8220,11 @@ void Isolate::ResetDefaultLocale() {
   Deoptimizer::DeoptimizeAll(this);
 }
 
-icu::UMemory* Isolate::get_cached_icu_object(ICUObjectCacheType cache_type,
-                                             DirectHandle<Object> locales) {
+std::shared_ptr<icu::UMemory> Isolate::get_cached_icu_object(
+    ICUObjectCacheType cache_type, DirectHandle<Object> locales) {
   const ICUObjectCacheEntry& entry =
       icu_object_cache_[static_cast<int>(cache_type)];
-  return StringEqualsLocales(this, entry.locales, locales) ? entry.obj.get()
+  return StringEqualsLocales(this, entry.locales, locales) ? entry.obj
                                                            : nullptr;
 }
 

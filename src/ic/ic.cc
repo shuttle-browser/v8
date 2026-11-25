@@ -240,8 +240,13 @@ static void LookupForRead(LookupIterator* it, bool is_has_property) {
         continue;
       }
       case LookupIterator::ACCESS_CHECK:
-        // ICs know how to perform access checks on global proxies.
-        if (!IsAccessCheckNeeded(*it->GetHolder<JSObject>())) continue;
+        // ICs only support access checks on the lookup start object (when it
+        // is a global proxy), not on objects in the prototype chain.
+        if (it->GetHolder<JSObject>().is_identical_to(
+                it->lookup_start_object()) &&
+            !IsAccessCheckNeeded(*it->GetHolder<JSObject>())) {
+          continue;
+        }
         return;
       case LookupIterator::MODULE_NAMESPACE: {
         if (JSDeferredModuleNamespace::TriggersEvaluation(it)) {
@@ -319,6 +324,12 @@ void IC::UpdateState(DirectHandle<Object> lookup_start_object,
   }
 }
 
+bool IC::CanUpdateElementIC() const {
+  return state() == UNINITIALIZED ||
+         ((state() == MONOMORPHIC || state() == POLYMORPHIC) &&
+          nexus()->GetKeyType() == IcCheckType::kElement);
+}
+
 MaybeDirectHandle<Object> IC::TypeError(MessageTemplate index,
                                         Handle<Object> object,
                                         Handle<Object> key) {
@@ -366,8 +377,12 @@ bool MigrateDeprecated(Isolate* isolate, DirectHandle<Object> object) {
 bool IC::ConfigureVectorState(IC::State new_state, DirectHandle<Object> key) {
   DCHECK_EQ(MEGAMORPHIC, new_state);
   DCHECK_IMPLIES(!is_keyed(), IsName(*key));
-  bool changed = nexus()->ConfigureMegamorphic(
-      IsName(*key) ? IcCheckType::kProperty : IcCheckType::kElement);
+  IcCheckType check_type =
+      IsName(*key) && (!is_keyed() || state() == UNINITIALIZED ||
+                       nexus()->GetKeyType() == IcCheckType::kProperty)
+          ? IcCheckType::kProperty
+          : IcCheckType::kElement;
+  bool changed = nexus()->ConfigureMegamorphic(check_type);
   if (changed) {
     OnFeedbackChanged("Megamorphic");
   }
@@ -1128,10 +1143,11 @@ void LoadIC::UpdateCaches(LookupIterator* lookup) {
 }
 
 StubCache* IC::stub_cache() {
-  // HasICs and each of the store own ICs require its own stub cache.
-  // Until we create them, don't allow accessing the load/store stub caches.
-  DCHECK(!IsAnyHas());
-  if (IsAnyLoad()) {
+  // Each IC kind needs its own stub cache: a has-handler and a load-handler
+  // for the same (map, name) pair are not interchangeable.
+  if (IsAnyHas()) {
+    return isolate()->has_stub_cache();
+  } else if (IsAnyLoad()) {
     return isolate()->load_stub_cache();
   } else if (IsAnyDefineOwn()) {
     return isolate()->define_own_stub_cache();
@@ -1143,17 +1159,15 @@ StubCache* IC::stub_cache() {
 
 void IC::UpdateMegamorphicCache(DirectHandle<Map> map, DirectHandle<Name> name,
                                 const MaybeObjectDirectHandle& handler) {
-  if (!IsAnyHas()) {
-    if (LoadHandler::IsFastProxyHandler(*handler)) {
-      // Special case for FastProxy: if we are seeing the same map again,
-      // this means the inner loadIC or the inner callIC missed. We downgrade
-      // to a normal slow proxy handler and not directly to MEGAMORPHIC.
-      stub_cache()->Set(
-          *name, *map,
-          *MaybeObjectDirectHandle(LoadHandler::LoadProxy(isolate())));
-    } else {
-      stub_cache()->Set(*name, *map, *handler);
-    }
+  if (!IsAnyHas() && LoadHandler::IsFastProxyHandler(*handler)) {
+    // Special case for FastProxy: if we are seeing the same map again,
+    // this means the inner loadIC or the inner callIC missed. We downgrade
+    // to a normal slow proxy handler and not directly to MEGAMORPHIC.
+    stub_cache()->Set(
+        *name, *map,
+        *MaybeObjectDirectHandle(LoadHandler::LoadProxy(isolate())));
+  } else {
+    stub_cache()->Set(*name, *map, *handler);
   }
 }
 
@@ -1563,6 +1577,8 @@ bool AllowedHandlerChange(KeyedAccessLoadMode old_mode,
 
 void KeyedLoadIC::UpdateLoadElement(DirectHandle<HeapObject> receiver,
                                     const KeyedAccessLoadMode new_load_mode) {
+  if (!CanUpdateElementIC()) return;
+
   Handle<Map> receiver_map(receiver->map(), isolate());
   DCHECK(receiver_map->instance_type() !=
          JS_PRIMITIVE_WRAPPER_TYPE);  // Checked by caller.
@@ -2078,8 +2094,13 @@ bool StoreIC::LookupForWrite(LookupIterator* it, DirectHandle<Object> value,
         continue;
       }
       case LookupIterator::ACCESS_CHECK:
-        // ICs know how to perform access checks on global proxies.
-        if (!IsAccessCheckNeeded(*it->GetHolder<JSObject>())) continue;
+        // ICs only support access checks on the lookup start object (when it
+        // is a global proxy), not on objects in the prototype chain.
+        if (it->GetHolder<JSObject>().is_identical_to(
+                it->lookup_start_object()) &&
+            !IsAccessCheckNeeded(*it->GetHolder<JSObject>())) {
+          continue;
+        }
         return false;
       case LookupIterator::ACCESSOR:
         return !it->IsReadOnly();
@@ -2706,10 +2727,6 @@ MaybeObjectHandle StoreIC::ComputeHandler(LookupIterator* lookup) {
         TRACE_HANDLER_STATS(isolate(), StoreIC_StoreFieldDH);
         InternalIndex descriptor = lookup->GetFieldDescriptorIndex();
         FieldIndex index = lookup->GetFieldIndex();
-        if (V8_UNLIKELY(IsJSSharedStruct(*holder))) {
-          return MaybeObjectHandle(StoreHandler::StoreSharedStructField(
-              isolate(), descriptor, index, lookup->representation()));
-        }
         return MaybeObjectHandle(StoreHandler::StoreField(
             isolate(), descriptor, index, lookup->constness(),
             lookup->representation()));
@@ -2755,6 +2772,8 @@ MaybeObjectHandle StoreIC::ComputeHandler(LookupIterator* lookup) {
 void KeyedStoreIC::UpdateStoreElement(Handle<Map> receiver_map,
                                       KeyedAccessStoreMode store_mode,
                                       Handle<Map> new_receiver_map) {
+  if (!CanUpdateElementIC()) return;
+
   MapsAndHandlers target_maps_and_handlers(isolate());
   nexus()->ExtractMapsAndHandlers(
       &target_maps_and_handlers,

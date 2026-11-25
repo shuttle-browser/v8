@@ -54,6 +54,19 @@ constexpr bool kSaveFullFPRegistersOnStack = true;
 constexpr bool kSaveFullFPRegistersOnStack = false;
 #endif  // V8_ENABLE_WEBASSEMBLY
 
+#if CONTIGUOUS_COMPRESSED_READ_ONLY_SPACE_BOOL
+// A tagged value points into the read-only reservation iff none of these bits
+// of its compressed half is set, the check MemoryChunk::InReadOnlySpace()
+// makes: the reservation is a power of two at the base of the cage. The mask
+// is a logical immediate, so the test is a single tst, whereas the reservation
+// size, one past the largest add/sub immediate, would have to be materialized
+// for a cmp.
+constexpr uint32_t kReadOnlyReservationMask =
+    static_cast<uint32_t>(kContiguousReadOnlySpaceMask);
+static_assert(kReadOnlyReservationMask ==
+              ~static_cast<uint32_t>(kContiguousReadOnlyReservationSize - 1));
+#endif  // CONTIGUOUS_COMPRESSED_READ_ONLY_SPACE_BOOL
+
 }  // namespace
 
 void MacroAssembler::PushCPURegList(CPURegList registers) {
@@ -1594,8 +1607,8 @@ void MacroAssembler::AssertNotSmi(Register object, AbortReason reason) {
 void MacroAssembler::AssertZeroExtended(Register int32_register) {
   if (!v8_flags.slow_debug_code) return;
   ASM_CODE_COMMENT(this);
-  Tst(int32_register.X(), kMaxUInt32);
-  Check(ls, AbortReason::k32BitValueInRegisterIsNotZeroExtended);
+  Tst(int32_register.X(), ~uint64_t{kMaxUInt32});
+  Check(kZero, AbortReason::k32BitValueInRegisterIsNotZeroExtended);
 }
 
 void MacroAssembler::AssertMap(Register object) {
@@ -3478,12 +3491,26 @@ void MacroAssembler::LoadElementsKindFromMap(Register result, Register map) {
   DecodeField<Map::Bits2::ElementsKindBits>(result);
 }
 
-void MacroAssembler::CompareTaggedRoot(const Register& obj, RootIndex index) {
+void MacroAssembler::CompareTaggedRoot(const Register& obj, RootIndex index,
+                                       ComparisonMode mode) {
   ASM_CODE_COMMENT(this);
+  DCHECK_NE(mode, ComparisonMode::kFullPointer);
   AssertSmiOrHeapObjectInMainCompressionCage(obj);
   UseScratchRegisterScope temps(this);
   if (V8_STATIC_ROOTS_BOOL && RootsTable::IsReadOnly(index)) {
-    CmpTagged(obj, Immediate(ReadOnlyRootPtr(index)));
+    Tagged_t ptr = ReadOnlyRootPtr(index);
+    // When only equality matters, a pointer that would need a movz/movk pair
+    // (wider than 16 bits and not an add/sub immediate) can be compared in two
+    // encodable 12-bit halves instead. This covers the holes after the_hole,
+    // which sit at 0x?fffd because each one ends just below a 64 KiB boundary.
+    if (mode == ComparisonMode::kEqualityOnly && is_uint24(ptr) &&
+        !is_uint16(ptr) && !IsImmAddSub(ptr)) {
+      Register temp = temps.AcquireW();
+      Sub(temp, obj.W(), ptr & ~0xfff);
+      Cmp(temp, ptr & 0xfff);
+      return;
+    }
+    CmpTagged(obj, Immediate(ptr));
     return;
   }
   // Some smi roots contain system pointer size values like stack limits.
@@ -3509,18 +3536,18 @@ void MacroAssembler::CompareRoot(const Register& obj, RootIndex index,
     Cmp(obj, temp);
     return;
   }
-  CompareTaggedRoot(obj, index);
+  CompareTaggedRoot(obj, index, mode);
 }
 
 void MacroAssembler::JumpIfRoot(const Register& obj, RootIndex index,
                                 Label* if_equal) {
-  CompareRoot(obj, index);
+  CompareRoot(obj, index, ComparisonMode::kEqualityOnly);
   B(eq, if_equal);
 }
 
 void MacroAssembler::JumpIfNotRoot(const Register& obj, RootIndex index,
                                    Label* if_not_equal) {
-  CompareRoot(obj, index);
+  CompareRoot(obj, index, ComparisonMode::kEqualityOnly);
   B(ne, if_not_equal);
 }
 
@@ -3836,7 +3863,7 @@ void MacroAssembler::PreCheckSkippedWriteBarrier(Register object,
   }
 
 #if CONTIGUOUS_COMPRESSED_READ_ONLY_SPACE_BOOL
-  JumpIfUnsignedLessThan(value, kContiguousReadOnlyReservationSize, ok);
+  TestAndBranchIfAllClear(value.W(), kReadOnlyReservationMask, ok);
 #else   // !CONTIGUOUS_COMPRESSED_READ_ONLY_SPACE_BOOL
   // Write barier can also be removed if value is in read-only space.
   CheckPageFlag(value, scratch, MemoryChunk::kIsInReadOnlyHeapMask, ne, ok);
@@ -3885,7 +3912,7 @@ void MacroAssembler::MaybeJumpIfReadOnlyOrSmallSmi(Register value,
   constexpr int kLastStaticRootPage =
       RoundUp<kRegularPageSize>(StaticReadOnlyRoot::kLastAllocatedRoot);
   static_assert(kLastStaticRootPage <= kContiguousReadOnlyReservationSize);
-  JumpIfUnsignedLessThan(value, kContiguousReadOnlyReservationSize, dest);
+  TestAndBranchIfAllClear(value.W(), kReadOnlyReservationMask, dest);
 #endif  // V8_STATIC_ROOTS_BOOL && CONTIGUOUS_COMPRESSED_READ_ONLY_SPACE_BOOL
 }
 
@@ -3963,7 +3990,7 @@ void MacroAssembler::LoadExternalPointerField(Register destination,
                                               Register isolate_root) {
   DCHECK(!AreAliased(destination, isolate_root));
   ASM_CODE_COMMENT(this);
-#ifdef V8_ENABLE_SANDBOX
+#ifdef V8_COMPRESS_POINTERS
   DCHECK(!tag_range.IsEmpty());
   DCHECK(!IsSharedExternalPointerType(tag_range));
   UseScratchRegisterScope temps(this);
@@ -4008,7 +4035,7 @@ void MacroAssembler::LoadExternalPointerField(Register destination,
   }
 #else
   Ldr(destination, field_operand);
-#endif  // V8_ENABLE_SANDBOX
+#endif  // V8_COMPRESS_POINTERS
 }
 
 void MacroAssembler::LoadTrustedPointerField(Register destination,
@@ -4178,6 +4205,7 @@ void MacroAssembler::PushDispatchHandle(Register dispatch_handle,
 #ifdef V8_ENABLE_SANDBOX
   DCHECK(!AreAliased(dispatch_handle, other, scratch1, scratch2));
   AssertZeroExtended(dispatch_handle);
+  Bic(dispatch_handle, dispatch_handle, (1 << kJSDispatchHandleShift) - 1);
   LoadParameterCountFromJSDispatchTable(scratch1, dispatch_handle, scratch2);
   Bfi(dispatch_handle, scratch1, 32, 32);
 #endif

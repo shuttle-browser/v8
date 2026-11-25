@@ -1700,7 +1700,7 @@ class V8_EXPORT_PRIVATE MacroAssembler : public MacroAssemblerBase {
   void StoreSandboxedPointerField(Register value, MemOperand dst_field_operand);
 
   // Loads a field containing an off-heap ("external") pointer and does
-  // necessary decoding if the sandbox is enabled.
+  // necessary decoding if pointer compression is enabled.
   void LoadExternalPointerField(Register destination, MemOperand field_operand,
                                 ExternalPointerTagRange tag_range,
                                 Register isolate_root = Register::no_reg());
@@ -2293,7 +2293,8 @@ class V8_EXPORT_PRIVATE MacroAssembler : public MacroAssemblerBase {
   // Compare the object in a register to a value from the root list.
   void CompareRoot(const Register& obj, RootIndex index,
                    ComparisonMode mode = ComparisonMode::kDefault);
-  void CompareTaggedRoot(const Register& with, RootIndex index);
+  void CompareTaggedRoot(const Register& with, RootIndex index,
+                         ComparisonMode mode = ComparisonMode::kDefault);
 
   // Compare the object in a register to a value and jump if they are equal.
   void JumpIfRoot(const Register& obj, RootIndex index, Label* if_equal);

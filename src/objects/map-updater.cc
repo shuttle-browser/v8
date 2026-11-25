@@ -372,17 +372,8 @@ std::optional<Tagged<Map>> MapUpdater::TryUpdateNoLock(Isolate* isolate,
 
   // Check the state of the root map.
   Tagged<Map> root_map = old_map->FindRootMap();
-  if (root_map->is_deprecated()) {
-    Tagged<JSFunction> constructor =
-        Cast<JSFunction>(root_map->GetConstructor());
-    DCHECK(constructor->has_initial_map());
-    DCHECK(constructor->initial_map()->is_dictionary_map());
-    if (constructor->initial_map()->elements_kind() !=
-        old_map->elements_kind()) {
-      return {};
-    }
-    return constructor->initial_map();
-  }
+  // Root maps shall not be deprecated.
+  CHECK(!root_map->is_deprecated());
 
   if (root_map->prototype() != old_map->prototype()) {
     auto maybe_transition =
@@ -1040,7 +1031,11 @@ DirectHandle<DescriptorArray> MapUpdater::BuildDescriptorArray() {
     }
   }
 
+#ifdef V8_ENABLE_DESCRIPTOR_ARRAY_LOOKUP_TABLE
+  new_descriptors->CopyFromOrRebuildLookupTable(*old_descriptors_);
+#else
   new_descriptors->Sort();
+#endif  // V8_ENABLE_DESCRIPTOR_ARRAY_LOOKUP_TABLE
   return new_descriptors;
 }
 

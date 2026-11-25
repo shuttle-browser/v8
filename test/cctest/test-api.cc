@@ -298,7 +298,7 @@ static void TestSignature(const char* operation, Local<Value> receiver,
 }
 
 THREADED_TEST(ReceiverSignature) {
-  i::v8_flags.allow_natives_syntax = true;
+  i::v8_flags.allow_natives_syntax.Set(true);
   LocalContext env;
   v8::Isolate* isolate = env.isolate();
   v8::HandleScope scope(isolate);
@@ -413,7 +413,7 @@ void DoNothingCallback(const v8::FunctionCallbackInfo<v8::Value>& info) {
 
 // Regression test for issue chromium:1188563.
 THREADED_TEST(Regress1188563) {
-  i::v8_flags.allow_natives_syntax = true;
+  i::v8_flags.allow_natives_syntax.Set(true);
   LocalContext env;
   v8::Isolate* isolate = env.isolate();
   v8::HandleScope scope(isolate);
@@ -620,6 +620,18 @@ class TestOneByteResource : public String::ExternalOneByteStringResource {
   int* counter_;
 };
 
+namespace {
+
+// Runs memory-reducing GCs and finishes the sweeping of the unified heap.
+void InvokeMajorGCsAndFinishSweeping(i::Heap* heap) {
+  i::heap::InvokeMemoryReducingMajorGCs(heap);
+  heap->EnsureSweepingCompleted(
+      i::Heap::SweepingForcedFinalizationMode::kUnifiedHeap,
+      i::CompleteSweepingReason::kTesting);
+}
+
+}  // namespace
+
 TEST(ScriptUsingStringResource) {
   int dispose_count = 0;
   const char* c_source = "1 + 2 * 3";
@@ -649,9 +661,10 @@ TEST(ScriptUsingStringResource) {
   {
     // We need to invoke GC without stack, otherwise the resource may not be
     // reclaimed because of conservative stack scanning.
+    // Finishing the sweeping makes sure the resource is disposed.
     i::DisableConservativeStackScanningScopeForTesting no_stack_scanning(
         CcTest::heap());
-    i::heap::InvokeMemoryReducingMajorGCs(CcTest::heap());
+    InvokeMajorGCsAndFinishSweeping(CcTest::heap());
   }
   CHECK_EQ(1, dispose_count);
 }
@@ -686,9 +699,10 @@ TEST(ScriptUsingOneByteStringResource) {
   {
     // We need to invoke GC without stack, otherwise the resource may not be
     // reclaimed because of conservative stack scanning.
+    // Finishing the sweeping makes sure the resource is disposed.
     i::DisableConservativeStackScanningScopeForTesting no_stack_scanning(
         CcTest::heap());
-    i::heap::InvokeMemoryReducingMajorGCs(CcTest::heap());
+    InvokeMajorGCsAndFinishSweeping(CcTest::heap());
   }
   CHECK_EQ(1, dispose_count);
 }
@@ -723,9 +737,10 @@ TEST(ScriptMakingExternalString) {
   {
     // We need to invoke GC without stack, otherwise the resource may not be
     // reclaimed because of conservative stack scanning.
+    // Finishing the sweeping makes sure the resource is disposed.
     i::DisableConservativeStackScanningScopeForTesting no_stack_scanning(
         CcTest::heap());
-    i::heap::InvokeMajorGC(CcTest::heap());
+    InvokeMajorGCsAndFinishSweeping(CcTest::heap());
   }
   CHECK_EQ(1, dispose_count);
 }
@@ -754,9 +769,10 @@ TEST(ScriptMakingExternalOneByteString) {
   {
     // We need to invoke GC without stack, otherwise the resource may not be
     // reclaimed because of conservative stack scanning.
+    // Finishing the sweeping makes sure the resource is disposed.
     i::DisableConservativeStackScanningScopeForTesting no_stack_scanning(
         CcTest::heap());
-    i::heap::InvokeMajorGC(CcTest::heap());
+    InvokeMajorGCsAndFinishSweeping(CcTest::heap());
   }
   CHECK_EQ(1, dispose_count);
 }
@@ -784,10 +800,11 @@ TEST(MakingExternalStringConditions) {
   // Old space strings should be accepted.
   CHECK(local_string->CanMakeExternal(String::Encoding::TWO_BYTE_ENCODING));
 
-  // Tiny strings are not in-place externalizable when pointer compression is
-  // enabled, but they are if the sandbox is enabled.
-  CHECK_EQ(
-      V8_ENABLE_SANDBOX_BOOL || i::kTaggedSize == i::kSystemPointerSize,
+  // Tiny strings are in-place externalizable when external pointers are stored
+  // in the ExternalPointerTable (COMPRESS_POINTERS_BOOL) or when tagged size
+  // equals system pointer size, so kExternalPointerSlotSize == kTaggedSize in
+  // all configurations.
+  CHECK(
       tiny_local_string->CanMakeExternal(String::Encoding::TWO_BYTE_ENCODING));
 
   // Change of representation is not allowed.
@@ -831,7 +848,8 @@ TEST(MakingExternalOneByteStringConditions) {
 
 
 TEST(MakingExternalUnalignedOneByteString) {
-  i::v8_flags.stress_concurrent_allocation = false;  // For SimulateFullSpace.
+  i::v8_flags.stress_concurrent_allocation.Set(
+      false);  // For SimulateFullSpace.
   LocalContext env;
   v8::HandleScope scope(env.isolate());
 
@@ -953,8 +971,8 @@ THREADED_TEST(NewExternalForVeryLongString) {
 
 TEST(ScavengeExternalString) {
   i::ManualGCScope manual_gc_scope;
-  i::v8_flags.stress_compaction = false;
-  i::v8_flags.gc_global = false;
+  i::v8_flags.stress_compaction.Set(false);
+  i::v8_flags.gc_global.Set(false);
 
   int dispose_count = 0;
   bool in_young_generation = false;
@@ -976,18 +994,19 @@ TEST(ScavengeExternalString) {
   {
     // We need to invoke GC without stack, otherwise the resource may not be
     // reclaimed because of conservative stack scanning.
+    // Finishing the sweeping makes sure the resource is disposed.
     i::DisableConservativeStackScanningScopeForTesting no_stack_scanning(
         CcTest::heap());
     in_young_generation ? i::heap::InvokeMinorGC(CcTest::heap())
-                        : i::heap::InvokeMajorGC(CcTest::heap());
+                        : InvokeMajorGCsAndFinishSweeping(CcTest::heap());
   }
   CHECK_EQ(1, dispose_count);
 }
 
 TEST(ScavengeExternalOneByteString) {
   i::ManualGCScope manual_gc_scope;
-  i::v8_flags.stress_compaction = false;
-  i::v8_flags.gc_global = false;
+  i::v8_flags.stress_compaction.Set(false);
+  i::v8_flags.gc_global.Set(false);
 
   int dispose_count = 0;
   bool in_young_generation = false;
@@ -1009,10 +1028,11 @@ TEST(ScavengeExternalOneByteString) {
   {
     // We need to invoke GC without stack, otherwise the resource may not be
     // reclaimed because of conservative stack scanning.
+    // Finishing the sweeping makes sure the resource is disposed.
     i::DisableConservativeStackScanningScopeForTesting no_stack_scanning(
         CcTest::heap());
     in_young_generation ? i::heap::InvokeMinorGC(CcTest::heap())
-                        : i::heap::InvokeMajorGC(CcTest::heap());
+                        : InvokeMajorGCsAndFinishSweeping(CcTest::heap());
   }
   CHECK_EQ(1, dispose_count);
 }
@@ -1063,9 +1083,10 @@ TEST(ExternalStringWithDisposeHandling) {
   {
     // We need to invoke GC without stack, otherwise the resource may not be
     // reclaimed because of conservative stack scanning.
+    // Finishing the sweeping makes sure the resource is disposed.
     i::DisableConservativeStackScanningScopeForTesting no_stack_scanning(
         CcTest::heap());
-    i::heap::InvokeMemoryReducingMajorGCs(CcTest::heap());
+    InvokeMajorGCsAndFinishSweeping(CcTest::heap());
   }
   CHECK_EQ(1, TestOneByteResourceWithDisposeControl::dispose_calls);
   CHECK_EQ(0, TestOneByteResourceWithDisposeControl::dispose_count);
@@ -1091,9 +1112,10 @@ TEST(ExternalStringWithDisposeHandling) {
   {
     // We need to invoke GC without stack, otherwise the resource may not be
     // reclaimed because of conservative stack scanning.
+    // Finishing the sweeping makes sure the resource is disposed.
     i::DisableConservativeStackScanningScopeForTesting no_stack_scanning(
         CcTest::heap());
-    i::heap::InvokeMemoryReducingMajorGCs(CcTest::heap());
+    InvokeMajorGCsAndFinishSweeping(CcTest::heap());
   }
   CHECK_EQ(1, TestOneByteResourceWithDisposeControl::dispose_calls);
   CHECK_EQ(1, TestOneByteResourceWithDisposeControl::dispose_count);
@@ -3309,6 +3331,17 @@ THREADED_TEST(GlobalObjectHasRealIndexedProperty) {
   CHECK(global->HasRealIndexedProperty(env.local(), 0).FromJust());
 }
 
+class TestGarbagedCollectedData
+    : public cppgc::GarbageCollected<TestGarbagedCollectedData> {
+ public:
+  void MarkUsed() { ++use_count_; }
+  int use_count() const { return use_count_; }
+  void Trace(cppgc::Visitor*) const {}
+
+ private:
+  int use_count_ = 0;
+};
+
 static void CheckAlignedPointerInInternalField(Local<v8::Object> obj,
                                                void* value) {
   CHECK(HAS_SMI_TAG(reinterpret_cast<i::Address>(value)));
@@ -3317,6 +3350,14 @@ static void CheckAlignedPointerInInternalField(Local<v8::Object> obj,
   CHECK_EQ(value, obj->GetAlignedPointerFromInternalField(0, kTestTypeTagA));
   CHECK_EQ(value, obj->GetAlignedPointerFromInternalField(CcTest::isolate(), 0,
                                                           kTestTypeTagA));
+}
+
+static void CheckCppHeapPointerInInternalField(
+    Local<v8::Object> obj, TestGarbagedCollectedData* value) {
+  obj->SetPointerInInternalField(0, value, i::kTagForTesting);
+  i::heap::InvokeMajorGC(CcTest::heap());
+  CHECK_EQ(value, obj->GetPointerFromInternalField<TestGarbagedCollectedData>(
+                      CcTest::isolate(), 0, i::kTagForTesting));
 }
 
 THREADED_TEST(InternalFieldsAlignedPointers) {
@@ -3351,6 +3392,21 @@ THREADED_TEST(InternalFieldsAlignedPointers) {
   CHECK_EQ(1, Object::InternalFieldCount(persistent));
   CHECK_EQ(huge, Object::GetAlignedPointerFromInternalField(persistent, 0,
                                                             kTestTypeTagA));
+
+  CheckCppHeapPointerInInternalField(obj, nullptr);
+
+  cppgc::Persistent<TestGarbagedCollectedData> cpp_object(
+      cppgc::MakeGarbageCollected<TestGarbagedCollectedData>(
+          isolate->GetCppHeap()->GetAllocationHandle()));
+  CheckCppHeapPointerInInternalField(obj, cpp_object.Get());
+  CHECK_EQ(cpp_object.Get(),
+           Object::GetPointerFromInternalField<TestGarbagedCollectedData>(
+               isolate, persistent, 0, i::kTagForTesting));
+
+  v8::TracedReference<v8::Object> traced(isolate, obj);
+  CHECK_EQ(cpp_object.Get(),
+           Object::GetPointerFromInternalField<TestGarbagedCollectedData>(
+               isolate, traced, 0, i::kTagForTesting));
 }
 
 static void CheckAlignedPointerInEmbedderData(LocalContext* env,
@@ -4143,7 +4199,7 @@ THREADED_TEST(WellKnownSymbols) {
 
 
 THREADED_TEST(GlobalPrivates) {
-  i::v8_flags.allow_natives_syntax = true;
+  i::v8_flags.allow_natives_syntax.Set(true);
   LocalContext env;
   v8::Isolate* isolate = env.isolate();
   v8::HandleScope scope(isolate);
@@ -5235,7 +5291,7 @@ TEST(MessageGetSourceLine) {
 }
 
 TEST(GetStackTraceLimit) {
-  i::v8_flags.stack_trace_limit = 10;
+  i::v8_flags.stack_trace_limit.Set(10);
 
   v8::Isolate* isolate = CcTest::isolate();
   v8::HandleScope scope(isolate);
@@ -5246,7 +5302,7 @@ TEST(GetStackTraceLimit) {
 }
 
 TEST(GetStackTraceLimitSetFromJS) {
-  i::v8_flags.stack_trace_limit = 10;
+  i::v8_flags.stack_trace_limit.Set(10);
 
   v8::Isolate* isolate = CcTest::isolate();
   v8::HandleScope scope(isolate);
@@ -5264,7 +5320,7 @@ TEST(GetStackTraceLimitSetFromJS) {
 }
 
 TEST(GetStackTraceLimitSetNegativeFromJS) {
-  i::v8_flags.stack_trace_limit = 10;
+  i::v8_flags.stack_trace_limit.Set(10);
 
   v8::Isolate* isolate = CcTest::isolate();
   v8::HandleScope scope(isolate);
@@ -7969,7 +8025,7 @@ static const char* kNativeCallInExtensionSource =
 
 // Test that natives syntax is not allowed in extensions.
 TEST(NativeCallInExtensions) {
-  i::v8_flags.allow_natives_syntax = false;
+  i::v8_flags.allow_natives_syntax.Set(false);
   v8::HandleScope handle_scope(CcTest::isolate());
   v8::RegisterExtension(
       std::make_unique<Extension>("nativecall", kNativeCallInExtensionSource));
@@ -8284,7 +8340,7 @@ static void IndependentWeakHandle(bool global_gc, bool interlinked) {
   if (i::v8_flags.scavenger_chaos_mode) return;
   i::ManualGCScope manual_gc_scope;
   // Parallel scavenge introduces too much fragmentation.
-  i::v8_flags.parallel_scavenge = false;
+  i::v8_flags.parallel_scavenge.Set(false);
 
   v8::Isolate* iso = CcTest::isolate();
   v8::HandleScope scope(iso);
@@ -11194,7 +11250,7 @@ THREADED_TEST(ShadowObjectAndDataProperty) {
   // efficient access and good feedback for optimization.
   v8::Isolate* isolate = CcTest::isolate();
   v8::HandleScope handle_scope(isolate);
-  i::v8_flags.allow_natives_syntax = true;
+  i::v8_flags.allow_natives_syntax.Set(true);
 
   Local<ObjectTemplate> global_template = v8::ObjectTemplate::New(isolate);
   LocalContext context(nullptr, global_template);
@@ -11240,7 +11296,7 @@ THREADED_TEST(ShadowObjectAndDataProperty) {
 THREADED_TEST(ShadowObjectAndDataPropertyTurbo) {
   // This test is the same as the previous one except that it triggers
   // optimization of {foo} after its first invocation.
-  i::v8_flags.allow_natives_syntax = true;
+  i::v8_flags.allow_natives_syntax.Set(true);
 
   if (i::v8_flags.lite_mode) return;
   v8::Isolate* isolate = CcTest::isolate();
@@ -11379,7 +11435,7 @@ THREADED_TEST(SetPrototype) {
 // triggers dictionary elements in GetOwnPropertyNames() shouldn't
 // crash the runtime.
 THREADED_TEST(Regress91517) {
-  i::v8_flags.allow_natives_syntax = true;
+  i::v8_flags.allow_natives_syntax.Set(true);
   LocalContext context;
   v8::Isolate* isolate = context.isolate();
   v8::HandleScope handle_scope(isolate);
@@ -13951,7 +14007,7 @@ void ApiTestFuzzer::ContextSwitch() {
   if (!NextThread()) return;
   // Mark the stack of this background thread for conservative stack scanning.
   CcTest::i_isolate()->heap()->stack().SetMarkerForBackgroundThreadAndCallback(
-      i::ThreadId::Current().ToInteger(), [this]() {
+      v8::base::ThreadId::Current().ToInteger(), [this]() {
         // Exit the isolate from this thread.
         CcTest::i_isolate()->Exit();
         {
@@ -14189,7 +14245,7 @@ static void CheckSurvivingGlobalObjectsCount(int expected) {
 
 TEST(DontLeakGlobalObjects) {
   // Regression test for issues 1139850 and 1174891.
-  i::v8_flags.expose_gc = true;
+  i::v8_flags.expose_gc.Set(true);
 
   for (int i = 0; i < 5; i++) {
     { v8::HandleScope scope(CcTest::isolate());
@@ -14572,12 +14628,13 @@ static void event_handler(const v8::JitCodeEvent* event) {
 }  // namespace
 
 UNINITIALIZED_TEST(SetJitCodeEventHandler) {
-  i::v8_flags.stress_compaction = true;
-  i::v8_flags.incremental_marking = false;
-  i::v8_flags.stress_concurrent_allocation = false;  // For SimulateFullSpace.
+  i::v8_flags.stress_compaction.Set(true);
+  i::v8_flags.incremental_marking.Set(false);
+  i::v8_flags.stress_concurrent_allocation.Set(
+      false);  // For SimulateFullSpace.
   // Batch compilation can cause different owning spaces for foo and bar.
 #ifdef V8_ENABLE_SPARKPLUG
-  i::v8_flags.baseline_batch_compilation = false;
+  i::v8_flags.baseline_batch_compilation.Set(false);
 #endif
   if (!i::v8_flags.compact) return;
   i::FlagList::EnforceFlagImplications();
@@ -14814,7 +14871,7 @@ TEST(ExternalAllocatedMemory) {
 
 
 TEST(Regress51719) {
-  i::v8_flags.incremental_marking = false;
+  i::v8_flags.incremental_marking.Set(false);
   CcTest::InitializeVM();
 
   const int64_t kTriggerGCSize =
@@ -16920,7 +16977,7 @@ void PromiseRejectCallbackConstructError(
 }
 
 TEST(PromiseRejectCallbackConstructError) {
-  i::v8_flags.allow_natives_syntax = true;
+  i::v8_flags.allow_natives_syntax.Set(true);
   LocalContext env;
   v8::Isolate* isolate = env.isolate();
   v8::HandleScope scope(isolate);
@@ -17744,7 +17801,7 @@ UNINITIALIZED_TEST(GetHeapTotalAllocatedBytesSharedSpaces) {
   if (i::v8_flags.stress_concurrent_allocation) return;
   if (COMPRESS_POINTERS_IN_MULTIPLE_CAGES_BOOL) return;
 
-  i::v8_flags.shared_heap = true;
+  i::v8_flags.shared_heap.Set(true);
   i::FlagList::EnforceFlagImplications();
 
   v8::Isolate::CreateParams create_params;
@@ -17861,7 +17918,7 @@ TEST(NumberOfDetachedContexts) {
 }
 
 TEST(ExternalizeOldSpaceTwoByteCons) {
-  i::v8_flags.allow_natives_syntax = true;
+  i::v8_flags.allow_natives_syntax.Set(true);
   v8::Isolate* isolate = CcTest::isolate();
   LocalContext env;
   v8::HandleScope scope(isolate);
@@ -17888,7 +17945,7 @@ TEST(ExternalizeOldSpaceTwoByteCons) {
 
 
 TEST(ExternalizeOldSpaceOneByteCons) {
-  i::v8_flags.allow_natives_syntax = true;
+  i::v8_flags.allow_natives_syntax.Set(true);
   v8::Isolate* isolate = CcTest::isolate();
   LocalContext env;
   v8::HandleScope scope(isolate);
@@ -17981,9 +18038,10 @@ TEST(ExternalInternalizedStringCollectedAtGC) {
   {
     // We need to invoke GC without stack, otherwise the resource may not be
     // reclaimed because of conservative stack scanning.
+    // Finishing the sweeping makes sure the resource is disposed.
     i::DisableConservativeStackScanningScopeForTesting no_stack_scanning(
         CcTest::heap());
-    i::heap::InvokeMemoryReducingMajorGCs(CcTest::heap());
+    InvokeMajorGCsAndFinishSweeping(CcTest::heap());
   }
 
   // Ring has been destroyed.  Free Peoples of Middle-earth Rejoice.
@@ -18158,7 +18216,7 @@ THREADED_TEST(SpaghettiStackReThrow) {
 TEST(Regress528) {
   i::ManualGCScope manual_gc_scope;
   v8::Isolate* isolate = CcTest::isolate();
-  i::v8_flags.retain_maps_for_n_gc = 0;
+  i::v8_flags.retain_maps_for_n_gc.Set(0);
   v8::HandleScope scope(isolate);
   int gc_count;
 
@@ -21543,8 +21601,8 @@ static void Helper137002(bool do_store,
 
 
 THREADED_TEST(Regress137002a) {
-  i::v8_flags.allow_natives_syntax = true;
-  i::v8_flags.compilation_cache = false;
+  i::v8_flags.allow_natives_syntax.Set(true);
+  i::v8_flags.compilation_cache.Set(false);
   v8::HandleScope scope(CcTest::isolate());
   for (int i = 0; i < 16; i++) {
     Helper137002(i & 8, i & 4, i & 2, i & 1);
@@ -21553,7 +21611,7 @@ THREADED_TEST(Regress137002a) {
 
 
 THREADED_TEST(Regress137002b) {
-  i::v8_flags.allow_natives_syntax = true;
+  i::v8_flags.allow_natives_syntax.Set(true);
   LocalContext context;
   v8::Isolate* isolate = context.isolate();
   v8::HandleScope scope(isolate);
@@ -21642,7 +21700,7 @@ THREADED_TEST(Regress137002b) {
 
 
 THREADED_TEST(Regress142088) {
-  i::v8_flags.allow_natives_syntax = true;
+  i::v8_flags.allow_natives_syntax.Set(true);
   LocalContext context;
   v8::Isolate* isolate = context.isolate();
   v8::HandleScope scope(isolate);
@@ -21662,7 +21720,7 @@ THREADED_TEST(Regress142088) {
 
 
 THREADED_TEST(Regress137496) {
-  i::v8_flags.expose_gc = true;
+  i::v8_flags.expose_gc.Set(true);
   LocalContext context;
   v8::HandleScope scope(context.isolate());
 
@@ -21975,7 +22033,7 @@ void CheckCorrectThrow(const char* script) {
 
 
 TEST(AccessCheckThrows) {
-  i::v8_flags.allow_natives_syntax = true;
+  i::v8_flags.allow_natives_syntax.Set(true);
   v8::Isolate* isolate = CcTest::isolate();
   isolate->SetFailedAccessCheckCallbackFunction(&FailedAccessCheckThrows);
   v8::HandleScope scope(isolate);
@@ -22265,7 +22323,7 @@ class RequestInterruptTestWithMathAbs
                   .ToLocalChecked())
         .FromJust();
 
-    i::v8_flags.allow_natives_syntax = true;
+    i::v8_flags.allow_natives_syntax.Set(true);
     CompileRun(
         "function loopish(o) {"
         "  var pre = 10;"
@@ -22284,7 +22342,7 @@ class RequestInterruptTestWithMathAbs
         "%OptimizeFunctionOnNextCall(loopish);"
         "loopish(Math);");
 
-    i::v8_flags.allow_natives_syntax = false;
+    i::v8_flags.allow_natives_syntax.Set(false);
   }
 
  private:
@@ -22927,14 +22985,14 @@ int ApiCallOptimizationChecker::count = 0;
 
 
 TEST(FunctionCallOptimization) {
-  i::v8_flags.allow_natives_syntax = true;
+  i::v8_flags.allow_natives_syntax.Set(true);
   ApiCallOptimizationChecker checker;
   checker.RunAll();
 }
 
 
 TEST(FunctionCallOptimizationMultipleArgs) {
-  i::v8_flags.allow_natives_syntax = true;
+  i::v8_flags.allow_natives_syntax.Set(true);
   LocalContext context;
   v8::Isolate* isolate = context.isolate();
   v8::HandleScope scope(isolate);
@@ -22963,7 +23021,7 @@ static void ReturnsSymbolCallback(
 
 
 TEST(ApiCallbackCanReturnSymbols) {
-  i::v8_flags.allow_natives_syntax = true;
+  i::v8_flags.allow_natives_syntax.Set(true);
   LocalContext context;
   v8::Isolate* isolate = context.isolate();
   v8::HandleScope scope(isolate);
@@ -23119,15 +23177,15 @@ void StoringEventLoggerCallback(const char* message, int status) {
 
 
 TEST(EventLogging) {
-    i::v8_flags.log_timer_events = true;
-    v8::Isolate* isolate = CcTest::isolate();
-    isolate->SetEventLogger(StoringEventLoggerCallback);
-    i::NestedTimedHistogram histogram(
-        "V8.Test", 0, 10000, i::TimedHistogramResolution::MILLISECOND, 50,
-        reinterpret_cast<i::Isolate*>(isolate)->counters());
-    event_count = 0;
-    int count = 0;
-    {
+  i::v8_flags.log_timer_events.Set(true);
+  v8::Isolate* isolate = CcTest::isolate();
+  isolate->SetEventLogger(StoringEventLoggerCallback);
+  i::NestedTimedHistogram histogram(
+      "V8.Test", 0, 10000, i::TimedHistogramResolution::MILLISECOND, 50,
+      reinterpret_cast<i::Isolate*>(isolate)->counters());
+  event_count = 0;
+  int count = 0;
+  {
     CHECK_EQ(0, event_count);
     {
       CHECK_EQ(0, event_count);
@@ -23185,7 +23243,7 @@ TEST(EventLogging) {
     CHECK_EQ(0, strcmp("V8.Test", last_event_message));
     CHECK_EQ(v8::LogEventStatus::kEnd, last_event_status);
     CHECK_EQ(++count, event_count);
-    }
+  }
   CHECK_EQ(0, strcmp("V8.Test", last_event_message));
   CHECK_EQ(v8::LogEventStatus::kEnd, last_event_status);
   CHECK_EQ(++count, event_count);
@@ -23799,28 +23857,6 @@ TEST(AllowJavascriptExecutionScope) {
   }
 }
 
-TEST(ThrowOnJavascriptExecution) {
-  LocalContext context;
-  v8::Isolate* isolate = context.isolate();
-  v8::HandleScope scope(isolate);
-  v8::TryCatch try_catch(isolate);
-  v8::Isolate::DisallowJavascriptExecutionScope throw_js(
-      isolate, v8::Isolate::DisallowJavascriptExecutionScope::THROW_ON_FAILURE);
-  CompileRun("1+1");
-  CHECK(try_catch.HasCaught());
-}
-
-TEST_WITH_PLATFORM(DumpOnJavascriptExecution, MockPlatform) {
-  LocalContext context;
-  v8::Isolate* isolate = context.isolate();
-  v8::HandleScope scope(isolate);
-  v8::Isolate::DisallowJavascriptExecutionScope throw_js(
-      isolate, v8::Isolate::DisallowJavascriptExecutionScope::DUMP_ON_FAILURE);
-  CHECK(!platform.dump_without_crashing_called());
-  CompileRun("1+1");
-  CHECK(platform.dump_without_crashing_called());
-}
-
 namespace {
 void TestMicrotaskCheckpointCallback(v8::Local<v8::Data> data) {
   int* count = GetData<int>(data);
@@ -23832,6 +23868,84 @@ void TestMicrotaskFunctionCallback(
   (*count)++;
 }
 }  // namespace
+
+TEST(ThrowOnJavascriptExecution) {
+  LocalContext context;
+  v8::Isolate* isolate = context.isolate();
+  v8::HandleScope scope(isolate);
+  int api_call_count = 0;
+  v8::Local<v8::Function> api_fn =
+      v8::Function::New(context.local(), TestMicrotaskFunctionCallback,
+                        MakeData(isolate, &api_call_count))
+          .ToLocalChecked();
+  v8::Local<v8::ObjectTemplate> templ = v8::ObjectTemplate::New(isolate);
+  templ->SetAccessorProperty(
+      v8_str("prop"),
+      v8::FunctionTemplate::New(isolate, TestMicrotaskFunctionCallback,
+                                MakeData(isolate, &api_call_count)));
+  v8::Local<v8::Object> obj =
+      templ->NewInstance(context.local()).ToLocalChecked();
+  v8::TryCatch try_catch(isolate);
+  v8::Isolate::DisallowJavascriptExecutionScope throw_js(
+      isolate, v8::Isolate::DisallowJavascriptExecutionScope::THROW_ON_FAILURE);
+  CompileRun("1+1");
+  CHECK(try_catch.HasCaught());
+  try_catch.Reset();
+  CHECK(api_fn->Call(context.local(), context->Global(), 0, nullptr).IsEmpty());
+  CHECK(try_catch.HasCaught());
+  try_catch.Reset();
+  CHECK(api_fn->NewInstance(context.local()).IsEmpty());
+  CHECK(try_catch.HasCaught());
+  try_catch.Reset();
+  CHECK(obj->Get(context.local(), v8_str("prop")).IsEmpty());
+  CHECK(try_catch.HasCaught());
+  CHECK_EQ(0, api_call_count);
+  CHECK(!templ->NewInstance(context.local()).IsEmpty());
+  CHECK(
+      !api_fn
+           ->NewInstanceWithSideEffectType(context.local(), 0, nullptr,
+                                           v8::SideEffectType::kHasNoSideEffect)
+           .IsEmpty());
+  CHECK_EQ(1, api_call_count);
+}
+
+TEST_WITH_PLATFORM(DumpOnJavascriptExecution, MockPlatform) {
+  LocalContext context;
+  v8::Isolate* isolate = context.isolate();
+  v8::HandleScope scope(isolate);
+  int api_call_count = 0;
+  v8::Local<v8::Function> js_fn =
+      v8::Local<v8::Function>::Cast(CompileRun("(function() {})"));
+  v8::Local<v8::Function> api_fn =
+      v8::Function::New(context.local(), TestMicrotaskFunctionCallback,
+                        MakeData(isolate, &api_call_count))
+          .ToLocalChecked();
+  v8::Local<v8::ObjectTemplate> templ = v8::ObjectTemplate::New(isolate);
+  templ->SetAccessorProperty(
+      v8_str("prop"),
+      v8::FunctionTemplate::New(isolate, TestMicrotaskFunctionCallback,
+                                MakeData(isolate, &api_call_count)));
+  v8::Local<v8::Object> obj =
+      templ->NewInstance(context.local()).ToLocalChecked();
+  v8::Isolate::DisallowJavascriptExecutionScope throw_js(
+      isolate, v8::Isolate::DisallowJavascriptExecutionScope::DUMP_ON_FAILURE);
+  CHECK(!platform.dump_without_crashing_called());
+  CompileRun("1+1");
+  CHECK(platform.dump_without_crashing_called());
+  CHECK(!js_fn->NewInstance(context.local()).IsEmpty());
+  CHECK(
+      !api_fn->Call(context.local(), context->Global(), 0, nullptr).IsEmpty());
+  CHECK(!api_fn->NewInstance(context.local()).IsEmpty());
+  CHECK(!obj->Get(context.local(), v8_str("prop")).IsEmpty());
+  CHECK_EQ(0, api_call_count);
+  CHECK(!templ->NewInstance(context.local()).IsEmpty());
+  CHECK(
+      !api_fn
+           ->NewInstanceWithSideEffectType(context.local(), 0, nullptr,
+                                           v8::SideEffectType::kHasNoSideEffect)
+           .IsEmpty());
+  CHECK_EQ(1, api_call_count);
+}
 
 TEST(MicrotaskCheckpointDisallowJavascriptExecutionScope) {
   LocalContext env;
@@ -24127,8 +24241,8 @@ TEST(ScriptPositionInfoWithLineEnds) {
   i::DirectHandle<i::Script> script1(i::Cast<i::Script>(obj->script()),
                                      i_isolate);
 
-  i::String::LineEndsVector line_ends =
-      i::Script::GetLineEnds(i_isolate, script1);
+  i::DisallowGarbageCollection no_gc;
+  i::String::LineEndsVector line_ends = script1->GetLineEnds(no_gc);
 
   i::Script::PositionInfo info;
 
@@ -24998,7 +25112,7 @@ TEST(StreamingWithHarmonyScopes) {
 
 namespace {
 void StreamingWithIsolateScriptCache(bool run_gc) {
-  i::v8_flags.expose_gc = true;
+  i::v8_flags.expose_gc.Set(true);
   const char* chunks[] = {"'use strict'; (function test() { return 13; })",
                           nullptr};
   const char* full_source = chunks[0];
@@ -25388,7 +25502,7 @@ TEST(CreateSyntheticModuleGC) {
   // happening during its execution.
   i::HeapAllocator::SetAllocationGcInterval(10);
 #endif
-  i::v8_flags.inline_new = false;
+  i::v8_flags.inline_new.Set(false);
 
   LocalContext env;
   v8::Isolate* isolate = env.isolate();
@@ -26269,7 +26383,7 @@ TEST(StreamingMagicCommentOutsideOfFullSource) {
 // magic comment value (e.g. an inline source map) must not be copied onto the
 // heap.
 UNINITIALIZED_TEST(HugeMagicCommentValueDoesNotOOM) {
-  i::v8_flags.stress_concurrent_allocation = false;
+  i::v8_flags.stress_concurrent_allocation.Set(false);
   v8::Isolate::CreateParams create_params;
   create_params.array_buffer_allocator = CcTest::array_buffer_allocator();
   create_params.constraints.set_max_old_generation_size_in_bytes(16 * i::MB);
@@ -26418,19 +26532,33 @@ THREADED_TEST(TestGetCurrentHostDefinedOptions) {
 TEST(NewStringRangeError) {
   // This test uses a lot of memory and fails with flaky OOM when run
   // with --stress-incremental-marking on TSAN.
-  i::v8_flags.stress_incremental_marking = false;
+  i::v8_flags.stress_incremental_marking.Set(false);
   v8::Isolate* isolate = CcTest::isolate();
   v8::HandleScope handle_scope(isolate);
   const int length = i::String::kMaxLength + 1;
-  const int buffer_size = length * sizeof(uint16_t);
+  const size_t buffer_size = static_cast<size_t>(length + 1) * sizeof(uint16_t);
   void* buffer = malloc(buffer_size);
   if (buffer == nullptr) return;
   memset(buffer, 'A', buffer_size);
   {
     v8::TryCatch try_catch(isolate);
+    uint16_t* data = reinterpret_cast<uint16_t*>(buffer);
+    data[length] = 0;
+    CHECK(v8::String::NewFromTwoByte(isolate, data, v8::NewStringType::kNormal,
+                                     length)
+              .IsEmpty());
+    CHECK(v8::String::NewFromTwoByte(isolate, data, v8::NewStringType::kNormal)
+              .IsEmpty());
+    CHECK(!try_catch.HasCaught());
+  }
+  reinterpret_cast<char*>(buffer)[length] = '\0';
+  {
+    v8::TryCatch try_catch(isolate);
     char* data = reinterpret_cast<char*>(buffer);
     CHECK(v8::String::NewFromUtf8(isolate, data, v8::NewStringType::kNormal,
                                   length)
+              .IsEmpty());
+    CHECK(v8::String::NewFromUtf8(isolate, data, v8::NewStringType::kNormal)
               .IsEmpty());
     CHECK(!try_catch.HasCaught());
   }
@@ -26440,13 +26568,7 @@ TEST(NewStringRangeError) {
     CHECK(v8::String::NewFromOneByte(isolate, data, v8::NewStringType::kNormal,
                                      length)
               .IsEmpty());
-    CHECK(!try_catch.HasCaught());
-  }
-  {
-    v8::TryCatch try_catch(isolate);
-    uint16_t* data = reinterpret_cast<uint16_t*>(buffer);
-    CHECK(v8::String::NewFromTwoByte(isolate, data, v8::NewStringType::kNormal,
-                                     length)
+    CHECK(v8::String::NewFromOneByte(isolate, data, v8::NewStringType::kNormal)
               .IsEmpty());
     CHECK(!try_catch.HasCaught());
   }
@@ -26550,6 +26672,50 @@ TEST(Map) {
   CHECK_EQ(0U, map->Size());
 }
 
+TEST(MapGetNoContext) {
+  v8::Isolate* isolate = CcTest::isolate();
+  v8::HandleScope handle_scope(isolate);
+  LocalContext env;
+  v8::Local<v8::Context> context = env.local();
+
+  v8::Local<v8::Map> map = v8::Map::New(isolate);
+  v8::Local<v8::Object> object_key = v8::Object::New(isolate);
+  v8::Local<v8::Object> undefined_key = v8::Object::New(isolate);
+  v8::Local<v8::Value> value = v8::Object::New(isolate);
+  map->Set(context, object_key, value).ToLocalChecked();
+  map->Set(context, v8::Integer::New(isolate, 1), value).ToLocalChecked();
+  map->Set(context, undefined_key, v8::Undefined(isolate)).ToLocalChecked();
+  map->Set(context, v8_str("a long string key"), value).ToLocalChecked();
+  v8::Local<v8::String> string_key = v8_str("a long string key");
+
+  context->Exit();
+  CHECK(!isolate->InContext());
+
+  bool found = false;
+  CHECK(map->Get(object_key, &found)->StrictEquals(value));
+  CHECK(found);
+
+  found = false;
+  CHECK(map->Get(v8::Integer::New(isolate, 1), &found)->StrictEquals(value));
+  CHECK(found);
+
+  found = true;
+  v8::Local<v8::Value> missing = map->Get(v8::Integer::New(isolate, 2), &found);
+  CHECK(missing->IsUndefined());
+  CHECK(!found);
+
+  found = false;
+  CHECK(map->Get(undefined_key, &found)->IsUndefined());
+  CHECK(found);
+
+  // The lookup has to compute the hash of an equal but unhashed string.
+  CHECK(!v8::Utils::OpenDirectHandle(*string_key)->HasHashCode());
+  found = false;
+  CHECK(map->Get(string_key, &found)->StrictEquals(value));
+  CHECK(found);
+
+  context->Enter();
+}
 
 TEST(Set) {
   v8::Isolate* isolate = CcTest::isolate();
@@ -26808,7 +26974,7 @@ TEST(AbortOnUncaughtExceptionNoAbort) {
       v8::ObjectTemplate::New(isolate);
   LocalContext env(nullptr, global_template);
 
-  i::v8_flags.abort_on_uncaught_exception = true;
+  i::v8_flags.abort_on_uncaught_exception.Set(true);
   isolate->SetAbortOnUncaughtExceptionCallback(NoAbortOnUncaughtException);
 
   CompileRun("function boom() { throw new Error(\"boom\") }");
@@ -27584,7 +27750,7 @@ TEST(DeterministicRandomNumberGeneration) {
   v8::HandleScope scope(CcTest::isolate());
 
   int previous_seed = i::v8_flags.random_seed;
-  i::v8_flags.random_seed = 1234;
+  i::v8_flags.random_seed.Set(1234);
 
   double first_value;
   double second_value;
@@ -27602,7 +27768,7 @@ TEST(DeterministicRandomNumberGeneration) {
   }
   CHECK_EQ(first_value, second_value);
 
-  i::v8_flags.random_seed = previous_seed;
+  i::v8_flags.random_seed.Set(previous_seed);
 }
 
 UNINITIALIZED_TEST(ResizableArrayBuffer_OutlivesScope) {
@@ -28322,7 +28488,7 @@ TEST(PersistentValueMap) {
 namespace v8::internal::wasm {
 
 TEST(WasmCodeFlushingOnMemoryPressure) {
-  i::v8_flags.flush_liftoff_code = true;
+  i::v8_flags.flush_liftoff_code.Set(true);
   WasmRunner<int32_t> r(TestExecutionTier::kLiftoff);
   r.Build({WASM_I32_ADD(WASM_I32V_1(11), WASM_I32V_1(44))});
   CHECK_EQ(55, r.Call());
@@ -28991,14 +29157,14 @@ void CallIsolate2(const v8::FunctionCallbackInfo<v8::Value>& info) {
 
 UNINITIALIZED_TEST(NestedIsolates) {
 #ifdef VERIFY_HEAP
-  i::v8_flags.verify_heap = true;
+  i::v8_flags.verify_heap.Set(true);
 #endif  // VERIFY_HEAP
   // Create two isolates and set up C++ functions via function templates that
   // call into the other isolate. Recurse a few times, trigger GC along the way,
   // and finally capture a stack trace. Check that the stack trace only includes
   // frames from its own isolate.
-  i::v8_flags.stack_trace_limit = 20;
-  i::v8_flags.experimental_stack_trace_frames = true;
+  i::v8_flags.stack_trace_limit.Set(20);
+  i::v8_flags.experimental_stack_trace_frames.Set(true);
   v8::Isolate::CreateParams create_params = CreateTestParams();
   isolate_1 = v8::Isolate::New(create_params);
   isolate_2 = v8::Isolate::New(create_params);
@@ -29889,10 +30055,10 @@ void FastApiCallWithAllocationAndGC(AllocationChecker::GCLocation gc_location) {
   if (i::v8_flags.jitless) return;
   if (i::v8_flags.disable_optimizing_compilers) return;
 
-  i::v8_flags.turbofan = true;
-  i::v8_flags.turbo_fast_api_calls = true;
-  i::v8_flags.allow_natives_syntax = true;
-  i::v8_flags.expose_gc = true;
+  i::v8_flags.turbofan.Set(true);
+  i::v8_flags.turbo_fast_api_calls.Set(true);
+  i::v8_flags.allow_natives_syntax.Set(true);
+  i::v8_flags.expose_gc.Set(true);
   i::FlagList::EnforceFlagImplications();
 
   CcTest::InitializeVM();
@@ -29931,9 +30097,9 @@ TEST(FastApiCallWithThrowInReentrantCode) {
   if (i::v8_flags.jitless) return;
   if (i::v8_flags.disable_optimizing_compilers) return;
 
-  i::v8_flags.turbofan = true;
-  i::v8_flags.turbo_fast_api_calls = true;
-  i::v8_flags.allow_natives_syntax = true;
+  i::v8_flags.turbofan.Set(true);
+  i::v8_flags.turbo_fast_api_calls.Set(true);
+  i::v8_flags.allow_natives_syntax.Set(true);
   i::FlagList::EnforceFlagImplications();
 
   CcTest::InitializeVM();
@@ -30036,9 +30202,9 @@ void FastApiCallRecursion(bool inner_most_throws) {
   if (i::v8_flags.jitless) return;
   if (i::v8_flags.disable_optimizing_compilers) return;
 
-  i::v8_flags.turbofan = true;
-  i::v8_flags.turbo_fast_api_calls = true;
-  i::v8_flags.allow_natives_syntax = true;
+  i::v8_flags.turbofan.Set(true);
+  i::v8_flags.turbo_fast_api_calls.Set(true);
+  i::v8_flags.allow_natives_syntax.Set(true);
   i::FlagList::EnforceFlagImplications();
 
   CcTest::InitializeVM();
@@ -30128,9 +30294,9 @@ TEST(FastApiStackSlot) {
   if (i::v8_flags.jitless) return;
   if (i::v8_flags.disable_optimizing_compilers) return;
 
-  i::v8_flags.turbofan = true;
-  i::v8_flags.turbo_fast_api_calls = true;
-  i::v8_flags.allow_natives_syntax = true;
+  i::v8_flags.turbofan.Set(true);
+  i::v8_flags.turbo_fast_api_calls.Set(true);
+  i::v8_flags.allow_natives_syntax.Set(true);
   i::FlagList::EnforceFlagImplications();
 
   v8::Isolate* isolate = CcTest::isolate();
@@ -30176,10 +30342,10 @@ TEST(FastApiCalls) {
   if (i::v8_flags.jitless) return;
   if (i::v8_flags.disable_optimizing_compilers) return;
 
-  i::v8_flags.turbofan = true;
-  i::v8_flags.turbo_fast_api_calls = true;
-  i::v8_flags.allow_natives_syntax = true;
-  i::v8_flags.fast_api_allow_float_in_sim = true;
+  i::v8_flags.turbofan.Set(true);
+  i::v8_flags.turbo_fast_api_calls.Set(true);
+  i::v8_flags.allow_natives_syntax.Set(true);
+  i::v8_flags.fast_api_allow_float_in_sim.Set(true);
   i::FlagList::EnforceFlagImplications();
 
   CcTest::InitializeVM();
@@ -30749,10 +30915,10 @@ TEST(FastApiCallsString) {
   if (i::v8_flags.jitless) return;
   if (i::v8_flags.disable_optimizing_compilers) return;
 
-  i::v8_flags.turbofan = true;
-  i::v8_flags.turbo_fast_api_calls = true;
-  i::v8_flags.allow_natives_syntax = true;
-  i::v8_flags.fast_api_allow_float_in_sim = true;
+  i::v8_flags.turbofan.Set(true);
+  i::v8_flags.turbo_fast_api_calls.Set(true);
+  i::v8_flags.allow_natives_syntax.Set(true);
+  i::v8_flags.fast_api_allow_float_in_sim.Set(true);
   i::FlagList::EnforceFlagImplications();
 
   CcTest::InitializeVM();
@@ -30869,11 +31035,11 @@ TEST(FastApiCallsFromWasm) {
   if (i::v8_flags.jitless) return;
   if (i::v8_flags.disable_optimizing_compilers) return;
 
-  i::v8_flags.liftoff = false;
-  i::v8_flags.wasm_fast_api = true;
-  i::v8_flags.turbo_fast_api_calls = true;
-  i::v8_flags.wasm_lazy_compilation = true;
-  i::v8_flags.fast_api_allow_float_in_sim = true;
+  i::v8_flags.liftoff.Set(false);
+  i::v8_flags.wasm_fast_api.Set(true);
+  i::v8_flags.turbo_fast_api_calls.Set(true);
+  i::v8_flags.wasm_lazy_compilation.Set(true);
+  i::v8_flags.fast_api_allow_float_in_sim.Set(true);
   i::FlagList::EnforceFlagImplications();
 
   CcTest::InitializeVM();
@@ -31022,7 +31188,7 @@ TEST(TriggerDelayedMainThreadMetricsEvent) {
   using v8::Context;
   using v8::Local;
   using v8::MaybeLocal;
-  i::v8_flags.stress_concurrent_allocation = false;
+  i::v8_flags.stress_concurrent_allocation.Set(false);
 
   // Set up isolate and context.
   v8::Isolate* iso = CcTest::isolate();
@@ -31548,30 +31714,30 @@ TEST(TestSetSabConstructorEnabledCallback) {
       v8::Utils::OpenDirectHandle(*context);
 
   // No callback
-  i::v8_flags.enable_sharedarraybuffer_per_context = false;
+  i::v8_flags.enable_sharedarraybuffer_per_context.Set(false);
   CHECK(i_isolate->IsSharedArrayBufferConstructorEnabled(i_context));
 
-  i::v8_flags.enable_sharedarraybuffer_per_context = true;
+  i::v8_flags.enable_sharedarraybuffer_per_context.Set(true);
   CHECK(!i_isolate->IsSharedArrayBufferConstructorEnabled(i_context));
 
   // Callback returns false
   isolate->SetSharedArrayBufferConstructorEnabledCallback(
       MockSabConstructorDisabledCallback);
 
-  i::v8_flags.enable_sharedarraybuffer_per_context = false;
+  i::v8_flags.enable_sharedarraybuffer_per_context.Set(false);
   CHECK(i_isolate->IsSharedArrayBufferConstructorEnabled(i_context));
 
-  i::v8_flags.enable_sharedarraybuffer_per_context = true;
+  i::v8_flags.enable_sharedarraybuffer_per_context.Set(true);
   CHECK(!i_isolate->IsSharedArrayBufferConstructorEnabled(i_context));
 
   // Callback returns true
   isolate->SetSharedArrayBufferConstructorEnabledCallback(
       MockSabConstructorEnabledCallback);
 
-  i::v8_flags.enable_sharedarraybuffer_per_context = false;
+  i::v8_flags.enable_sharedarraybuffer_per_context.Set(false);
   CHECK(i_isolate->IsSharedArrayBufferConstructorEnabled(i_context));
 
-  i::v8_flags.enable_sharedarraybuffer_per_context = true;
+  i::v8_flags.enable_sharedarraybuffer_per_context.Set(true);
   CHECK(i_isolate->IsSharedArrayBufferConstructorEnabled(i_context));
 }
 
@@ -32617,17 +32783,6 @@ TEST(LocalCasts) {
   }
 }
 
-class TestGarbagedCollectedData
-    : public cppgc::GarbageCollected<TestGarbagedCollectedData> {
- public:
-  void MarkUsed() { was_used_ = true; }
-  bool was_used() const { return was_used_; }
-  void Trace(cppgc::Visitor*) const {}
-
- private:
-  bool was_used_ = false;
-};
-
 void ReadCppHeapExternalCallback(
     const v8::FunctionCallbackInfo<v8::Value>& info) {
   v8::Local<v8::Data> data = info.DataV2();
@@ -32646,6 +32801,31 @@ void ReadCppHeapExternalPropertyCallback(
   v8::Local<v8::CppHeapExternal>::Cast(data)
       ->Value<TestGarbagedCollectedData>(
           info.GetIsolate(),
+          v8::CppHeapPointerTagRange(i::kTagForTesting, i::kTagForTesting))
+      ->MarkUsed();
+}
+
+v8::Intercepted ReadCppHeapExternalNamedGetterCallback(
+    v8::Local<v8::Name>, const v8::PropertyCallbackInfo<v8::Value>& info) {
+  ReadCppHeapExternalPropertyCallback(v8::Local<v8::Name>(), info);
+  info.GetReturnValue().Set(v8_num(42));
+  return v8::Intercepted::kYes;
+}
+
+v8::Intercepted ReadCppHeapExternalIndexedGetterCallback(
+    uint32_t, const v8::PropertyCallbackInfo<v8::Value>& info) {
+  ReadCppHeapExternalPropertyCallback(v8::Local<v8::Name>(), info);
+  info.GetReturnValue().Set(v8_num(42));
+  return v8::Intercepted::kYes;
+}
+
+void ReadCppHeapExternalFastCallback(v8::Local<v8::Object> receiver,
+                                     v8::FastApiCallbackOptions& options) {
+  v8::Local<v8::Data> data = options.DataV2();
+  CHECK(data->IsCppHeapExternal());
+  v8::Local<v8::CppHeapExternal>::Cast(data)
+      ->Value<TestGarbagedCollectedData>(
+          options.isolate,
           v8::CppHeapPointerTagRange(i::kTagForTesting, i::kTagForTesting))
       ->MarkUsed();
 }
@@ -32899,6 +33079,9 @@ TEST(FunctionTemplateCallbackDataV2_CppHeapExternal) {
   {
     LocalContext env(isolate);
     v8::Global<v8::Function> function;
+    v8::Global<v8::Function> cached_function;
+    v8::Global<v8::Function> overloaded_function;
+    v8::Global<v8::Object> callable_object;
     cppgc::WeakPersistent<TestGarbagedCollectedData> cpp_object(
         cppgc::MakeGarbageCollected<TestGarbagedCollectedData>(
             cpp_heap->GetAllocationHandle()));
@@ -32909,11 +33092,38 @@ TEST(FunctionTemplateCallbackDataV2_CppHeapExternal) {
           v8::CppHeapExternal::New<TestGarbagedCollectedData>(
               isolate, cpp_object.Get(), i::kTagForTesting);
       v8::Local<v8::FunctionTemplate> function_template =
-          v8::FunctionTemplate::New(isolate);
-      function_template->SetCallHandler(ReadCppHeapExternalCallback, external);
+          v8::FunctionTemplate::New(isolate, ReadCppHeapExternalCallback,
+                                    external);
       function.Reset(
           isolate,
           function_template->GetFunction(env.local()).ToLocalChecked());
+      v8::Local<v8::FunctionTemplate> cached_function_template =
+          v8::FunctionTemplate::NewWithCache(
+              isolate, ReadCppHeapExternalCallback, v8::Private::New(isolate),
+              external);
+      cached_function.Reset(
+          isolate,
+          cached_function_template->GetFunction(env.local()).ToLocalChecked());
+
+      static const v8::CFunction c_func =
+          v8::CFunction::Make(ReadCppHeapExternalFastCallback);
+      static const v8::CFunction c_function_overloads[] = {c_func};
+      v8::Local<v8::FunctionTemplate> overloaded_template =
+          v8::FunctionTemplate::NewWithCFunctionOverloads(
+              isolate, ReadCppHeapExternalCallback, external,
+              v8::Local<v8::Signature>(), 0, v8::ConstructorBehavior::kThrow,
+              v8::SideEffectType::kHasSideEffect, {c_function_overloads, 1});
+      overloaded_function.Reset(
+          isolate,
+          overloaded_template->GetFunction(env.local()).ToLocalChecked());
+
+      v8::Local<v8::ObjectTemplate> callable_template =
+          v8::ObjectTemplate::New(isolate);
+      callable_template->SetCallAsFunctionHandler(ReadCppHeapExternalCallback,
+                                                  external);
+      callable_object.Reset(
+          isolate,
+          callable_template->NewInstance(env.local()).ToLocalChecked());
     }
 
     {
@@ -32929,9 +33139,22 @@ TEST(FunctionTemplateCallbackDataV2_CppHeapExternal) {
       CHECK(!function.Get(isolate)
                  ->Call(env.local(), v8::Undefined(isolate), 0, nullptr)
                  .IsEmpty());
+      CHECK(!cached_function.Get(isolate)
+                 ->Call(env.local(), v8::Undefined(isolate), 0, nullptr)
+                 .IsEmpty());
+      CHECK(!overloaded_function.Get(isolate)
+                 ->Call(env.local(), v8::Undefined(isolate), 0, nullptr)
+                 .IsEmpty());
+      CHECK(
+          !callable_object.Get(isolate)
+               ->CallAsFunction(env.local(), v8::Undefined(isolate), 0, nullptr)
+               .IsEmpty());
     }
-    CHECK(cpp_object->was_used());
+    CHECK_EQ(4, cpp_object->use_count());
     function.Reset();
+    cached_function.Reset();
+    overloaded_function.Reset();
+    callable_object.Reset();
   }
 
   isolate->Exit();
@@ -32952,6 +33175,7 @@ TEST(PropertyCallbackInfoDataV2_CppHeapExternal) {
   {
     LocalContext env(isolate);
     v8::Global<v8::Object> object;
+    v8::Global<v8::Object> template_object;
     cppgc::WeakPersistent<TestGarbagedCollectedData> cpp_object(
         cppgc::MakeGarbageCollected<TestGarbagedCollectedData>(
             cpp_heap->GetAllocationHandle()));
@@ -32959,25 +33183,35 @@ TEST(PropertyCallbackInfoDataV2_CppHeapExternal) {
     {
       v8::HandleScope scope(isolate);
       v8::Local<v8::Name> name = v8_str("property");
+      v8::Local<v8::Name> lazy_name = v8_str("lazy_property");
       v8::Local<v8::Object> local_object = v8::Object::New(isolate);
-      CHECK(local_object
-                ->SetNativeDataProperty(env.local(), name,
-                                        ReadCppHeapExternalPropertyCallback)
-                .FromJust());
-
       v8::Local<v8::CppHeapExternal> external =
           v8::CppHeapExternal::New<TestGarbagedCollectedData>(
               isolate, cpp_object.Get(), i::kTagForTesting);
-      // Keep producer inputs Value-typed until the output migration completes.
-      i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(isolate);
-      i::LookupIterator it(i_isolate,
-                           v8::Utils::OpenDirectHandle(*local_object),
-                           v8::Utils::OpenDirectHandle(*name),
-                           i::LookupIterator::OWN_SKIP_INTERCEPTOR);
-      CHECK_EQ(i::LookupIterator::ACCESSOR, it.state());
-      i::Cast<i::AccessorInfo>(it.GetAccessors())
-          ->set_data(*v8::Utils::OpenDirectHandle(*external));
+      CHECK(local_object
+                ->SetNativeDataProperty(env.local(), name,
+                                        ReadCppHeapExternalPropertyCallback,
+                                        nullptr, external)
+                .FromJust());
+      CHECK(local_object
+                ->SetLazyDataProperty(env.local(), lazy_name,
+                                      ReadCppHeapExternalPropertyCallback,
+                                      external)
+                .FromJust());
       object.Reset(isolate, local_object);
+
+      v8::Local<v8::ObjectTemplate> object_template =
+          v8::ObjectTemplate::New(isolate);
+      object_template->SetNativeDataProperty(
+          name, ReadCppHeapExternalPropertyCallback, nullptr, external);
+      object_template->SetHandler(v8::NamedPropertyHandlerConfiguration(
+          ReadCppHeapExternalNamedGetterCallback, nullptr, nullptr, nullptr,
+          nullptr, external, v8::PropertyHandlerFlags::kNonMasking));
+      object_template->SetHandler(v8::IndexedPropertyHandlerConfiguration(
+          ReadCppHeapExternalIndexedGetterCallback, nullptr, nullptr, nullptr,
+          nullptr, external));
+      template_object.Reset(
+          isolate, object_template->NewInstance(env.local()).ToLocalChecked());
     }
 
     {
@@ -32992,9 +33226,20 @@ TEST(PropertyCallbackInfoDataV2_CppHeapExternal) {
       v8::HandleScope scope(isolate);
       CHECK(
           !object.Get(isolate)->Get(env.local(), v8_str("property")).IsEmpty());
+      CHECK(!object.Get(isolate)
+                 ->Get(env.local(), v8_str("lazy_property"))
+                 .IsEmpty());
+      CHECK(!template_object.Get(isolate)
+                 ->Get(env.local(), v8_str("property"))
+                 .IsEmpty());
+      CHECK(!template_object.Get(isolate)
+                 ->Get(env.local(), v8_str("intercepted"))
+                 .IsEmpty());
+      CHECK(!template_object.Get(isolate)->Get(env.local(), 0).IsEmpty());
     }
-    CHECK(cpp_object->was_used());
+    CHECK_EQ(5, cpp_object->use_count());
     object.Reset();
+    template_object.Reset();
   }
 
   isolate->Exit();
@@ -33026,9 +33271,9 @@ TEST(MaglevFastProxyCheckTrapResultLazyDeopt) {
   if (i::v8_flags.disable_optimizing_compilers) return;
   if (!i::v8_flags.maglev) return;
 
-  i::v8_flags.allow_natives_syntax = true;
-  i::v8_flags.fast_proxy_ic = true;
-  i::v8_flags.optimize_on_next_call_optimizes_to_maglev = true;
+  i::v8_flags.allow_natives_syntax.Set(true);
+  i::v8_flags.fast_proxy_ic.Set(true);
+  i::v8_flags.optimize_on_next_call_optimizes_to_maglev.Set(true);
 
   LocalContext env;
   v8::Isolate* isolate = env.isolate();

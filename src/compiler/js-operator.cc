@@ -788,11 +788,13 @@ ForInParameters const& ForInParametersOf(const Operator* op) {
 #if V8_ENABLE_WEBASSEMBLY
 JSWasmCallParameters::JSWasmCallParameters(
     wasm::NativeModule* native_module, int function_index,
-    SharedFunctionInfoRef shared_fct_info, FeedbackSource const& feedback)
+    SharedFunctionInfoRef shared_fct_info, FeedbackSource const& feedback,
+    IndirectHandle<WasmInternalFunction> internal_function)
     : native_module_(native_module),
       function_index_(function_index),
       shared_fct_info_(shared_fct_info),
-      feedback_(feedback) {}
+      feedback_(feedback),
+      internal_function_(internal_function) {}
 
 JSWasmCallParameters const& JSWasmCallParametersOf(const Operator* op) {
   DCHECK_EQ(IrOpcode::kJSWasmCall, op->opcode());
@@ -1584,7 +1586,7 @@ const Operator* JSOperatorBuilder::GetTemplateObject(
   GetTemplateObjectParameters parameters(description, shared, feedback);
   return zone()->New<Operator1<GetTemplateObjectParameters>>(  // --
       IrOpcode::kJSGetTemplateObject,                          // opcode
-      Operator::kNoDeopt | Operator::kNoThrow,                 // properties
+      Operator::kNoThrow,                                      // properties
       "JSGetTemplateObject",                                   // name
       1, 1, 1, 1, 1, 0,                                        // counts
       parameters);                                             // parameter

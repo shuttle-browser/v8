@@ -56,14 +56,19 @@ inline MemOperand GetInstanceDataOperand() {
 inline Register CalculateActualAddress(LiftoffAssembler* lasm,
                                        UseScratchRegisterScope& temps,
                                        Register addr_reg, Register offset_reg,
-                                       uintptr_t offset_imm) {
+                                       uintptr_t offset_imm, bool i64_offset) {
   DCHECK_NE(addr_reg, no_reg);
   if (offset_reg == no_reg && offset_imm == 0) return addr_reg;
   Register result = temps.Acquire();
   if (offset_reg == no_reg) {
     lasm->Add_d(result, addr_reg, Operand(offset_imm));
   } else {
-    lasm->Add_d(result, addr_reg, Operand(offset_reg));
+    if (i64_offset) {
+      lasm->Add_d(result, addr_reg, Operand(offset_reg));
+    } else {
+      lasm->Bstrpick_d(result, offset_reg, 31, 0);
+      lasm->Add_d(result, addr_reg, Operand(result));
+    }
     if (offset_imm != 0) lasm->Add_d(result, result, Operand(offset_imm));
   }
   return result;
@@ -160,9 +165,8 @@ inline void Store(LiftoffAssembler* assm, Register base, int32_t offset,
 inline void push(LiftoffAssembler* assm, LiftoffRegister reg, ValueKind kind) {
   switch (kind) {
     case kI32:
-      assm->addi_d(sp, sp, -kSystemPointerSize);
-      assm->St_w(reg.gp(), MemOperand(sp, 0));
-      break;
+      // Store the entire (sign-extended) register, clearing any old data in the
+      // upper half—rather than storing only the lower 4 bytes.
     case kI64:
     case kRefNull:
     case kRef:
@@ -955,19 +959,6 @@ ATOMIC_BINOP_CASE(And, And, And, and)
 ATOMIC_BINOP_CASE(Or, Or, Or, or)
 ATOMIC_BINOP_CASE(Xor, Xor, Xor, xor)
 
-#define ASSEMBLE_ATOMIC_BINOP(load_linked, store_conditional, bin_instr) \
-  do {                                                                   \
-    Label binop;                                                         \
-    dbar(0);                                                             \
-    bind(&binop);                                                        \
-    load_linked(result.gp(), MemOperand(temp0, 0),                       \
-                reinterpret_cast<int*>(trapping_load_pc));               \
-    bin_instr(temp1, result.gp(), Operand(value.gp()));                  \
-    store_conditional(temp1, MemOperand(temp0, 0));                      \
-    BranchShort(&binop, eq, temp1, Operand(zero_reg));                   \
-    dbar(0);                                                             \
-  } while (0)
-
 void LiftoffAssembler::AtomicSub(Register dst_addr, Register offset_reg,
                                  uintptr_t offset_imm, LiftoffRegister value,
                                  LiftoffRegister result, StoreType type,
@@ -1003,10 +994,14 @@ void LiftoffAssembler::AtomicSub(Register dst_addr, Register offset_reg,
       ASSEMBLE_ATOMIC_BINOP_EXT(Ll_d, Sc_d, 32, Sub_d, 7);
       break;
     case StoreType::kI32Store:
-      ASSEMBLE_ATOMIC_BINOP(Ll_w, Sc_w, Sub_w);
+      Sub_w(temp2, zero_reg, value.gp());
+      if (trapping_load_pc) *trapping_load_pc = pc_offset();
+      amadd_db_w(result.gp(), temp2, temp0);
       break;
     case StoreType::kI64Store:
-      ASSEMBLE_ATOMIC_BINOP(Ll_d, Sc_d, Sub_d);
+      Sub_d(temp2, zero_reg, value.gp());
+      if (trapping_load_pc) *trapping_load_pc = pc_offset();
+      amadd_db_d(result.gp(), temp2, temp0);
       break;
     default:
       UNREACHABLE();
@@ -1016,7 +1011,6 @@ void LiftoffAssembler::AtomicSub(Register dst_addr, Register offset_reg,
                                                             buffer_start_))
                      ->IsLoad());
 }
-#undef ASSEMBLE_ATOMIC_BINOP
 #undef ASSEMBLE_ATOMIC_BINOP_EXT
 #undef ATOMIC_BINOP_CASE
 
@@ -1097,7 +1091,7 @@ void LiftoffAssembler::AtomicExchangeTaggedPointer(
   {
     UseScratchRegisterScope temps(this);
     Register actual_addr = liftoff::CalculateActualAddress(
-        this, temps, dst_addr, offset_reg, offset_imm);
+        this, temps, dst_addr, offset_reg, offset_imm, false);
     if (trapping_load_pc) *trapping_load_pc = pc_offset();
     if constexpr (COMPRESS_POINTERS_BOOL) {
       amswap_db_w(result.gp(), value.gp(), actual_addr);
@@ -1309,6 +1303,12 @@ void LiftoffAssembler::StoreCallerFrameSlot(LiftoffRegister src,
                                             uint32_t caller_slot_idx,
                                             ValueKind kind) {
   int32_t offset = kSystemPointerSize * (caller_slot_idx + 1);
+  if (kind == kI32) {
+    // Store the full (sign-extended) register, matching liftoff::push, so
+    // that the caller-frame slot is fully initialized.
+    St_d(src.gp(), MemOperand(fp, offset));
+    return;
+  }
   liftoff::Store(this, fp, offset, src, kind);
 }
 
@@ -2468,20 +2468,19 @@ void LiftoffAssembler::LoadTransform(LiftoffRegister dst, Register src_addr,
   MachineType memtype = type.mem_type();
 
   if (transform == LoadTransformationKind::kExtend) {
-    Ld_d(scratch, src_op, reinterpret_cast<int*>(trapping_load_pc));
-    vreplgr2vr_d(kSimd128ScratchReg, scratch);
+    Fld_d(dst.fp(), src_op, reinterpret_cast<int*>(trapping_load_pc));
     if (memtype == MachineType::Int8()) {
-      vexth_h_b(dstReg, kSimd128ScratchReg);
+      vsllwil_h_b(dstReg, dstReg, 0);
     } else if (memtype == MachineType::Uint8()) {
-      vexth_hu_bu(dstReg, kSimd128ScratchReg);
+      vsllwil_hu_bu(dstReg, dstReg, 0);
     } else if (memtype == MachineType::Int16()) {
-      vexth_w_h(dstReg, kSimd128ScratchReg);
+      vsllwil_w_h(dstReg, dstReg, 0);
     } else if (memtype == MachineType::Uint16()) {
-      vexth_wu_hu(dstReg, kSimd128ScratchReg);
+      vsllwil_wu_hu(dstReg, dstReg, 0);
     } else if (memtype == MachineType::Int32()) {
-      vexth_d_w(dstReg, kSimd128ScratchReg);
+      vsllwil_d_w(dstReg, dstReg, 0);
     } else if (memtype == MachineType::Uint32()) {
-      vexth_du_wu(dstReg, kSimd128ScratchReg);
+      vsllwil_du_wu(dstReg, dstReg, 0);
     }
   } else if (transform == LoadTransformationKind::kZeroExtend) {
     vxor_v(dstReg, dstReg, dstReg);
@@ -4493,9 +4492,18 @@ void LiftoffStackSlots::Construct(int param_slots) {
     switch (src.loc()) {
       case LiftoffAssembler::VarState::kStack:
         if (src.kind() != kS128) {
+          UseScratchRegisterScope temps(asm_);
+          Register temp = temps.Acquire();
           asm_->AllocateStackSpace(stack_decrement - kSystemPointerSize);
-          asm_->Ld_d(kScratchReg, liftoff::GetStackSlot(slot.src_offset_));
-          asm_->Push(kScratchReg);
+          if (src.kind() == kI32) {
+            // Spill() only writes the low 4 bytes of an i32 spill slot, so the
+            // upper 4 bytes are stale. Load with sign extension so that the
+            // pushed 8-byte argument slot holds a canonical i32.
+            asm_->Ld_w(temp, liftoff::GetStackSlot(slot.src_offset_));
+          } else {
+            asm_->Ld_d(temp, liftoff::GetStackSlot(slot.src_offset_));
+          }
+          asm_->Push(temp);
         } else {
           asm_->AllocateStackSpace(stack_decrement - kSimd128Size);
           asm_->Vld(kScratchDoubleReg.toV(),

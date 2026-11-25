@@ -1284,8 +1284,8 @@ HeapEntry* V8HeapExplorer::AddEntry(Tagged<HeapObject> object) {
       const char* tag_name = ToString(tag);
       name = names_->GetFormatted("system / Managed (%s)", tag_name);
     } else if (kAnyForeignExternalPointerTagRange.Contains(tag)) {
-      // Only sandbox configurations set tags properly, so we cannot CHECK here
-      // but merely improve the tag if present.
+      // Only pointer-compression configurations set tags properly, so we cannot
+      // CHECK here but merely improve the tag if present.
       const char* tag_name = ToString(tag);
       name = names_->GetFormatted("system / Foreign (%s)", tag_name);
     }
@@ -1431,8 +1431,8 @@ void V8HeapExplorer::PopulateLineEnds() {
   }
 
   for (auto& script : scripts) {
-    snapshot_->AddScriptLineEnds(script->id(),
-                                 Script::GetLineEnds(isolate(), script));
+    DisallowGarbageCollection no_gc;
+    snapshot_->AddScriptLineEnds(script->id(), script->GetLineEnds(no_gc));
   }
 }
 
@@ -1909,6 +1909,7 @@ void V8HeapExplorer::ExtractStringReferences(HeapEntry* entry,
                          offsetof(ThinString, actual_));
   } else if (IsExternalString(string)) {
     Tagged<ExternalString> es = Cast<ExternalString>(string);
+    generator_->GetCppHeapWrappers().insert(es);
     if (const v8::String::ExternalStringResourceBase* resource =
             GetExternalStringResource(es)) {
       ExternalStringRecorder recorder(entry, this, generator_, names_);
@@ -2285,8 +2286,6 @@ void V8HeapExplorer::ExtractScriptReferences(HeapEntry* entry,
   SetInternalReference(entry, "source", script->source(),
                        offsetof(Script, source_));
   SetInternalReference(entry, "name", script->name(), offsetof(Script, name_));
-  SetInternalReference(entry, "context_data", script->context_data(),
-                       offsetof(Script, context_data_));
   TagObject(script->line_ends(), "(script line ends)", HeapEntry::kCode);
   SetInternalReference(entry, "line_ends", script->line_ends(),
                        offsetof(Script, line_ends_));
@@ -2651,6 +2650,10 @@ void V8HeapExplorer::ExtractDescriptorArrayReferences(
     HeapEntry* entry, Tagged<DescriptorArray> array) {
   SetInternalReference(entry, "enum_cache", array->enum_cache(),
                        offsetof(DescriptorArray, enum_cache_));
+#ifdef V8_ENABLE_DESCRIPTOR_ARRAY_LOOKUP_TABLE
+  SetInternalReference(entry, "lookup_table", array->lookup_table(),
+                       offsetof(DescriptorArray, lookup_table_));
+#endif  // V8_ENABLE_DESCRIPTOR_ARRAY_LOOKUP_TABLE
   MaybeObjectSlot start = MaybeObjectSlot(array->GetDescriptorSlot(0));
   MaybeObjectSlot end = MaybeObjectSlot(
       array->GetDescriptorSlot(array->number_of_all_descriptors()));
@@ -3188,10 +3191,6 @@ bool V8HeapExplorer::IsEssentialObject(Tagged<Object> object) {
 
 bool V8HeapExplorer::IsEssentialHiddenReference(Tagged<Object> parent,
                                                 int field_offset) {
-  if (IsAllocationSite(parent) &&
-      field_offset == offsetof(AllocationSiteWithWeakNext, weak_next_)) {
-    return false;
-  }
   if (IsContext(parent) &&
       field_offset == Context::OffsetOfElementAt(Context::NEXT_CONTEXT_LINK)) {
     return false;

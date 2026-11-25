@@ -666,7 +666,7 @@ void Parser::DeserializeScopeChain(
   InitializeEmptyScopeChain(info);
   DirectHandle<ScopeInfo> outer_scope_info;
   if (maybe_outer_scope_info.ToHandle(&outer_scope_info)) {
-    DCHECK_EQ(ThreadId::Current(), isolate->thread_id());
+    DCHECK_EQ(base::ThreadId::Current(), isolate->thread_id());
     Tagged<Script> eval_from_script = *script;
     Tagged<ScopeInfo> eval_from_scope_info;
     if (eval_from_script->has_eval_from_scope_info()) {
@@ -869,11 +869,6 @@ FunctionLiteral* Parser::DoParseProgram(Isolate* isolate, ParseInfo* info,
         info->ast_value_factory()->Internalize(isolate);
       }
       CheckConflictingVarDeclarations(scope);
-      if (flags().is_eval() && !has_error() &&
-          scope->HasConflictingArgumentsVarDeclaration(ast_value_factory())) {
-        ReportVarRedeclarationIn(ast_value_factory()->arguments_string(),
-                                 scope);
-      }
     }
 
     // For sloppy eval though, we clear dynamic variables created for toplevel
@@ -1115,6 +1110,14 @@ void Parser::ParseFunction(Isolate* isolate, ParseInfo* info,
 
   FunctionKind function_kind = flags().function_kind();
   FunctionLiteral* result;
+  std::optional<ClassScope::HeritageParsingScope> heritage;
+  if (V8_UNLIKELY(shared_info->private_name_lookup_skips_outer_class() &&
+                  original_scope_->is_class_scope())) {
+    // If the function skips the outer class and the outer scope is a class, the
+    // function is in heritage position. Otherwise the function scope's skip bit
+    // will be correctly inherited from the outer scope.
+    heritage.emplace(original_scope_->AsClassScope());
+  }
   if (V8_UNLIKELY(IsClassInitializerFunction(function_kind))) {
     // Reparsing of class member initializer functions has to be handled
     // specially because they require reparsing of the whole class body,
@@ -1124,14 +1127,6 @@ void Parser::ParseFunction(Isolate* isolate, ParseInfo* info,
         function_kind, start_position, function_literal_id, end_position,
         info->function_name());
     info->set_max_info_id(GetLastInfoId());
-  } else if (V8_UNLIKELY(shared_info->private_name_lookup_skips_outer_class() &&
-                         original_scope_->is_class_scope())) {
-    // If the function skips the outer class and the outer scope is a class, the
-    // function is in heritage position. Otherwise the function scope's skip bit
-    // will be correctly inherited from the outer scope.
-    ClassScope::HeritageParsingScope heritage(original_scope_->AsClassScope());
-    result = DoParseFunction(isolate, info, start_position, end_position,
-                             function_literal_id, info->function_name());
   } else {
     result = DoParseFunction(isolate, info, start_position, end_position,
                              function_literal_id, info->function_name());
@@ -1397,6 +1392,9 @@ FunctionLiteral* Parser::ParseClassForMemberInitialization(
   }
 
   if (has_error()) return nullptr;
+  if (V8_UNLIKELY(flags().private_name_lookup_skips_outer_class())) {
+    initializer->scope()->RecordNeedsPrivateNameContextChainRecalc();
+  }
 
   DCHECK(IsClassInitializerFunction(initializer_kind));
 

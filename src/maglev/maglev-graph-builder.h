@@ -64,7 +64,7 @@ struct CatchBlockDetails {
 struct MaglevCallerDetails {
   base::Vector<ValueNode*> arguments;
   DeoptFrame* deopt_frame;
-  KnownNodeAspects* known_node_aspects;
+  KnownNodeAspects::Ptr known_node_aspects;
   LoopEffects* loop_effects;
   ZoneUnorderedMap<KnownNodeAspects::LoadedContextSlotsKey, Node*>
       unobserved_context_slot_stores;
@@ -227,9 +227,6 @@ class MaglevGraphBuilder {
   std::tuple<DeoptFrame*, interpreter::Register, int> GetDeoptFrameForLazyDeopt(
       bool can_throw);
 
-  void OnBeginDeoptFrameScope() {
-    current_interpreter_frame_.virtual_objects().Snapshot();
-  }
   void OnEndDeoptFrameScope() {
     // We might have cached a checkpointed frame which includes this scope;
     // reset it just in case.
@@ -237,18 +234,16 @@ class MaglevGraphBuilder {
   }
 
   bool need_checkpointed_loop_entry() {
-    return v8_flags.maglev_speculative_hoist_phi_untagging ||
-           v8_flags.maglev_licm;
+    return v8_flags.maglev_speculative_hoist_phi_untagging;
   }
 
   SourcePosition GetCurrentSourcePosition() const;
 
   BasicBlock* current_block() const;
-  void set_current_block(BasicBlock* block);
+  V8_EXPORT_PRIVATE void set_current_block(BasicBlock* block);
+  V8_EXPORT_PRIVATE void FlushNodesToBlock();
   BasicBlock* FinishInlinedBlockForCaller(
       ControlNode* control_node, ZoneVector<Node*> rem_nodes_in_call_block);
-
-  uint32_t NewObjectId() { return graph_->NewObjectId(); }
 
   bool is_turbolev() const { return is_turbolev_; }
 
@@ -282,7 +277,7 @@ class MaglevGraphBuilder {
   void MarkPossibleSideEffect(NodeT* node);
 
   // CRTP hook for MaglevReducer::EmitAbruptBlockEnd: registers the
-  // just-finished block in the graph and snapshots the interpreter frame.
+  // just-finished block in the graph.
   void OnAbruptBlockEnd(BasicBlock* block);
 
   template <bool is_possible_map_change = true>
@@ -311,8 +306,19 @@ class MaglevGraphBuilder {
         Base::LabelForTrackingInterpreterFrameState;
     class V8_NODISCARD LoopLabel;
 
+    // Upper bound on the number of branches a BuildLoop body may emit into its
+    // loop exit label; unused predecessors are trimmed when binding.
+    static constexpr int kMaxLoopExitPredecessors = 2;
+
     MaglevSubGraphBuilder(MaglevGraphBuilder* builder, int variable_count);
     LoopLabel BeginLoop(std::initializer_list<Variable*> loop_vars);
+    // Emits a loop with header `loop_vars` and an exit label taking at most
+    // `kMaxLoopExitPredecessors` branches from `body_fn(&loop_end)`. Both the
+    // loop back-edge and `loop_end` are always closed or trimmed even when
+    // `body_fn` aborts.
+    template <typename FBody>
+    V8_NODISCARD ReduceResult
+    BuildLoop(std::initializer_list<Variable*> loop_vars, FBody&& body_fn);
     template <typename ControlNodeT, typename... Args>
     ReduceResult GotoIfTrue(Label* true_target,
                             std::initializer_list<ValueNode*> control_inputs,
@@ -477,7 +483,6 @@ class MaglevGraphBuilder {
                                         compiler::ScopeInfoRef scope_info);
   void MinimizeContextChainDepth(ValueNode** context, size_t* depth,
                                  ContextScopeInfo* scope_info);
-  void EscapeContext();
   ReduceResult BuildLoadContextSlot(ValueNode* context, size_t depth,
                                     int slot_index, ContextMode context_mode,
                                     ContextScopeInfo scope_info);
@@ -1122,8 +1127,7 @@ class MaglevGraphBuilder {
       BuildIteratorStepResultCallback build_result);
   ReduceResult BuildAndAllocateJSArray(
       compiler::MapRef map, ValueNode* length, ValueNode* elements,
-      const compiler::SlackTrackingPrediction& slack_tracking_prediction,
-      AllocationType allocation_type);
+      const compiler::SlackTrackingPrediction& slack_tracking_prediction);
 
   MaybeReduceResult TryBuildAndAllocateJSGeneratorObject(ValueNode* closure,
                                                          ValueNode* receiver);
@@ -1250,8 +1254,6 @@ class MaglevGraphBuilder {
   ReduceResult BuildTestUndetectable(ValueNode* value);
   ReduceResult BuildToNumberOrToNumeric(Object::Conversion mode);
 
-  enum class TrackObjectMode { kLoad, kStore };
-  bool CanTrackObjectChanges(ValueNode* object, TrackObjectMode mode);
   bool IsFieldConstant(ValueNode* object, int offset);
 
   bool CanElideWriteBarrier(ValueNode* object, ValueNode* value) {
@@ -1260,13 +1262,14 @@ class MaglevGraphBuilder {
 
   ReduceResult BuildLoadMap(ValueNode* object);
 
-  void TryBuildStoreTaggedFieldToAllocation(ValueNode* object, ValueNode* value,
-                                            int offset);
   std::optional<ValueNode*> TryBuildLoadTaggedFieldFromAllocation(
       ValueNode* object, int offset);
-  MaybeReduceResult TryBuildLoadFixedDoubleArrayElementFromAllocation(
-      ValueNode* elements, int index);
-  bool TryElideWriteBarrierForAllocation(ValueNode* object, ValueNode* value);
+  V8_EXPORT_PRIVATE bool TryElideWriteBarrierForAllocation(ValueNode* object,
+                                                           ValueNode* value);
+  V8_EXPORT_PRIVATE VirtualObject* CreateJSObject(compiler::MapRef map);
+  V8_EXPORT_PRIVATE ReduceResult BuildInlinedAllocation(
+      VirtualObject* object,
+      AllocationType allocation_type = AllocationType::kYoung);
 
   ReduceResult BuildLoadTaggedField(
       ValueNode* object, uint32_t offset, NodeType type = NodeType::kUnknown,
@@ -1531,11 +1534,6 @@ class MaglevGraphBuilder {
   ReduceResult ConvertForStoring(ValueNode* node, ElementsKind kind);
 
   bool IsEscaping(InlinedAllocation* allocation);
-  VirtualObject* GetObjectFromAllocation(InlinedAllocation* allocation);
-  VirtualObject* GetModifiableObjectFromAllocation(
-      InlinedAllocation* allocation);
-
-  VirtualObject* DeepCopyVirtualObject(VirtualObject* vobj);
 
   void AddDeoptUse(ValueNode* node);
   void AddMaterializedDeoptUse(ValueNode* node);
@@ -1556,8 +1554,7 @@ class MaglevGraphBuilder {
   MaybeReduceResult TryBuildFastCreateObjectOrArrayLiteral(
       const compiler::LiteralFeedback& feedback);
   std::optional<VirtualObject*> TryReadBoilerplateForFastLiteral(
-      compiler::JSObjectRef boilerplate, AllocationType allocation,
-      int max_depth, int* max_properties);
+      compiler::JSObjectRef boilerplate, int max_depth, int* max_properties);
 
   ValueNode* BuildInlinedArgumentsElements(int start_index, int length);
   ValueNode* BuildInlinedUnmappedArgumentsElements(int mapped_count);
@@ -1627,9 +1624,7 @@ class MaglevGraphBuilder {
   ReduceResult BuildStringConcat(ValueNode* left, ValueNode* right);
   ReduceResult BuildNewConsStringMap(ValueNode* left, ValueNode* right);
   uint32_t StringLengthStaticLowerBound(ValueNode* string, int max_depth = 2);
-  MaybeReduceResult TryBuildNewConsString(
-      ValueNode* left, ValueNode* right,
-      AllocationType allocation_type = AllocationType::kYoung);
+  MaybeReduceResult TryBuildNewConsString(ValueNode* left, ValueNode* right);
 
   template <Operation kOperation>
   ReduceResult VisitCompareOperation();
@@ -1685,6 +1680,10 @@ class MaglevGraphBuilder {
           fallthrough_offset_(builder->iterator_.next_offset()) {}
 
     BranchResult FromBool(bool value) const;
+    BranchResult BuildAbort(AbortReason reason) const {
+      CHECK(builder_->BuildAbort(reason).IsDoneWithAbort());
+      return Abort();
+    }
     template <typename ControlNodeT, typename... Args>
     BranchResult Build(std::initializer_list<ValueNode*> inputs,
                        Args&&... args);
@@ -1902,7 +1901,7 @@ class MaglevGraphBuilder {
            peeled_iteration_count_ == 1;
   }
   bool is_loop_effect_tracking_enabled() {
-    return v8_flags.maglev_escape_analysis || v8_flags.maglev_licm;
+    return v8_flags.maglev_escape_analysis;
   }
   bool is_loop_effect_tracking() { return loop_effects_; }
   LoopEffects* loop_effects_ = nullptr;
@@ -1937,8 +1936,46 @@ class MaglevGraphBuilder {
   // TODO(leszeks): Allow having a stack of these.
   ForInState current_for_in_state = ForInState();
 
+  // Owns the active KnownNodeAspects on a merge state slot in `merge_states_`,
+  // automatically releasing its pooled storage when the slot is overwritten
+  // (e.g., when resetting a loop header's merge state in `BuildLoopHeader` or
+  // loop peeling after its forward KNA was already taken) or when the
+  // MaglevGraphBuilder is destroyed.
+  class MergeStatePtr {
+   public:
+    MergeStatePtr() = default;
+    MergeStatePtr(MergePointInterpreterFrameState* state)  // NOLINT
+        : state_(state) {}
+    ~MergeStatePtr() { Clear(); }
+    MergeStatePtr(const MergeStatePtr&) = delete;
+    MergeStatePtr& operator=(const MergeStatePtr&) = delete;
+    MergeStatePtr& operator=(MergePointInterpreterFrameState* state) {
+      if (state_ != state) {
+        Clear();
+        state_ = state;
+      }
+      return *this;
+    }
+
+    operator MergePointInterpreterFrameState*() const { return state_; }
+    MergePointInterpreterFrameState* operator->() const { return state_; }
+    MergePointInterpreterFrameState& operator*() const { return *state_; }
+
+   private:
+    void Clear() {
+      if (state_ != nullptr) {
+        // Only clear `known_node_aspects_`; `backedge_known_node_aspects_` on
+        // merged loop headers is retained on the basic block's state for later
+        // `RecomputeKnownNodeAspectsProcessor` passes.
+        state_->ClearKnownNodeAspects();
+      }
+    }
+
+    MergePointInterpreterFrameState* state_ = nullptr;
+  };
+
   BasicBlockRef* jump_targets_;
-  MergePointInterpreterFrameState** merge_states_;
+  ZoneVector<MergeStatePtr> merge_states_;
 
   RegisterFrameArray<ContextScopeInfo> register_scope_infos_;
   ContextScopeInfo accumulator_scope_info_;

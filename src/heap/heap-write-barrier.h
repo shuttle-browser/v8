@@ -97,10 +97,13 @@ class V8_EXPORT_PRIVATE WriteBarrier final {
   static inline void ForRelocInfo(Tagged<InstructionStream> host,
                                   RelocInfo* rinfo, Tagged<HeapObject> value,
                                   WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
-  static inline void ForArrayBufferExtension(Tagged<JSArrayBuffer> host,
+  template <typename IsolateT>
+  static inline void ForArrayBufferExtension(IsolateT* isolate,
+                                             Tagged<JSArrayBuffer> host,
                                              ArrayBufferExtension* extension);
+  template <typename IsolateT>
   static inline void ForExternalPointer(
-      Tagged<HeapObject> host, ExternalPointerSlot slot,
+      IsolateT isolate, Tagged<HeapObject> host, ExternalPointerSlot slot,
       ExternalPointerHandle handle,
       WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
   static inline void ForTrustedPointer(
@@ -193,7 +196,13 @@ class V8_EXPORT_PRIVATE WriteBarrier final {
 
   static bool PageFlagsAreConsistent(Tagged<HeapObject> object);
 
-  static inline bool IsMarking(Tagged<HeapObject> object);
+  template <typename IsolateT>
+  static inline bool IsLocalMarking(IsolateT* isolate);
+
+  template <typename IsolateT>
+  static inline bool IsAnyMarking(IsolateT* isolate);
+
+  static inline bool IsMarkingUntrusted(Tagged<HeapObject> object);
 
   static inline void Marking(Tagged<HeapObject> host, HeapObjectSlot,
                              Tagged<HeapObject> value);
@@ -201,7 +210,9 @@ class V8_EXPORT_PRIVATE WriteBarrier final {
                              Tagged<MaybeObject> value);
   static inline void MarkingForRelocInfo(Tagged<InstructionStream> host,
                                          RelocInfo*, Tagged<HeapObject> value);
-  static inline void Marking(Tagged<HeapObject> host, ExternalPointerSlot slot,
+  template <typename IsolateT>
+  static inline void Marking(IsolateT isolate, Tagged<HeapObject> host,
+                             ExternalPointerSlot slot,
                              ExternalPointerHandle handle);
   static inline void Marking(Tagged<HeapObject> host, TrustedPointerSlot slot);
   static inline void Marking(Tagged<TrustedObject> host,
@@ -235,6 +246,9 @@ class V8_EXPORT_PRIVATE WriteBarrier final {
   V8_NOINLINE V8_PRESERVE_MOST static void GenerationalBarrierSlow(
       Tagged<HeapObject> object, Address slot, Tagged<HeapObject> value);
   static inline void GenerationalBarrierForCppHeapPointer(
+      Heap* heap, Tagged<CppHeapPointerWrapperObjectT> host, void* value);
+  V8_NOINLINE V8_PRESERVE_MOST static void
+  GenerationalBarrierForCppHeapPointerSlow(
       Heap* heap, Tagged<CppHeapPointerWrapperObjectT> host, void* value);
 
   V8_NOINLINE V8_PRESERVE_MOST static void SharedSlow(
