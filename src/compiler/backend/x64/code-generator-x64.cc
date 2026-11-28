@@ -3607,12 +3607,18 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
     }
     case kX64MovqDecompressTagged: {
       CHECK(instr->HasOutput());
-      RecordTrapInfoIfNeeded(zone(), this, opcode, instr, __ pc_offset());
-      Operand address(i.MemoryOperand());
-      __ DecompressTagged(i.OutputRegister(), address);
-      EmitTSANRelaxedLoadOOLIfNeeded(zone(), this, masm(), address,
-                                     MakeSharedBaseTsanArgument(instr, i), i,
-                                     DetermineStubCallMode(), kTaggedSize);
+      if (HasAddressingMode(instr)) {
+        RecordTrapInfoIfNeeded(zone(), this, opcode, instr, __ pc_offset());
+        Operand address(i.MemoryOperand());
+        __ DecompressTagged(i.OutputRegister(), address);
+        EmitTSANRelaxedLoadOOLIfNeeded(zone(), this, masm(), address,
+                                       MakeSharedBaseTsanArgument(instr, i), i,
+                                       DetermineStubCallMode(), kTaggedSize);
+      } else if (instr->InputAt(0)->IsRegister()) {
+        __ DecompressTagged(i.OutputRegister(), i.InputRegister(0));
+      } else {
+        __ DecompressTagged(i.OutputRegister(), i.InputOperand(0));
+      }
       break;
     }
     case kX64MovqCompressTagged: {
@@ -9033,14 +9039,6 @@ void CodeGenerator::SetPendingMove(MoveOperands* move) {
 }
 
 namespace {
-
-bool Is32BitOperand(InstructionOperand* operand) {
-  DCHECK(operand->IsStackSlot() || operand->IsRegister());
-  MachineRepresentation mr = LocationOperand::cast(operand)->representation();
-  return mr == MachineRepresentation::kWord32 ||
-         mr == MachineRepresentation::kCompressed ||
-         mr == MachineRepresentation::kCompressedPointer;
-}
 
 // When we need only 32 bits, move only 32 bits. Benefits:
 // - Save a byte here and there (depending on the destination
