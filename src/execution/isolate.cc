@@ -4424,13 +4424,16 @@ DirectHandle<NativeContext> Isolate::GetIncumbentContextSlow() {
   // 1st candidate: most-recently-entered author function's context
   // if it's newer than the last Context::BackupIncumbentScope entry.
   //
-  // NOTE: This code assumes that the stack grows downward.
+  // NOTE: This code assumes that the stack grows downward. Compare against
+  // fp() rather than sp(), because sp() is kNullAddress on reconstructed
+  // Fast C API caller frames whereas fp() is valid and BackupIncumbentScope
+  // always resides outside JS frames.
   Address top_backup_incumbent =
       top_backup_incumbent_scope()
           ? top_backup_incumbent_scope()->JSStackComparableAddressPrivate()
           : 0;
   if (!it.done() &&
-      (!top_backup_incumbent || it.frame()->sp() < top_backup_incumbent)) {
+      (!top_backup_incumbent || it.frame()->fp() < top_backup_incumbent)) {
     Tagged<Context> context = Cast<Context>(it.frame()->context());
     // If the topmost_script_having_context is set then it must be correct.
     if (DEBUG_BOOL && !topmost_script_having_context().is_null()) {
@@ -8751,6 +8754,16 @@ void Isolate::PrintNumberStringCacheStats(const char* comment,
            v8_flags.double_string_cache_size.value());
   }
   PrintF("\n");
+}
+
+void Isolate::MarkContextSlotNotAssignedIsUnreliable() {
+  if (is_context_slot_not_assigned_unreliable()) return;
+  context_slot_not_assigned_is_unreliable_.store(true,
+                                                 std::memory_order_relaxed);
+  // Abort any in-flight concurrent compilations that may have relied on
+  // kNotAssigned and deoptimize existing optimized code.
+  AbortConcurrentOptimization(BlockingBehavior::kBlock);
+  Deoptimizer::DeoptimizeAll(this);
 }
 
 }  // namespace internal
